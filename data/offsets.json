@@ -1,0 +1,136 @@
+{
+  "libclient.so": [
+    {
+      "name": "dwCSGOInput",
+      "value": 73009240
+    },
+    {
+      "name": "dwEntityList",
+      "value": 73238272
+    },
+    {
+      "name": "dwGameEntitySystem",
+      "value": 78062416
+    },
+    {
+      "name": "dwGameEntitySystem_highestEntityIndex",
+      "value": 8352
+    },
+    {
+      "name": "dwGameRules",
+      "value": 76135188
+    },
+    {
+      "name": "dwGlobalVars",
+      "value": 72963064
+    },
+    {
+      "name": "dwGlowManager",
+      "value": 75663672
+    },
+    {
+      "name": "dwLocalPlayerController",
+      "value": 75478968
+    },
+    {
+      "name": "dwLocalPlayerPawn",
+      "value": 75687912
+    },
+    {
+      "name": "dwPlantedC4",
+      "value": 73321831
+    },
+    {
+      "name": "dwPrediction",
+      "value": 75687584
+    },
+    {
+      "name": "dwSensitivity",
+      "value": 75680472
+    },
+    {
+      "name": "dwSensitivity_sensitivity",
+      "value": 88
+    },
+    {
+      "name": "dwViewAngles",
+      "value": 73010592
+    },
+    {
+      "name": "dwViewMatrix",
+      "value": 75716736
+    },
+    {
+      "name": "dwViewRender",
+      "value": 75717008
+    }
+  ],
+  "libengine2.so": [
+    {
+      "name": "dwBuildNumber",
+      "value": 13068776
+    },
+    {
+      "name": "dwNetworkGameClient_clientTickCount",
+      "value": 904
+    },
+    {
+      "name": "dwNetworkGameClient_deltaTick",
+      "value": 908
+    },
+    {
+      "name": "dwNetworkGameClient_isBackgroundMap",
+      "value": 648
+    },
+    {
+      "name": "dwNetworkGameClient_localPlayer",
+      "value": 640
+    },
+    {
+      "name": "dwNetworkGameClient_maxClients",
+      "value": 576
+    },
+    {
+      "name": "dwNetworkGameClient_serverTickCount",
+      "value": 604
+    },
+    {
+      "name": "dwNetworkGameClient_signOnState",
+      "value": 644
+    },
+    {
+      "name": "dwWindowHeight",
+      "value": 10386628
+    },
+    {
+      "name": "dwWindowWidth",
+      "value": 10386624
+    }
+  ],
+  "libinputsystem.so": [
+    {
+      "name": "dwInputSystem",
+      "value": 523200
+    }
+  ],
+  "libmatchmaking.so": [
+    {
+      "name": "dwGameTypes",
+      "value": 3785856
+    },
+    {
+      "name": "dwGameTypes_mapName",
+      "value": 3786144
+    }
+  ],
+  "libpanorama.so": [
+    {
+      "name": "HUD_CONTEXT",
+      "value": 6802656
+    },
+    {
+      "name": "MENU_CONTEXT",
+      "value": 6802624
+    }
+  ]
+}

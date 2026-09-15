@@ -1,0 +1,615 @@
+"""
+Оффлайн-симуляция навигации без CS2: физика движения Source (разгон, трение,
+скольжение вдоль стен), мышь → углы, память → позиция/скорость/углы.
+
+Позволяет проверить карту, маршрут и контроллер и сразу увидеть картинку.
+Намеренно «неудобная» для бота: чувствительность мыши отличается от ожидаемой,
+можно инвертировать мышь и сместить yaw в «памяти» — контроллер обязан адаптироваться.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
+from cs2_control.input import GameInput
+from cs2_nav.coord_map import CoordinateMap
+from cs2_nav.navigator import NavConfig, Navigator
+from cs2_reader.aim import shortest_yaw_err
+from cs2_reader.game_state import Vec3
+
+
+class FakeInput(GameInput):
+    def __init__(self) -> None:
+        self.mouse_dx = 0
+        self.mouse_dy = 0
+        self.keys: set[str] = set()
+        self.jump_requested = False
+        self.key_events = 0
+        self.buttons: set[str] = set()
+        self.shot_requested = False
+
+    def key_down(self, key: str) -> None:
+        k = key.lower()
+        if k == "space":
+            self.jump_requested = True
+            return
+        if k not in self.keys:
+            self.keys.add(k)
+            self.key_events += 1
+
+    def key_up(self, key: str) -> None:
+        k = key.lower()
+        if k in self.keys:
+            self.keys.discard(k)
+            self.key_events += 1
+
+    def mouse_move(self, dx: int, dy: int) -> None:
+        self.mouse_dx += dx
+        self.mouse_dy += dy
+
+    def mouse_down(self, button: str = "left") -> None:
+        if button not in self.buttons:
+            self.buttons.add(button)
+            if button == "left":
+                self.shot_requested = True     # нажатие = выстрел (semi-auto)
+
+    def mouse_up(self, button: str = "left") -> None:
+        self.buttons.discard(button)
+
+    def release_all(self) -> None:
+        self.keys.clear()
+        self.buttons.clear()
+
+
+@dataclass
+class SimPlayer:
+    x: float
+    y: float
+    z: float
+    yaw: float            # истинный yaw (Source)
+    pitch: float
+    vx: float = 0.0
+    vy: float = 0.0
+    airborne: float = 0.0  # секунд в прыжке
+
+
+@dataclass
+class SimTarget:
+    """Статичная мишень-макет: цилиндр радиуса radius, «глаза» на eye_z над ногами."""
+
+    index: int
+    x: float
+    y: float
+    z: float
+    name: str = ""
+    health: int = 100
+    radius: float = 16.0
+    eye_z: float = 64.0
+    hits_to_kill: int = 3           # попаданий до «смерти» (мишень пропадает); 0 = бессмертная
+    hits: int = 0
+    alive: bool = True
+    respawn_at: float = float("inf")
+
+    def aim_position(self, z_offset: float | None = None) -> Vec3:
+        return Vec3(self.x, self.y, self.z + (self.eye_z if z_offset is None else z_offset))
+
+
+class FakeReader:
+    """Отдаёт «память» с задержкой в один тик и (опционально) смещённым yaw."""
+
+    def __init__(
+        self,
+        player: SimPlayer,
+        yaw_offset: float = 0.0,
+        noise: float = 0.0,
+        targets: list[SimTarget] | None = None,
+        visible_fn: Callable[[SimTarget], bool] | None = None,
+    ):
+        self.p = player
+        self.yaw_offset = yaw_offset
+        self.noise = noise
+        self.rng = random.Random(1)
+        self.targets = targets or []
+        self._visible_fn = visible_fn or (lambda _t: True)
+        self._visible: list[SimTarget] = []
+        self._snap = self._take()
+
+    def _take(self) -> tuple[Vec3, Vec3, Vec3]:
+        p = self.p
+        n = self.noise
+        pos = Vec3(p.x + self.rng.uniform(-n, n), p.y + self.rng.uniform(-n, n), p.z)
+        vel = Vec3(p.vx, p.vy, 0.0)
+        ang = Vec3(p.pitch, shortest_yaw_err(p.yaw + self.yaw_offset, 0.0), 0.0)
+        return pos, vel, ang
+
+    def latch(self) -> None:
+        self._snap = self._take()
+        # как m_bSpotted в игре: видимость определяется движком, не FOV камеры
+        self._visible = [t for t in self.targets if self._visible_fn(t)]
+
+    def local_position(self) -> Vec3:
+        return self._snap[0]
+
+    def local_velocity(self) -> Vec3:
+        return self._snap[1]
+
+    def local_eye_angles(self) -> Vec3:
+        return self._snap[2]
+
+    def local_view_offset_z(self) -> float:
+        return 64.0
+
+    def visible_enemies(self) -> list[SimTarget]:
+        return list(self._visible)
+
+
+@dataclass
+class SimConfig:
+    max_speed: float = 250.0        # u/s (нож/пистолет)
+    accelerate: float = 5.5         # sv_accelerate
+    friction: float = 5.2           # sv_friction
+    stop_speed: float = 80.0        # sv_stopspeed
+    deg_per_px: float = 0.055       # чувствительность в «игре» (бот думает 0.0759)
+    invert_mouse: bool = False
+    yaw_offset: float = 0.0         # смещение yaw в «памяти»
+    pos_noise: float = 0.0
+    mouse_delay_ticks: int = 1
+    jump_duration: float = 0.45
+    # мишени-макеты: (x, y, z) ног; видимость — прямая видимость по карте в пределах target_vis_dist
+    targets: list[tuple[float, float, float]] = field(default_factory=list)
+    target_radius: float = 16.0
+    target_vis_dist: float = 1400.0
+    target_hits_to_kill: int = 3    # попаданий → мишень пропадает (0 = не пропадает)
+    target_respawn: float = 6.0     # с до повторного появления (0 = навсегда)
+
+
+@dataclass
+class SimResult:
+    done: bool = False
+    ticks: int = 0
+    time: float = 0.0
+    final_goal_dist: float = float("inf")
+    walked: list[tuple[float, float, float]] = field(default_factory=list)
+    headings: list[tuple[float, float, float]] = field(default_factory=list)
+    route: list[tuple[float, float, float]] = field(default_factory=list)
+    goal: tuple[float, float, float] | None = None
+    route_len: float = 0.0
+    walked_len: float = 0.0
+    min_clearance: float = float("inf")
+    low_clearance_ticks: int = 0
+    stop_ticks: int = 0
+    max_yaw_rate: float = 0.0
+    yaw_rate_p95: float = 0.0
+    moving_yaw_rate_p95: float = 0.0
+    key_events: int = 0
+    stucks: int = 0
+    replans: int = 0
+    collisions: int = 0
+    yaw_offset_detected: float = 0.0
+    yaw_per_px_final: float = 0.0
+    events: list[str] = field(default_factory=list)
+    log: list[str] = field(default_factory=list)
+    # мишени
+    targets: list[tuple[float, float, float]] = field(default_factory=list)
+    engaged_ticks: int = 0
+    targets_engaged: int = 0
+    aim_lines: list[tuple[float, float, float, float]] = field(default_factory=list)   # (x, y, tx, ty)
+    aim_err_p50: float = 0.0          # ° ошибка прицела по yaw, когда камера на мишени (после наводки)
+    aim_settle_time: float = 0.0      # с: медиана времени от «увидел» до ошибки < 3°
+    target_collisions: int = 0        # тиков касания тела мишени
+    # стрельба
+    shots: int = 0
+    hits: int = 0
+    shot_lines: list[tuple[float, float, float, float, bool]] = field(default_factory=list)  # (x, y, tx, ty, hit)
+    fire_ticks: int = 0               # тиков в режиме стрельбы (стоим)
+    first_shot_delay: float = 0.0     # с: медиана «увидел → первый выстрел»
+    move_speed_at_shot: float = 0.0   # u/s: медиана скорости в момент выстрела (у игрока ≈ 0)
+    targets_killed: int = 0
+    kill_time: float = 0.0            # с: медиана «увидел → мишень пропала»
+    flick_peak_rate: float = 0.0      # °/с: максимум скорости камеры во время наводки
+    # плавность камеры
+    yaw_accel_p95: float = 0.0        # °/с²: p95 |Δскорости| за тик (рывки)
+    yaw_jerk_rms: float = 0.0         # °/с³: RMS изменения ускорения (дёрганость)
+    rate_sign_flips_per_s: float = 0.0  # смен направления вращения камеры в секунду (дрожание)
+    path_curvature: float = 0.0       # средняя кривизна траектории прицела при наводке (0 = прямая)
+
+
+class NavSimulator:
+    def __init__(
+        self,
+        cm: CoordinateMap,
+        start: tuple[float, float, float],
+        *,
+        nav_config: NavConfig | None = None,
+        sim_config: SimConfig | None = None,
+        initial_yaw: float = 0.0,
+        initial_pitch: float = 0.0,
+    ):
+        self.cm = cm
+        self.sim = sim_config or SimConfig()
+        node = cm.nearest_node(*start)
+        if node is None:
+            raise ValueError(f"старт {start} вне карты")
+        self.player = SimPlayer(x=start[0], y=start[1], z=node.z, yaw=initial_yaw, pitch=initial_pitch)
+        self.inp = FakeInput()
+        self.targets: list[SimTarget] = []
+        for i, (tx, ty, tz) in enumerate(self.sim.targets):
+            tn = cm.nearest_node(tx, ty, tz)
+            self.targets.append(
+                SimTarget(
+                    index=100 + i, x=tx, y=ty, z=tn.z if tn else tz, name=f"T{i + 1}",
+                    radius=self.sim.target_radius, hits_to_kill=self.sim.target_hits_to_kill,
+                )
+            )
+        self.reader = FakeReader(
+            self.player,
+            yaw_offset=self.sim.yaw_offset,
+            noise=self.sim.pos_noise,
+            targets=self.targets,
+            visible_fn=self._target_visible,
+        )
+        cfg = nav_config or NavConfig(verbose_log=False)
+        self.dt = 1.0 / cfg.tick_hz
+        self.time = 0.0
+        self.nav = Navigator(self.reader, self.inp, cm, cfg, clock=lambda: self.time)
+        self._mouse_queue: list[tuple[int, int]] = []
+        self.collisions = 0
+        self.target_collisions = 0
+
+    # -------------------------------------------------------------- targets
+
+    def _target_visible(self, t: SimTarget) -> bool:
+        """Прямая видимость по карте (2D): отрезок игрок→мишень не пересекает стену."""
+        if not t.alive:
+            return False
+        p = self.player
+        dx, dy = t.x - p.x, t.y - p.y
+        d = math.hypot(dx, dy)
+        if d > self.sim.target_vis_dist:
+            return False
+        steps = max(1, int(d / 6.0))
+        z = p.z
+        for i in range(1, steps + 1):
+            k = i / steps
+            node = self.cm.layer_at(p.x + dx * k, p.y + dy * k, z, dz_max=self.cm.cfg.jump_height)
+            if node is None:
+                return False
+            z = node.z
+        return True
+
+    def _resolve_shot(self) -> tuple[SimTarget | None, bool]:
+        """Луч из глаз по реальным углам камеры: попал ли в цилиндр какой-то мишени (2D + высота)."""
+        p = self.player
+        yr = math.radians(p.yaw)
+        pr = math.radians(p.pitch)
+        fx, fy = math.cos(yr) * math.cos(pr), math.sin(yr) * math.cos(pr)
+        fz = -math.sin(pr)
+        eye_z = p.z + 64.0
+        best: SimTarget | None = None
+        best_d = float("inf")
+        for t in self.targets:
+            if not t.alive:
+                continue
+            dx, dy = t.x - p.x, t.y - p.y
+            # проекция центра мишени на луч (в плоскости)
+            h = math.hypot(fx, fy)
+            if h < 1e-6:
+                continue
+            along = (dx * fx + dy * fy) / h
+            if along <= 0:
+                continue
+            perp = abs(dx * fy - dy * fx) / h
+            if perp > t.radius:
+                continue
+            d3 = along / h
+            hit_z = eye_z + fz * d3
+            if t.z <= hit_z <= t.z + 72.0:
+                if along < best_d:
+                    best, best_d = t, along
+        # цель под прицелом по направлению — но ближайшая по лучу (даже если мишень не та)
+        return best, best is not None
+
+    def _apply_hit(self, t: SimTarget) -> bool:
+        """Попадание: считаем, «убиваем» после hits_to_kill. Возвращает True, если мишень пропала."""
+        t.hits += 1
+        if t.hits_to_kill > 0 and t.hits >= t.hits_to_kill:
+            t.alive = False
+            t.hits = 0
+            t.respawn_at = self.time + self.sim.target_respawn if self.sim.target_respawn > 0 else float("inf")
+            return True
+        return False
+
+    def _respawn_targets(self) -> None:
+        for t in self.targets:
+            if not t.alive and self.time >= t.respawn_at:
+                t.alive = True
+                t.respawn_at = float("inf")
+
+    def _collide_targets(self) -> None:
+        """Мишень — твёрдый цилиндр: выталкиваем игрока, гасим скорость в её сторону."""
+        p = self.player
+        hull = self.cm.cfg.hull_radius
+        for t in self.targets:
+            if not t.alive:
+                continue
+            dx, dy = p.x - t.x, p.y - t.y
+            d = math.hypot(dx, dy)
+            min_d = hull + t.radius
+            if d >= min_d or abs(p.z - t.z) > 72.0:
+                continue
+            self.target_collisions += 1
+            if d < 1e-6:
+                dx, dy, d = 1.0, 0.0, 1.0
+            nx, ny = dx / d, dy / d
+            p.x, p.y = t.x + nx * min_d, t.y + ny * min_d
+            into = p.vx * nx + p.vy * ny
+            if into < 0:
+                p.vx -= into * nx
+                p.vy -= into * ny
+
+    # -------------------------------------------------------------- physics
+
+    def _apply_mouse(self) -> None:
+        self._mouse_queue.append((self.inp.mouse_dx, self.inp.mouse_dy))
+        self.inp.mouse_dx = 0
+        self.inp.mouse_dy = 0
+        if len(self._mouse_queue) <= self.sim.mouse_delay_ticks:
+            return
+        dx, dy = self._mouse_queue.pop(0)
+        k = self.sim.deg_per_px
+        sign = 1.0 if self.sim.invert_mouse else -1.0
+        p = self.player
+        p.yaw = shortest_yaw_err(p.yaw + sign * dx * k, 0.0)
+        p.pitch = max(-89.0, min(89.0, p.pitch + dy * k))
+
+    def _wishdir(self) -> tuple[float, float] | None:
+        keys = self.inp.keys
+        f = 0.0
+        s = 0.0
+        if "w" in keys:
+            f += 1.0
+        if "s" in keys:
+            f -= 1.0
+        if "a" in keys:
+            s += 1.0   # влево = +yaw сторона
+        if "d" in keys:
+            s -= 1.0
+        if f == 0.0 and s == 0.0:
+            return None
+        yr = math.radians(self.player.yaw)
+        fx, fy = math.cos(yr), math.sin(yr)
+        lx, ly = -fy, fx  # влево
+        wx, wy = fx * f + lx * s, fy * f + ly * s
+        m = math.hypot(wx, wy)
+        return wx / m, wy / m
+
+    def _move(self) -> None:
+        p = self.player
+        dt = self.dt
+        sim = self.sim
+        speed = math.hypot(p.vx, p.vy)
+
+        if p.airborne > 0.0:
+            p.airborne = max(0.0, p.airborne - dt)
+        elif self.inp.jump_requested:
+            p.airborne = sim.jump_duration
+        self.inp.jump_requested = False
+
+        # трение (на земле)
+        if speed > 0.1 and p.airborne <= 0.0:
+            control = max(speed, sim.stop_speed)
+            drop = control * sim.friction * dt
+            new_speed = max(0.0, speed - drop)
+            p.vx *= new_speed / speed
+            p.vy *= new_speed / speed
+
+        wish = self._wishdir()
+        if wish is not None:
+            wx, wy = wish
+            cur = p.vx * wx + p.vy * wy
+            add = sim.max_speed - cur
+            if add > 0:
+                accel = min(add, sim.accelerate * sim.max_speed * dt)
+                p.vx += wx * accel
+                p.vy += wy * accel
+            spd = math.hypot(p.vx, p.vy)
+            if spd > sim.max_speed:
+                p.vx *= sim.max_speed / spd
+                p.vy *= sim.max_speed / spd
+
+        nx, ny = p.x + p.vx * dt, p.y + p.vy * dt
+        dz_max = self.cm.cfg.jump_height if p.airborne > 0.0 else self.cm.cfg.step_height
+        node = self.cm.layer_at(nx, ny, p.z, dz_max)
+        if node is not None:
+            p.x, p.y = nx, ny
+            p.z += (node.z - p.z) * min(1.0, dt * 12.0)
+            return
+        # скольжение вдоль стены
+        self.collisions += 1
+        node = self.cm.layer_at(nx, p.y, p.z, dz_max)
+        if node is not None:
+            p.x = nx
+            p.vy = 0.0
+            p.z += (node.z - p.z) * min(1.0, dt * 12.0)
+            return
+        node = self.cm.layer_at(p.x, ny, p.z, dz_max)
+        if node is not None:
+            p.y = ny
+            p.vx = 0.0
+            p.z += (node.z - p.z) * min(1.0, dt * 12.0)
+            return
+        p.vx = p.vy = 0.0
+
+    # -------------------------------------------------------------- run
+
+    def run(self, duration: float = 60.0, log_every: int = 40) -> SimResult:
+        res = SimResult()
+        p = self.player
+        self.reader.latch()
+        self.nav.plan((p.x, p.y, p.z))
+        assert self.nav.route is not None
+        res.route = list(self.nav.route.pts)
+        res.route_len = self.nav.route.length
+        res.goal = self.nav.route.goal
+        res.walked.append((p.x, p.y, p.z))
+        yaw_rates: list[float] = []
+        moving_rates: list[float] = []
+        aim_errs: list[float] = []
+        settle_times: list[float] = []
+        first_shot_delays: list[float] = []
+        shot_speeds: list[float] = []
+        kill_times: list[float] = []
+        kill_events: list[str] = []
+        engage_start: float | None = None
+        seen_at: float | None = None
+        prev_target = None
+        prev_yaw = p.yaw
+        prev_srate = 0.0
+        prev_acc = 0.0
+        accels: list[float] = []
+        jerks: list[float] = []
+        curv: list[float] = []
+        sign_flips = 0
+        aim_prev = (p.yaw, p.pitch)
+        aim_prev_step: tuple[float, float] | None = None
+        max_ticks = int(duration / self.dt)
+        heading_every = max(1, int(0.5 / self.dt))
+        aim_every = max(1, int(0.25 / self.dt))
+        res.targets = [(t.x, t.y, t.z) for t in self.targets]
+
+        for tick in range(max_ticks):
+            self.time = tick * self.dt
+            self.reader.latch()
+            info = self.nav.tick()
+            # выстрел — по состоянию камеры на момент нажатия (мышь этого тика ещё не применена)
+            if self.inp.shot_requested:
+                self.inp.shot_requested = False
+                spd_now = math.hypot(p.vx, p.vy)
+                hit_t, hit = self._resolve_shot()
+                res.shots += 1
+                res.hits += int(hit)
+                shot_speeds.append(spd_now)
+                tgt_now = info.get("target")
+                if tgt_now is not None:
+                    res.shot_lines.append((p.x, p.y, tgt_now[0], tgt_now[1], hit))
+                if info.get("shots_on_target") == 1 and seen_at is not None:
+                    first_shot_delays.append(self.time - seen_at)
+                if hit and hit_t is not None and self._apply_hit(hit_t):
+                    res.targets_killed += 1
+                    if seen_at is not None:
+                        kill_times.append(self.time - seen_at)
+                    kill_events.append(f"t={self.time:.1f}s {hit_t.name} пропала (попаданий {hit_t.hits_to_kill})")
+            self._respawn_targets()
+            self._apply_mouse()
+            self._move()
+            self._collide_targets()
+            res.ticks += 1
+            if info.get("firing"):
+                res.fire_ticks += 1
+
+            tgt = info.get("target")
+            if tgt is not None:
+                # ошибка прицела по факту (после применения мыши), yaw игрока → мишень
+                want = math.degrees(math.atan2(tgt[1] - p.y, tgt[0] - p.x))
+                err = abs(shortest_yaw_err(want, p.yaw))
+                res.flick_peak_rate = max(res.flick_peak_rate, abs(shortest_yaw_err(p.yaw, prev_yaw)) / self.dt)
+                if tgt != prev_target:
+                    engage_start = self.time
+                    seen_at = self.time
+                elif engage_start is not None and err < 3.0:
+                    settle_times.append(self.time - engage_start)
+                    engage_start = None
+                if engage_start is None:
+                    aim_errs.append(err)
+                if tick % aim_every == 0:
+                    res.aim_lines.append((p.x, p.y, tgt[0], tgt[1]))
+            else:
+                engage_start = None
+            prev_target = tgt
+
+            res.walked.append((p.x, p.y, p.z))
+            res.walked_len += math.hypot(p.x - res.walked[-2][0], p.y - res.walked[-2][1])
+            if tick % heading_every == 0:
+                res.headings.append((p.x, p.y, p.yaw))
+            cl = self.cm.clearance_at(p.x, p.y, p.z)
+            res.min_clearance = min(res.min_clearance, cl)
+            if cl < 12.0:
+                res.low_clearance_ticks += 1
+            spd = math.hypot(p.vx, p.vy)
+            if tick > int(1.5 / self.dt) and spd < 40.0 and info.get("action") not in ("done", "arrived", "pause"):
+                res.stop_ticks += 1
+            srate = shortest_yaw_err(p.yaw, prev_yaw) / self.dt
+            rate = abs(srate)
+            prev_yaw = p.yaw
+            yaw_rates.append(rate)
+            if spd > 100.0:
+                moving_rates.append(rate)
+            # плавность: ускорение и рывок по yaw, смены знака скорости
+            acc = (srate - prev_srate) / self.dt
+            accels.append(abs(acc))
+            jerks.append((acc - prev_acc) / self.dt)
+            if abs(srate) > 4.0 and abs(prev_srate) > 4.0 and (srate > 0) != (prev_srate > 0):
+                sign_flips += 1
+            prev_srate, prev_acc = srate, acc
+            # кривизна траектории прицела при наводке: угол между соседними шагами (yaw, pitch)
+            if tgt is not None and rate > 40.0:
+                step = (shortest_yaw_err(p.yaw, aim_prev[0]), p.pitch - aim_prev[1])
+                if aim_prev_step is not None:
+                    a = math.hypot(*step)
+                    b = math.hypot(*aim_prev_step)
+                    if a > 0.3 and b > 0.3:
+                        cosang = (step[0] * aim_prev_step[0] + step[1] * aim_prev_step[1]) / (a * b)
+                        curv.append(math.degrees(math.acos(max(-1.0, min(1.0, cosang)))))
+                aim_prev_step = step
+            else:
+                aim_prev_step = None
+            aim_prev = (p.yaw, p.pitch)
+
+            if log_every and tick % log_every == 0:
+                res.log.append(
+                    f"t={tick * self.dt:5.1f}s pos=({p.x:.0f},{p.y:.0f},{p.z:.0f}) spd={spd:3.0f} "
+                    f"yaw={p.yaw:6.1f} keys={info.get('keys')} err={info.get('yaw_err')} "
+                    f"rel={info.get('rel')} s={info.get('s')}/{info.get('route_len')} goal_d={info.get('goal_d')}"
+                )
+            if info.get("action") == "done":
+                res.done = True
+                break
+
+        res.time = res.ticks * self.dt
+        if res.goal:
+            res.final_goal_dist = math.hypot(res.goal[0] - p.x, res.goal[1] - p.y)
+        yaw_rates.sort()
+        moving_rates.sort()
+        res.max_yaw_rate = yaw_rates[-1] if yaw_rates else 0.0
+        res.yaw_rate_p95 = yaw_rates[int(len(yaw_rates) * 0.95)] if yaw_rates else 0.0
+        res.moving_yaw_rate_p95 = moving_rates[int(len(moving_rates) * 0.95)] if moving_rates else 0.0
+        res.key_events = self.inp.key_events
+        res.stucks = self.nav.stucks
+        res.replans = self.nav.replans
+        res.collisions = self.collisions
+        res.yaw_offset_detected = self.nav.yaw_offset
+        res.yaw_per_px_final = self.nav.cfg.yaw_per_px
+        res.events = list(self.nav.events)
+        res.engaged_ticks = self.nav.engaged_ticks
+        res.targets_engaged = self.nav.targets_engaged
+        res.target_collisions = self.target_collisions
+        aim_errs.sort()
+        settle_times.sort()
+        res.aim_err_p50 = aim_errs[len(aim_errs) // 2] if aim_errs else 0.0
+        res.aim_settle_time = settle_times[len(settle_times) // 2] if settle_times else 0.0
+        first_shot_delays.sort()
+        shot_speeds.sort()
+        res.first_shot_delay = first_shot_delays[len(first_shot_delays) // 2] if first_shot_delays else 0.0
+        res.move_speed_at_shot = shot_speeds[len(shot_speeds) // 2] if shot_speeds else 0.0
+        kill_times.sort()
+        res.kill_time = kill_times[len(kill_times) // 2] if kill_times else 0.0
+        res.events.extend(kill_events)
+        accels.sort()
+        res.yaw_accel_p95 = accels[int(len(accels) * 0.95)] if accels else 0.0
+        res.yaw_jerk_rms = math.sqrt(sum(j * j for j in jerks) / len(jerks)) if jerks else 0.0
+        res.rate_sign_flips_per_s = sign_flips / max(1e-6, res.time)
+        res.path_curvature = sum(curv) / len(curv) if curv else 0.0
+        return res

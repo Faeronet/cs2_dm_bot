@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.python-version
+*.dmp
+external/cs2-dumper/target/
+data/sim/
+data/maps/

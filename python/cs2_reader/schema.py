@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+from cs2_reader.platform import detect_platform, schema_file
+
+
+@dataclass(frozen=True)
+class Schema:
+    m_i_health: int
+    m_i_team_num: int
+    m_life_state: int
+    m_p_game_scene_node: int
+    m_vec_abs_origin: int
+    m_b_dormant: int
+    m_v_old_origin: int
+    m_h_player_pawn: int
+    m_b_pawn_is_alive: int
+    m_s_sanitized_player_name: int
+    m_armor_value: int
+    m_ang_eye_angles: int
+    m_vec_view_offset: int
+    m_entity_spotted_state: int
+    m_b_spotted: int
+    m_b_spotted_by_mask: int
+    m_b_is_scoped: int = 0
+    m_i_shots_fired: int = 0
+    m_b_is_defusing: int = 0
+    m_i_ping: int = 0
+    m_f_flags: int = 0
+    m_vec_velocity: int = 0
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> "Schema":
+        path = path or schema_file()
+        raw = json.loads(path.read_text(encoding="utf-8"))
+
+        if "client.dll" in raw:
+            classes = raw["client.dll"]["classes"]
+        elif "libclient.so" in raw:
+            classes = raw["libclient.so"]["classes"]
+        else:
+            raise KeyError(f"Unknown schema format in {path}")
+
+        def field(class_name: str, field_name: str) -> int:
+            return classes[class_name]["fields"][field_name]
+
+        return cls(
+            m_i_health=field("C_BaseEntity", "m_iHealth"),
+            m_i_team_num=field("C_BaseEntity", "m_iTeamNum"),
+            m_life_state=field("C_BaseEntity", "m_lifeState"),
+            m_p_game_scene_node=field("C_BaseEntity", "m_pGameSceneNode"),
+            m_vec_abs_origin=field("CGameSceneNode", "m_vecAbsOrigin"),
+            m_b_dormant=field("CGameSceneNode", "m_bDormant"),
+            m_v_old_origin=field("C_BasePlayerPawn", "m_vOldOrigin"),
+            m_h_player_pawn=field("CCSPlayerController", "m_hPlayerPawn"),
+            m_b_pawn_is_alive=field("CCSPlayerController", "m_bPawnIsAlive"),
+            m_s_sanitized_player_name=field("CCSPlayerController", "m_sSanitizedPlayerName"),
+            m_armor_value=field("C_CSPlayerPawn", "m_ArmorValue"),
+            m_ang_eye_angles=field("C_CSPlayerPawn", "m_angEyeAngles"),
+            m_vec_view_offset=field("C_BaseModelEntity", "m_vecViewOffset"),
+            m_entity_spotted_state=field("C_CSPlayerPawn", "m_entitySpottedState"),
+            m_b_spotted=field("EntitySpottedState_t", "m_bSpotted"),
+            m_b_spotted_by_mask=field("EntitySpottedState_t", "m_bSpottedByMask"),
+            m_b_is_scoped=field("C_CSPlayerPawn", "m_bIsScoped"),
+            m_i_shots_fired=field("C_CSPlayerPawn", "m_iShotsFired"),
+            m_b_is_defusing=field("C_CSPlayerPawn", "m_bIsDefusing"),
+            m_i_ping=field("CCSPlayerController", "m_iPing"),
+            m_f_flags=field("C_BaseEntity", "m_fFlags"),
+            m_vec_velocity=field("C_BaseEntity", "m_vecVelocity"),
+        )
