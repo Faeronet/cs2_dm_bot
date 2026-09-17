@@ -105,6 +105,11 @@ def main() -> int:
     samples = 0
     duration = 0.0
     poll_hz = None
+    crouch_points: list[list[int]] = []
+    crouch_path: list[list[int] | None] = []
+    crouch_duration = 0.0
+    crouch_samples = 0
+    crouch_created: str | None = None
     for f in files:
         raw = json.loads(f.read_text(encoding="utf-8"))
         m = raw.get("map", "unknown")
@@ -123,6 +128,19 @@ def main() -> int:
         samples += int(raw.get("samples", 0))
         duration += float(raw.get("duration_s", 0.0))
         poll_hz = poll_hz or raw.get("poll_hz")
+        crouch = raw.get("crouch") or {}
+        file_crouch_pts = [[int(v) for v in p] for p in crouch.get("points") or []]
+        file_crouch_path = [
+            [int(v) for v in p] if p is not None else None for p in (crouch.get("path") or file_crouch_pts)
+        ]
+        if file_crouch_pts:
+            crouch_created = crouch_created or crouch.get("created")
+            crouch_duration += float(crouch.get("duration_s", 0.0))
+            crouch_samples += int(crouch.get("samples", 0))
+            crouch_points.extend(file_crouch_pts)
+            if crouch_path and file_crouch_path:
+                crouch_path.append(None)
+            crouch_path.extend(file_crouch_path)
 
     kept, dropped = dedup_across(files_points, args.radius)
     for f, pts, d in zip(files, files_points, dropped):
@@ -146,6 +164,27 @@ def main() -> int:
         "points": kept,
         "path": path,
     }
+    if crouch_points:
+        seen: set[tuple[int, int, int]] = set()
+        merged_crouch: list[list[int]] = []
+        for p in crouch_points:
+            t = (p[0], p[1], p[2])
+            if t in seen:
+                continue
+            seen.add(t)
+            merged_crouch.append(p)
+        payload["crouch"] = {
+            "created": crouch_created or datetime.now(timezone.utc).isoformat(),
+            "updated": datetime.now(timezone.utc).isoformat(),
+            "sources": sources,
+            "poll_hz": poll_hz,
+            "duration_s": round(crouch_duration, 2),
+            "samples": crouch_samples,
+            "unique_points": len(merged_crouch),
+            "points": merged_crouch,
+            "path": crouch_path,
+        }
+        print(f"Crouch: {len(merged_crouch)} точек")
     out.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"→ {out}")
     return 0

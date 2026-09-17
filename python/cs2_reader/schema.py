@@ -42,6 +42,22 @@ class Schema:
     m_b_gun_game_immunity: int = 0
     m_b_has_moved_since_spawn: int = 0
     m_h_my_weapons: int = 0
+    m_p_entity: int = 0
+    m_designer_name: int = 0
+    m_name: int = 0
+    m_p_collision: int = 0
+    m_vec_mins: int = 0
+    m_vec_maxs: int = 0
+    m_vec_surrounding_mins: int = 0
+    m_vec_surrounding_maxs: int = 0
+    m_vec_ladder_dir: int = 0
+    m_vec_local_top: int = 0
+    m_vec_player_mount_top: int = 0
+    m_vec_player_mount_bottom: int = 0
+    m_fl_auto_ride_speed: int = 0
+    m_b_ladder_disabled: int = 0
+    m_b_fake_ladder: int = 0
+    m_b_ladder_has_slack: int = 0
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Schema":
@@ -92,4 +108,20 @@ class Schema:
             m_b_gun_game_immunity=field("C_CSPlayerPawn", "m_bGunGameImmunity"),
             m_b_has_moved_since_spawn=field("C_CSPlayerPawnBase", "m_bHasMovedSinceSpawn"),
             m_h_my_weapons=field("CPlayer_WeaponServices", "m_hMyWeapons"),
+            m_p_entity=field("CEntityInstance", "m_pEntity"),
+            m_designer_name=field("CEntityIdentity", "m_designerName"),
+            m_name=field("CEntityIdentity", "m_name"),
+            m_p_collision=field("C_BaseEntity", "m_pCollision"),
+            m_vec_mins=field("CCollisionProperty", "m_vecMins"),
+            m_vec_maxs=field("CCollisionProperty", "m_vecMaxs"),
+            m_vec_surrounding_mins=field("CCollisionProperty", "m_vecSurroundingMins"),
+            m_vec_surrounding_maxs=field("CCollisionProperty", "m_vecSurroundingMaxs"),
+            m_vec_ladder_dir=field("C_FuncLadder", "m_vecLadderDir"),
+            m_vec_local_top=field("C_FuncLadder", "m_vecLocalTop"),
+            m_vec_player_mount_top=field("C_FuncLadder", "m_vecPlayerMountPositionTop"),
+            m_vec_player_mount_bottom=field("C_FuncLadder", "m_vecPlayerMountPositionBottom"),
+            m_fl_auto_ride_speed=field("C_FuncLadder", "m_flAutoRideSpeed"),
+            m_b_ladder_disabled=field("C_FuncLadder", "m_bDisabled"),
+            m_b_fake_ladder=field("C_FuncLadder", "m_bFakeLadder"),
+            m_b_ladder_has_slack=field("C_FuncLadder", "m_bHasSlack"),
         )

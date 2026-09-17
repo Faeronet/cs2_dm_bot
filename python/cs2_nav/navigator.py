@@ -148,6 +148,7 @@ class NavConfig:
     # --- мишени вокруг (LOS по карте + spotted, не конус камеры)
     engage_targets: bool = True              # смотреть на видимую вокруг мишень, продолжая идти по маршруту
     enemies_poll_hz: float = 20.0            # как часто читать список врагов из памяти (перебор 64 сущностей)
+    ladders_poll_hz: float = 0.5             # лестницы меняются редко — полный перебор entity list
     target_memory: float = 45.0              # с: помним, где стояла мишень, когда её уже не видно (для обхода)
     standoff_dist: float = 110.0             # u: если мишень перекрыла проход — подойти на столько и стрелять с места
     standoff_wait: float = 4.0               # с: стоим на дистанции без мишени в прицеле → бросаем, другая цель
@@ -280,6 +281,7 @@ class _PoseSource:
     def local_shots_fired(self): ...
     def local_is_scoped(self): ...
     def poll_life(self): ...
+    def ladders(self): ...
 
 
 class Navigator:
@@ -365,6 +367,7 @@ class Navigator:
         self._brake = False
         self.visible_enemies: list[dict] = []
         self.all_enemies: list[dict] = []        # видимые + скрытые (координаты из памяти)
+        self.ladders: list[dict] = []            # func_ladder на карте (из entity list)
         self.known_targets: list[dict] = []      # живые враги, которые сейчас в памяти
         self._known: dict[int, dict] = {}
         self._hunt: dict | None = None           # скрытая мишень: куда выйти, чтобы увидеть
@@ -398,6 +401,7 @@ class Navigator:
         self._target_bumps = 0                   # сколько раз подряд упирались в мишень
         self._target_contact_since: float | None = None
         self._enemies_next_poll = 0.0
+        self._ladders_next_poll = 0.0
         # соглашение yaw подтверждено движением (до этого не стреляем — прицел может быть смещён)
         self.yaw_verified = not self.cfg.detect_yaw_offset
         # стрельба
@@ -572,6 +576,22 @@ class Navigator:
 
     def _read_visible_enemies(self) -> list[dict]:
         return [e for e in self._read_enemies() if e.get("visible")]
+
+    def _read_ladders(self) -> list[dict]:
+        fn = getattr(self.reader, "ladders", None)
+        if not callable(fn):
+            return []
+        out: list[dict] = []
+        try:
+            for lad in fn():
+                if hasattr(lad, "to_dict"):
+                    out.append(lad.to_dict())
+                elif isinstance(lad, dict):
+                    out.append(lad)
+        except Exception as exc:
+            self.log(f"ladders: ошибка чтения ({exc})")
+            return self.ladders
+        return out
 
     def _read_weapon(self) -> dict:
         fn = getattr(self.reader, "local_weapon", None)
@@ -3282,6 +3302,10 @@ class Navigator:
                     self._replan((x, y, z), "мишень пропала, продолжаем маршрут")
             self.known_targets = list(self._known.values())
 
+        if now >= self._ladders_next_poll:
+            self._ladders_next_poll = now + 1.0 / max(0.05, cfg.ladders_poll_hz)
+            self.ladders = self._read_ladders()
+
         combat = (
             self.engaged
             or self._flick is not None
@@ -3308,6 +3332,7 @@ class Navigator:
             "pitch": round(mem_pitch, 1),
             "visible_enemies": self.visible_enemies,
             "all_enemies": self.all_enemies,
+            "ladders": self.ladders,
             "weapon": self.weapon,
             "life": self.life,
         }

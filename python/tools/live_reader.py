@@ -67,6 +67,17 @@ def print_snapshot(snap, json_mode: bool) -> None:
             f"chest=({chest.x:.1f},{chest.y:.1f},{chest.z:.1f}) ~{meters:.1f}m"
         )
 
+    print(f"\nLadders ({len(snap.ladders)}):")
+    for lad in snap.ladders[:12]:
+        meters = lad.distance / 39.37
+        print(
+            f"  #{lad.index:4} h={lad.height:.0f} w={lad.width:.0f} d={lad.depth:.0f} "
+            f"bot=({lad.bottom.x:.0f},{lad.bottom.y:.0f},{lad.bottom.z:.0f}) "
+            f"top=({lad.top.x:.0f},{lad.top.y:.0f},{lad.top.z:.0f}) ~{meters:.0f}m"
+        )
+    if len(snap.ladders) > 12:
+        print(f"  … ещё {len(snap.ladders) - 12}")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="CS2 live memory reader")

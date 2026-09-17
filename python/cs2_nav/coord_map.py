@@ -87,6 +87,7 @@ class CoordinateMap:
         self.fill_radius: float = self.cfg.hull_radius
         self.lane_spacing: float | None = None
         self.n_points = 0
+        self.crouch_points: list[tuple[float, float, float]] = []
         self.bounds = (0.0, 0.0, 0.0, 0.0)  # min_x, min_y, max_x, max_y (мировые)
 
     # ------------------------------------------------------------------ build
@@ -101,6 +102,7 @@ class CoordinateMap:
         paths = [Path(p) for p in (path if isinstance(path, (list, tuple)) else [path])]
         pts: list[tuple[float, float, float]] = []
         trail: list[tuple[float, float, float]] = []
+        crouch_pts: list[tuple[float, float, float]] = []
         map_name, location = "unknown", paths[0].stem
         for i, p in enumerate(paths):
             raw = json.loads(p.read_text(encoding="utf-8"))
@@ -108,6 +110,11 @@ class CoordinateMap:
                 map_name = str(raw.get("map", "unknown"))
                 location = str(raw.get("location", p.stem))
             file_pts = [(float(q[0]), float(q[1]), float(q[2])) for q in raw.get("points", [])]
+            crouch_block = raw.get("crouch") or {}
+            for q in crouch_block.get("points") or []:
+                if q is None:
+                    continue
+                crouch_pts.append((float(q[0]), float(q[1]), float(q[2])))
             # null в path — разрыв между склеенными записями (merge_recordings.py)
             gap = (float("nan"), float("nan"), float("nan"))
             file_trail = [
@@ -121,7 +128,9 @@ class CoordinateMap:
             trail.extend(file_trail)
         if len(paths) > 1:
             location = f"{location}+{len(paths) - 1}"
-        return cls.build(pts, trail, map_name=map_name, location=location, cfg=cfg)
+        cm = cls.build(pts, trail, map_name=map_name, location=location, cfg=cfg)
+        cm.crouch_points = _dedupe_xyz(crouch_pts)
+        return cm
 
     @classmethod
     def build(
@@ -436,10 +445,30 @@ class CoordinateMap:
         n = self.nearest_node(x, y, z, max_radius=32.0)
         return n.clearance if n else 0.0
 
+    def near_crouch(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        *,
+        radius_xy: float = 24.0,
+        dz_max: float = 32.0,
+    ) -> bool:
+        """True, если рядом есть записанная точка прохода с приседанием."""
+        r2 = radius_xy * radius_xy
+        for cx, cy, cz in self.crouch_points:
+            if abs(cz - z) > dz_max:
+                continue
+            dx, dy = cx - x, cy - y
+            if dx * dx + dy * dy <= r2:
+                return True
+        return False
+
     def stats(self) -> dict:
         cl = sorted(n.clearance for n in self.nodes)
         return {
             "points": self.n_points,
+            "crouch_points": len(self.crouch_points),
             "nodes": len(self.nodes),
             "cells": len(self.cells),
             "multi_layer_cells": sum(1 for v in self.cells.values() if len(v) > 1),
@@ -464,3 +493,15 @@ class CoordinateMap:
             if hits:
                 return hits[0]
         raise FileNotFoundError(f"нет записи для {map_name}/{location or '*'}")
+
+
+def _dedupe_xyz(points: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
+    seen: set[tuple[int, int, int]] = set()
+    out: list[tuple[float, float, float]] = []
+    for x, y, z in points:
+        key = (round(x), round(y), round(z))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((x, y, z))
+    return out

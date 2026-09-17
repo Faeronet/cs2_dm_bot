@@ -4,6 +4,10 @@
 Перед стартом обязательно: карта (de_dust2 …) и зона (b_tunnel, short …).
 Бегаете по локации — скрипт пишет уникальные целые (x, y, z).
 В консоли: stop / стоп / q — сохранить и выйти.
+
+Дополнительно — проходы, где нужно приседать (--crouch):
+  python3 python/tools/record_coords.py -m de_dust2 -l lower_tunel1 --crouch
+Запись дописывается в блок «crouch» уже существующего JSON (points/path не трогаются).
 """
 
 from __future__ import annotations
@@ -148,6 +152,30 @@ def _wait_for_stop(stop: threading.Event) -> None:
             return
 
 
+def _recording_path(map_name: str, location: str) -> Path:
+    return OUT_DIR / map_name / f"{location}.json"
+
+
+def _load_recording(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _dedupe_points(existing: list[list[int]], new: list[list[int]]) -> list[list[int]]:
+    seen = {tuple(p) for p in existing}
+    out = list(existing)
+    for p in new:
+        t = tuple(p)
+        if t not in seen:
+            seen.add(t)
+            out.append(p)
+    return out
+
+
 def _merge_nearby(points: list[list[int]], radius: int) -> list[list[int]]:
     """Убрать точки ближе radius (2D) — на случай мелкого дрожания округления."""
     if radius <= 0:
@@ -165,7 +193,7 @@ def _merge_nearby(points: list[list[int]], radius: int) -> list[list[int]]:
     return kept
 
 
-def _save(
+def _save_walk(
     map_name: str,
     location: str,
     points: list[list[int]],
@@ -173,21 +201,95 @@ def _save(
     poll_hz: float,
     samples: int,
     duration_s: float,
+    *,
+    append: bool = False,
 ) -> Path:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUT_DIR / map_name / f"{location}.json"
+    out = _recording_path(map_name, location)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    payload = {
-        "map": map_name,
-        "location": location,
-        "created": datetime.now(timezone.utc).isoformat(),
+    now = datetime.now(timezone.utc).isoformat()
+    payload = _load_recording(out) if append else None
+    if payload is None:
+        payload = {
+            "map": map_name,
+            "location": location,
+            "created": now,
+            "poll_hz": poll_hz,
+            "duration_s": round(duration_s, 2),
+            "samples": samples,
+            "unique_points": len(points),
+            "points": points,
+            "path": path,
+        }
+    else:
+        old_pts = payload.get("points") or []
+        old_path = payload.get("path") or []
+        merged_pts = _dedupe_points(old_pts, points)
+        merged_path = list(old_path)
+        if merged_path and path:
+            merged_path.append(None)
+        merged_path.extend(path)
+        payload["map"] = map_name
+        payload["location"] = location
+        payload["updated"] = now
+        payload["poll_hz"] = poll_hz
+        payload["duration_s"] = round(float(payload.get("duration_s", 0.0)) + duration_s, 2)
+        payload["samples"] = int(payload.get("samples", 0)) + samples
+        payload["unique_points"] = len(merged_pts)
+        payload["points"] = merged_pts
+        payload["path"] = merged_path
+
+    out.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return out
+
+
+def _save_crouch(
+    map_name: str,
+    location: str,
+    points: list[list[int]],
+    path: list[list[int]],
+    poll_hz: float,
+    samples: int,
+    duration_s: float,
+    *,
+    replace: bool = False,
+) -> Path:
+    """Дописать блок crouch в существующий файл (основные points/path не меняются)."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out = _recording_path(map_name, location)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now(timezone.utc).isoformat()
+    payload = _load_recording(out)
+    if payload is None:
+        payload = {
+            "map": map_name,
+            "location": location,
+            "created": now,
+            "points": [],
+            "path": [],
+            "unique_points": 0,
+        }
+
+    prev = {} if replace else (payload.get("crouch") or {})
+    old_pts = [] if replace else list(prev.get("points") or [])
+    old_path = [] if replace else list(prev.get("path") or [])
+    merged_pts = _dedupe_points(old_pts, points)
+    merged_path = list(old_path)
+    if merged_path and path:
+        merged_path.append(None)
+    merged_path.extend(path)
+
+    payload["crouch"] = {
+        "created": prev.get("created") or now,
+        "updated": now,
         "poll_hz": poll_hz,
-        "duration_s": round(duration_s, 2),
-        "samples": samples,
-        "unique_points": len(points),
-        "points": points,
-        "path": path,
+        "duration_s": round(float(prev.get("duration_s", 0.0)) + duration_s, 2),
+        "samples": int(prev.get("samples", 0)) + samples,
+        "unique_points": len(merged_pts),
+        "points": merged_pts,
+        "path": merged_path,
     }
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return out
@@ -206,6 +308,21 @@ def main() -> int:
         default=0,
         help="После stop: убрать точки ближе N единиц (0 = только точные дубликаты)",
     )
+    parser.add_argument(
+        "--crouch",
+        action="store_true",
+        help="Запись проходов с приседанием → блок crouch в существующем JSON",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Дописать точки к уже сохранённой записи (обычный режим; для --crouch включено по умолчанию)",
+    )
+    parser.add_argument(
+        "--replace-crouch",
+        action="store_true",
+        help="С --crouch: заменить блок crouch целиком, а не дополнять",
+    )
     parser.add_argument("--list", action="store_true", help="Показать сохранённые записи и выйти")
     args = parser.parse_args()
 
@@ -217,7 +334,10 @@ def main() -> int:
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 n = data.get("unique_points", len(data.get("points", [])))
-                print(f"{path.relative_to(ROOT)}  —  {n} точек")
+                crouch = data.get("crouch") or {}
+                nc = crouch.get("unique_points", len(crouch.get("points", [])))
+                extra = f", crouch={nc}" if nc else ""
+                print(f"{path.relative_to(ROOT)}  —  {n} точек{extra}")
             except (json.JSONDecodeError, OSError):
                 print(path.relative_to(ROOT))
         return 0
@@ -264,10 +384,30 @@ def main() -> int:
 
     threading.Thread(target=_wait_for_stop, args=(stop,), daemon=True).start()
 
+    rec_path = _recording_path(map_name, location)
+    crouch_mode = args.crouch
+    append_mode = args.append or crouch_mode
+
     print()
-    print(f"Карта: {map_name}  |  зона: {location}  |  опрос: {args.hz:.0f} Hz")
-    print("Бегай по локации. Новые точки пишутся ниже.")
-    print("Остановка: введите stop (или стоп / q) и Enter")
+    mode_txt = "ПРИСЕД (блок crouch)" if crouch_mode else "ходьба (points/path)"
+    print(f"Карта: {map_name}  |  зона: {location}  |  режим: {mode_txt}  |  опрос: {args.hz:.0f} Hz")
+    if crouch_mode:
+        if rec_path.is_file():
+            prev = _load_recording(rec_path) or {}
+            nc = (prev.get("crouch") or {}).get("unique_points", 0)
+            print(f"Файл: {rec_path.relative_to(ROOT)}  (сейчас crouch={nc} точек)")
+            if args.replace_crouch:
+                print("Блок crouch будет заменён целиком (--replace-crouch).")
+            else:
+                print("Новые точки допишутся в блок crouch (основная карта не меняется).")
+        else:
+            print(f"Файл создастся: {rec_path.relative_to(ROOT)} (пока без основных points).")
+        print("Идите по проходам, где нужно приседать (Ctrl).")
+    elif append_mode and rec_path.is_file():
+        print(f"Дописываем к {rec_path.relative_to(ROOT)}")
+    else:
+        print("Бегай по локации.")
+    print("Новые точки пишутся ниже. Остановка: stop / стоп / q + Enter")
     print("-" * 50)
 
     t0 = time.perf_counter()
@@ -317,10 +457,38 @@ def main() -> int:
         print("Нет записанных точек.")
         return 1
 
-    out = _save(map_name, location, points, path, args.hz, samples, duration_s)
-    print("-" * 50)
-    print(f"Готово: {len(points)} уникальных точек за {duration_s:.1f} s")
-    print(f"Опросов: {samples} (~{samples / duration_s:.0f} Hz)")
+    if crouch_mode:
+        out = _save_crouch(
+            map_name,
+            location,
+            points,
+            path,
+            args.hz,
+            samples,
+            duration_s,
+            replace=args.replace_crouch,
+        )
+        data = _load_recording(out) or {}
+        nc = (data.get("crouch") or {}).get("unique_points", len(points))
+        print("-" * 50)
+        print(f"Готово: +{len(points)} точек приседания за {duration_s:.1f} s")
+        print(f"В блоке crouch всего: {nc} точек")
+    else:
+        out = _save_walk(
+            map_name,
+            location,
+            points,
+            path,
+            args.hz,
+            samples,
+            duration_s,
+            append=append_mode,
+        )
+        data = _load_recording(out) or {}
+        print("-" * 50)
+        print(f"Готово: {len(points)} новых точек за {duration_s:.1f} s")
+        print(f"В записи всего: {data.get('unique_points', len(points))} точек")
+    print(f"Опросов: {samples} (~{samples / max(duration_s, 0.001):.0f} Hz)")
     print(f"Файл: {out}")
     return 0
 

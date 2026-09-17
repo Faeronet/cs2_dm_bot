@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +34,7 @@ from cs2_reader.offsets import (
     Offsets,
 )
 from cs2_reader.platform import Platform, client_module_name, detect_platform, engine_module_name
+from cs2_reader.ladders import LadderInfo, entity_designer_name, is_ladder_entity, read_ladder
 from cs2_reader.life import (
     LIFE_ALIVE,
     LIFE_RESPAWNING,
@@ -45,6 +47,9 @@ from cs2_reader.schema import Schema
 from cs2_reader.visibility import read_radar_spotted, spotted_by_viewer
 from cs2_reader.vulnerability import read_pawn_vulnerability
 from cs2_reader.weapons import is_healthshot, weapon_name
+
+MAX_ENTITIES = 8192
+LADDER_CACHE_TTL = 5.0
 
 
 class Reader:
@@ -73,6 +78,9 @@ class Reader:
             else GLOBAL_VARS_MAP_NAME_WINDOWS
         )
         self._life_tracker = LifeTracker()
+        self._ladder_cache: list[LadderInfo] = []
+        self._ladder_cache_at = 0.0
+        self._ladder_map = ""
 
     @classmethod
     def from_pid(cls, pid: int) -> "Reader":
@@ -583,6 +591,57 @@ class Reader:
         """DM: любой живой игрок, кроме себя (без фильтра по команде)."""
         return not p.is_local and p.alive and p.team > 1
 
+    def highest_entity_index(self) -> int:
+        client = self._client_base()
+        off = self.offsets.client
+        if not client or not off.dw_game_entity_system or not off.dw_game_entity_system_highest_entity_index:
+            return MAX_ENTITIES
+        ges = self.backend.read_u64(client + off.dw_game_entity_system)
+        if not ges:
+            return MAX_ENTITIES
+        hi = self.backend.read_i32(ges + off.dw_game_entity_system_highest_entity_index)
+        return min(max(hi or 0, 0), MAX_ENTITIES)
+
+    def ladders(self, force_refresh: bool = False) -> list[LadderInfo]:
+        """Все func_ladder на карте: координаты, направление, габариты (кэш ~5 с)."""
+        map_name = self.map_name()
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._ladder_cache
+            and now - self._ladder_cache_at < LADDER_CACHE_TTL
+            and self._ladder_map == map_name
+        ):
+            local = self.local_position()
+            for lad in self._ladder_cache:
+                lad.distance = lad.center.distance_to(local)
+            return self._ladder_cache
+
+        local = self.local_position()
+        out: list[LadderInfo] = []
+        seen: set[tuple[int, int, int]] = set()
+        for i in range(1, self.highest_entity_index() + 1):
+            ent = self.entity_by_index(i)
+            if not ent or ent < 0x10000:
+                continue
+            cls = entity_designer_name(self.backend, self.schema, ent)
+            if not is_ladder_entity(cls):
+                continue
+            lad = read_ladder(self.backend, self.schema, ent, i, local, name=cls or "func_ladder")
+            if not lad or lad.disabled:
+                continue
+            key = (round(lad.bottom.x), round(lad.bottom.y), round(lad.bottom.z))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(lad)
+
+        out.sort(key=lambda lad: lad.distance)
+        self._ladder_cache = out
+        self._ladder_cache_at = now
+        self._ladder_map = map_name
+        return out
+
     def bomb_info(self) -> BombInfo | None:
         client = self._client_base()
         if not client or not self.offsets.client.dw_planted_c4:
@@ -634,6 +693,7 @@ class Reader:
             p for p in snap.players if self._is_enemy(p) and p.spotted and not p.dormant
         ]
         snap.bomb = self.bomb_info()
+        snap.ladders = self.ladders()
         return snap
 
     def _read_build_number(self, engine: int) -> int:

@@ -140,6 +140,7 @@ class GameSnapshot:
     enemies: list[EnemyInfo] = field(default_factory=list)
     visible_enemies: list[PlayerInfo] = field(default_factory=list)
     bomb: BombInfo | None = None
+    ladders: list = field(default_factory=list)  # list[LadderInfo]
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -213,5 +214,6 @@ class GameSnapshot:
             "enemies": [enemy_dict(e) for e in self.enemies],
             "visible_enemies": [player_dict(p) for p in self.visible_enemies],
             "bomb": {"planted": self.bomb.planted, "position": vec(self.bomb.position)} if self.bomb else None,
+            "ladders": [lad.to_dict() for lad in self.ladders],
             "errors": self.errors,
         }
