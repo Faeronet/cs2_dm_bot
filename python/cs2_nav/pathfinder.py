@@ -27,6 +27,7 @@ class RouteConfig:
     wall_weight: float = 3.0            # сила штрафа за близость к стене
     jump_penalty: float = 80.0
     drop_penalty: float = 24.0
+    ladder_penalty: float = 36.0            # лестница дешевле прыжка, дороже пола
     climb_weight: float = 0.6           # за каждый юнит подъёма
     los_min_clearance: float = 12.0     # минимум clearance на прямом отрезке (0.75 hull)
     los_sample: float = 4.0             # шаг проверки отрезка (юниты)
@@ -35,10 +36,11 @@ class RouteConfig:
 
 def _edge_cost(cm: CoordinateMap, a: Node, b: Node, hdist: float, kind: str, cfg: RouteConfig) -> float:
     cost = hdist
-    c = min(a.clearance, b.clearance)
-    if c < cfg.preferred_clearance:
-        t = (cfg.preferred_clearance - c) / cfg.preferred_clearance
-        cost *= 1.0 + cfg.wall_weight * t * t
+    if kind != "ladder":
+        c = min(a.clearance, b.clearance)
+        if c < cfg.preferred_clearance:
+            t = (cfg.preferred_clearance - c) / cfg.preferred_clearance
+            cost *= 1.0 + cfg.wall_weight * t * t
     dz = b.z - a.z
     if dz > 0:
         cost += dz * cfg.climb_weight
@@ -46,6 +48,8 @@ def _edge_cost(cm: CoordinateMap, a: Node, b: Node, hdist: float, kind: str, cfg
         cost += cfg.jump_penalty
     elif kind == "drop":
         cost += cfg.drop_penalty
+    elif kind == "ladder":
+        cost += cfg.ladder_penalty + abs(dz) * 0.35
     return cost
 
 
@@ -107,7 +111,11 @@ def dijkstra(
                 continue
             b = cm.nodes[nb_id]
             if geometric:
-                step = hdist + abs(b.z - a.z) * 0.5 + (cfg.jump_penalty if kind == "jump" else 0.0)
+                step = hdist + abs(b.z - a.z) * 0.5
+                if kind == "jump":
+                    step += cfg.jump_penalty
+                elif kind == "ladder":
+                    step += abs(b.z - a.z) * 0.2
             else:
                 step = _edge_cost(cm, a, b, hdist, kind, cfg)
             nd = d + step
@@ -242,7 +250,7 @@ def smooth_path(
         best_j = i + 1
         j = i + 1
         while j < n:
-            # прыжок/спуск между соседями нельзя срезать
+            # прыжок / лестница / большой спуск между соседями нельзя срезать
             if abs(pts[j][2] - pts[j - 1][2]) > cm.cfg.step_height:
                 break
             span = j - i

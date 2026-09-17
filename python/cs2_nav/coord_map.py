@@ -88,6 +88,9 @@ class CoordinateMap:
         self.lane_spacing: float | None = None
         self.n_points = 0
         self.crouch_points: list[tuple[float, float, float]] = []
+        self._crouch_grid: dict[tuple[int, int], list[tuple[float, float, float]]] = {}
+        self.ladder_links: list[dict] = []
+        self._ladder_keys: set[tuple[int, int, int, int, int, int]] = set()
         self.bounds = (0.0, 0.0, 0.0, 0.0)  # min_x, min_y, max_x, max_y (мировые)
 
     # ------------------------------------------------------------------ build
@@ -111,25 +114,36 @@ class CoordinateMap:
                 location = str(raw.get("location", p.stem))
             file_pts = [(float(q[0]), float(q[1]), float(q[2])) for q in raw.get("points", [])]
             crouch_block = raw.get("crouch") or {}
+            file_crouch: list[tuple[float, float, float]] = []
             for q in crouch_block.get("points") or []:
                 if q is None:
                     continue
-                crouch_pts.append((float(q[0]), float(q[1]), float(q[2])))
+                file_crouch.append((float(q[0]), float(q[1]), float(q[2])))
+            crouch_pts.extend(file_crouch)
             # null в path — разрыв между склеенными записями (merge_recordings.py)
             gap = (float("nan"), float("nan"), float("nan"))
             file_trail = [
                 gap if q is None else (float(q[0]), float(q[1]), float(q[2]))
                 for q in (raw.get("path") or file_pts)
             ]
+            crouch_trail = [
+                gap if q is None else (float(q[0]), float(q[1]), float(q[2]))
+                for q in (crouch_block.get("path") or file_crouch)
+            ]
             pts.extend(file_pts)
+            pts.extend(file_crouch)
             if trail and file_trail:
-                # разрыв между файлами: точка далеко «в никуда», чтобы _segments не соединил
-                trail.append((float("nan"), float("nan"), float("nan")))
+                trail.append(gap)
             trail.extend(file_trail)
+            if crouch_trail:
+                if trail:
+                    trail.append(gap)
+                trail.extend(crouch_trail)
         if len(paths) > 1:
             location = f"{location}+{len(paths) - 1}"
         cm = cls.build(pts, trail, map_name=map_name, location=location, cfg=cfg)
         cm.crouch_points = _dedupe_xyz(crouch_pts)
+        cm._index_crouch()
         return cm
 
     @classmethod
@@ -451,18 +465,104 @@ class CoordinateMap:
         y: float,
         z: float,
         *,
-        radius_xy: float = 24.0,
-        dz_max: float = 32.0,
+        radius_xy: float = 28.0,
+        dz_max: float = 40.0,
     ) -> bool:
         """True, если рядом есть записанная точка прохода с приседанием."""
+        cell = self.cfg.cell
         r2 = radius_xy * radius_xy
-        for cx, cy, cz in self.crouch_points:
-            if abs(cz - z) > dz_max:
-                continue
-            dx, dy = cx - x, cy - y
-            if dx * dx + dy * dy <= r2:
-                return True
+        cx0, cy0 = int(math.floor(x / cell)), int(math.floor(y / cell))
+        reach = max(1, int(math.ceil(radius_xy / cell)))
+        grid = self._crouch_grid
+        if not grid:
+            pts = self.crouch_points
+            for px, py, pz in pts:
+                if abs(pz - z) > dz_max:
+                    continue
+                dx, dy = px - x, py - y
+                if dx * dx + dy * dy <= r2:
+                    return True
+            return False
+        for dx in range(-reach, reach + 1):
+            for dy in range(-reach, reach + 1):
+                for px, py, pz in grid.get((cx0 + dx, cy0 + dy), ()):
+                    if abs(pz - z) > dz_max:
+                        continue
+                    if (px - x) * (px - x) + (py - y) * (py - y) <= r2:
+                        return True
         return False
+
+    def _index_crouch(self) -> None:
+        grid: dict[tuple[int, int], list[tuple[float, float, float]]] = {}
+        cell = self.cfg.cell
+        for p in self.crouch_points:
+            key = (int(math.floor(p[0] / cell)), int(math.floor(p[1] / cell)))
+            grid.setdefault(key, []).append(p)
+        self._crouch_grid = grid
+
+    def attach_ladders(self, ladders: list) -> int:
+        """Связать ярусы карты рёбрами ladder (дно↔верх). Повторный вызов идемпотентен."""
+        added = 0
+        for raw in ladders or []:
+            lad = _ladder_as_dict(raw)
+            if not lad or lad.get("disabled") or lad.get("fake"):
+                continue
+            bot = lad["bottom"]
+            top = lad["top"]
+            if top[2] < bot[2]:
+                bot, top = top, bot
+            key = (
+                round(bot[0]), round(bot[1]), round(bot[2]),
+                round(top[0]), round(top[1]), round(top[2]),
+            )
+            if key in self._ladder_keys:
+                continue
+            n_bot = self._node_for_mount(bot[0], bot[1], bot[2])
+            n_top = self._node_for_mount(top[0], top[1], top[2])
+            if n_bot is None or n_top is None or n_bot.id == n_top.id:
+                continue
+            if abs(n_top.z - n_bot.z) < self.cfg.jump_height + 4.0:
+                continue
+            hdist = math.hypot(n_top.x - n_bot.x, n_top.y - n_bot.y) + abs(n_top.z - n_bot.z)
+            if not any(e[0] == n_top.id and e[2] == "ladder" for e in n_bot.edges):
+                n_bot.edges.append((n_top.id, hdist, "ladder"))
+            if not any(e[0] == n_bot.id and e[2] == "ladder" for e in n_top.edges):
+                n_top.edges.append((n_bot.id, hdist, "ladder"))
+            self._ladder_keys.add(key)
+            self.ladder_links.append(
+                {
+                    "bottom_id": n_bot.id,
+                    "top_id": n_top.id,
+                    "bottom": bot,
+                    "top": top,
+                    "ladder": lad,
+                }
+            )
+            added += 1
+        return added
+
+    def _node_for_mount(self, x: float, y: float, z: float):
+        n = self.nearest_node(x, y, z, max_radius=72.0)
+        if n is not None and n.dist2d(x, y) <= 56.0 and abs(n.z - z) <= 48.0:
+            return n
+        return self._insert_mount_node(x, y, z)
+
+    def _insert_mount_node(self, x: float, y: float, z: float):
+        cx, cy = self.cell_of(x, y)
+        node = Node(id=len(self.nodes), cx=cx, cy=cy, z=z, x=x, y=y, clearance=18.0, recorded=True)
+        self.nodes.append(node)
+        self.cells.setdefault((cx, cy), []).append(node)
+        c = self.cfg
+        for dx, dy, mult in _NEIGH8:
+            for nb in self.cells.get((cx + dx, cy + dy), ()):
+                if nb.id == node.id:
+                    continue
+                if abs(nb.z - z) > c.step_height:
+                    continue
+                hdist = c.cell * mult
+                node.edges.append((nb.id, hdist, "walk"))
+                nb.edges.append((node.id, hdist, "walk"))
+        return node
 
     def stats(self) -> dict:
         cl = sorted(n.clearance for n in self.nodes)
@@ -477,6 +577,7 @@ class CoordinateMap:
             "clearance_median": round(cl[len(cl) // 2], 1) if cl else 0.0,
             "clearance_max": round(cl[-1], 1) if cl else 0.0,
             "jump_edges": sum(1 for n in self.nodes for e in n.edges if e[2] == "jump") // 2,
+            "ladder_edges": sum(1 for n in self.nodes for e in n.edges if e[2] == "ladder") // 2,
             "z_min": round(min(n.z for n in self.nodes), 1),
             "z_max": round(max(n.z for n in self.nodes), 1),
         }
@@ -505,3 +606,42 @@ def _dedupe_xyz(points: list[tuple[float, float, float]]) -> list[tuple[float, f
         seen.add(key)
         out.append((x, y, z))
     return out
+
+
+def _xyz3(v) -> tuple[float, float, float] | None:
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        return float(v.get("x", 0.0)), float(v.get("y", 0.0)), float(v.get("z", 0.0))
+    if hasattr(v, "x"):
+        return float(v.x), float(v.y), float(v.z)
+    if isinstance(v, (tuple, list)) and len(v) >= 3:
+        return float(v[0]), float(v[1]), float(v[2])
+    return None
+
+
+def _ladder_as_dict(raw) -> dict | None:
+    if raw is None:
+        return None
+    if hasattr(raw, "to_dict"):
+        d = raw.to_dict()
+    elif isinstance(raw, dict):
+        d = dict(raw)
+    else:
+        return None
+    bot = _xyz3(d.get("bottom"))
+    top = _xyz3(d.get("top"))
+    if bot is None or top is None:
+        return None
+    d["bottom"] = bot
+    d["top"] = top
+    ctr = _xyz3(d.get("center"))
+    if ctr is not None:
+        d["center"] = ctr
+    mins = _xyz3(d.get("bounds_mins"))
+    maxs = _xyz3(d.get("bounds_maxs"))
+    if mins is not None:
+        d["bounds_mins"] = mins
+    if maxs is not None:
+        d["bounds_maxs"] = maxs
+    return d

@@ -58,6 +58,7 @@ class Schema:
     m_b_ladder_disabled: int = 0
     m_b_fake_ladder: int = 0
     m_b_ladder_has_slack: int = 0
+    m_n_actual_move_type: int = 0
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Schema":
@@ -124,4 +125,5 @@ class Schema:
             m_b_ladder_disabled=field("C_FuncLadder", "m_bDisabled"),
             m_b_fake_ladder=field("C_FuncLadder", "m_bFakeLadder"),
             m_b_ladder_has_slack=field("C_FuncLadder", "m_bHasSlack"),
+            m_n_actual_move_type=field("C_BaseEntity", "m_nActualMoveType"),
         )

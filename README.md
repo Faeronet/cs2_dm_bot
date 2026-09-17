@@ -74,7 +74,7 @@ python3 python/tools/walk_test.py --leg 1.5 --circle 8
 локации: новая/расширенная запись подхватывается автоматически.
 
 ```bash
-# Живой запуск (CS2 в фокусе). По умолчанию data/recordings/de_dust2/de_dust2.json
+# Живой запуск (CS2 в фокусе). По умолчанию data/recordings/de_mirage/de_mirage.json
 python3 python/tools/walk_nav.py --duration 30
 python3 python/tools/walk_nav.py -r data/recordings/de_dust2/lower_tunel1.json --loop --png /tmp/route.png
 

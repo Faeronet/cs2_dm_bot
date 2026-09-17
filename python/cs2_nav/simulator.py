@@ -196,6 +196,12 @@ class FakeReader:
     def local_has_healthshot(self) -> bool:
         return False
 
+    def ladders(self, force_refresh: bool = False):
+        return []
+
+    def local_on_ladder(self) -> bool:
+        return False
+
     def poll_life(self):
         from cs2_reader.life import LocalLifeInfo, LocalLifeUpdate, LifeEvents
 

@@ -236,6 +236,15 @@ class Reader:
         coords = self.backend.read_vec3(pawn + self.schema.m_vec_velocity)
         return Vec3(*coords) if coords else Vec3()
 
+    def local_move_type(self) -> int:
+        pawn = self.local_pawn()
+        if not pawn or not self.schema.m_n_actual_move_type:
+            return 0
+        return int(self.backend.read_u8(pawn + self.schema.m_n_actual_move_type) or 0)
+
+    def local_on_ladder(self) -> bool:
+        return self.local_move_type() in (8, 9)
+
     def local_eye_angles(self) -> Vec3:
         """pitch=X, yaw=Y, roll=Z (m_angEyeAngles)."""
         pawn = self.local_pawn()

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from cs2_control.input import GameInput
-from cs2_nav.coord_map import CoordinateMap
+from cs2_nav.coord_map import CoordinateMap, _ladder_as_dict
 from cs2_nav.pathfinder import (
     Obstacle,
     RouteConfig,
@@ -243,6 +243,8 @@ class NavConfig:
     rcs_rate_jitter: float = 0.045           # ± доля скорости xxHash
     rcs_gain: float = 10.5                   # 1/с: догон линии, не lock 340°/с
     rcs_wind_sigma: float = 0.32             # °/с ветер WindMouse на линии
+    rcs_return_mul: tuple[float, float] = (0.92, 1.32)  # xxHash: скорость возврата от скорости RCS
+    rcs_return_done: float = 0.65            # °: считаем, что вернулись
     rcs_break_deg: float = 5.5               # °: сошли с линии слишком далеко — отпускаем зажим
     rcs_path_frac: float = 0.55              # допуск «на линии» vs овал первого выстрела
     # --- перезарядка / осмотр / нож / дальние тапы
@@ -282,6 +284,7 @@ class _PoseSource:
     def local_is_scoped(self): ...
     def poll_life(self): ...
     def ladders(self): ...
+    def local_on_ladder(self): ...
 
 
 class Navigator:
@@ -368,6 +371,9 @@ class Navigator:
         self.visible_enemies: list[dict] = []
         self.all_enemies: list[dict] = []        # видимые + скрытые (координаты из памяти)
         self.ladders: list[dict] = []            # func_ladder на карте (из entity list)
+        self._ladders_linked = False
+        self._ladder: dict | None = None         # подъём/спуск по лестнице
+        self._crouch_until = 0.0
         self.known_targets: list[dict] = []      # живые враги, которые сейчас в памяти
         self._known: dict[int, dict] = {}
         self._hunt: dict | None = None           # скрытая мишень: куда выйти, чтобы увидеть
@@ -436,6 +442,10 @@ class Navigator:
         self._rcs_arc = 0.0
         self._rcs_rate_var = 0.0
         self._rcs_sampled = False
+        self._rcs_return = False
+        self._rcs_return_rate = 28.0
+        self._rcs_return_until = 0.0
+        self._rcs_return_seeded = True
         # флик: None | dict(t0, T, dyaw, dpitch, s_prev); _flick_pending — новый захват, флик ещё не спланирован
         self._flick: dict | None = None
         self._flick_pending = False
@@ -592,6 +602,215 @@ class Navigator:
             self.log(f"ladders: ошибка чтения ({exc})")
             return self.ladders
         return out
+
+    def _read_on_ladder(self) -> bool:
+        fn = getattr(self.reader, "local_on_ladder", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
+    def _sync_ladders(self, now: float, pos: XYZ, combat: bool) -> None:
+        cfg = self.cfg
+        if now < self._ladders_next_poll:
+            return
+        self._ladders_next_poll = now + 1.0 / max(0.05, cfg.ladders_poll_hz)
+        self.ladders = self._read_ladders()
+        if not self.ladders:
+            return
+        n = self.map.attach_ladders(self.ladders)
+        if n and not self._ladders_linked:
+            self._ladders_linked = True
+            self.log(f"Лестницы: {len(self.ladders)} шт., {n} связей на карте")
+            if self.route is not None and not combat:
+                self._replan(pos, "лестницы подключены")
+
+    def _ladder_facing(self, lad: dict) -> tuple[float, float]:
+        bot = lad["bottom"]
+        mins = lad.get("bounds_mins")
+        maxs = lad.get("bounds_maxs")
+        if isinstance(mins, (tuple, list)) and isinstance(maxs, (tuple, list)):
+            cx = (mins[0] + maxs[0]) * 0.5
+            cy = (mins[1] + maxs[1]) * 0.5
+            fx, fy = bot[0] - cx, bot[1] - cy
+            ln = math.hypot(fx, fy)
+            if ln >= 4.0:
+                return fx / ln, fy / ln
+            sx = abs(maxs[0] - mins[0])
+            sy = abs(maxs[1] - mins[1])
+            if sx <= sy:
+                return (1.0 if bot[0] >= cx else -1.0), 0.0
+            return 0.0, (1.0 if bot[1] >= cy else -1.0)
+        top = lad["top"]
+        fx, fy = bot[0] - top[0], bot[1] - top[1]
+        ln = math.hypot(fx, fy)
+        if ln < 1.0:
+            return 1.0, 0.0
+        return fx / ln, fy / ln
+
+    def _match_ladder(self, a: XYZ, b: XYZ) -> dict | None:
+        lo_z, hi_z = (a[2], b[2]) if a[2] <= b[2] else (b[2], a[2])
+        best = None
+        best_d = 80.0
+        for raw in self.ladders:
+            lad = _ladder_as_dict(raw)
+            if not lad:
+                continue
+            bot, top = lad["bottom"], lad["top"]
+            if top[2] < bot[2]:
+                bot, top = top, bot
+            d = min(
+                math.hypot(a[0] - bot[0], a[1] - bot[1]) + abs(a[2] - bot[2]) * 0.4,
+                math.hypot(a[0] - top[0], a[1] - top[1]) + abs(a[2] - top[2]) * 0.4,
+                math.hypot(b[0] - bot[0], b[1] - bot[1]) + abs(b[2] - bot[2]) * 0.4,
+                math.hypot(b[0] - top[0], b[1] - top[1]) + abs(b[2] - top[2]) * 0.4,
+            )
+            if abs(bot[2] - lo_z) > 72.0 and abs(top[2] - hi_z) > 72.0:
+                continue
+            if d < best_d:
+                best_d, best = d, lad
+        return best
+
+    def _ladder_exit_side(self, lad: dict, dest: tuple[float, float], going_up: bool) -> str:
+        """Куда уходит маршрут после лестницы: left / right / forward / back."""
+        exit_pt = lad["top"] if going_up else lad["bottom"]
+        fx, fy = self._ladder_facing(lad)
+        dx, dy = dest[0] - exit_pt[0], dest[1] - exit_pt[1]
+        fwd = dx * fx + dy * fy
+        right = dx * (-fy) + dy * fx
+        if fwd < -20.0 and abs(fwd) >= abs(right) * 0.85:
+            return "back"
+        if abs(right) > 16.0 and abs(right) > abs(fwd) * 0.55:
+            return "right" if right > 0.0 else "left"
+        return "forward"
+
+    def _update_ladder(self, now: float, route: Route, x: float, y: float, z: float) -> None:
+        on = self._read_on_ladder()
+        if self._ladder is not None:
+            st = self._ladder
+            lad = st["lad"]
+            going_up = bool(st["up"])
+            exit_z = lad["top"][2] if going_up else lad["bottom"][2]
+            done_z = (z >= exit_z - 14.0) if going_up else (z <= exit_z + 18.0)
+            if st["phase"] == "exit":
+                if math.hypot(st["mx"] - x, st["my"] - y) < 28.0 or now - st.get("exit_t0", st["t0"]) > 1.5:
+                    self._ladder = None
+                    self.log("Лестница: обошли дыру")
+                return
+            if now - st["t0"] > 9.0:
+                self._ladder = None
+                return
+            if on:
+                st["phase"] = "climb"
+                st["seen"] = True
+                return
+            if st.get("seen") and done_z:
+                if st["side"] == "back":
+                    fx, fy = self._ladder_facing(lad)
+                    sx, sy = (-fy, fx) if st.get("strafe") == "d" else (fy, -fx)
+                    exit_pt = lad["top"] if going_up else lad["bottom"]
+                    st["phase"] = "exit"
+                    st["mx"] = exit_pt[0] + sx * 52.0 + fx * 10.0
+                    st["my"] = exit_pt[1] + sy * 52.0 + fy * 10.0
+                    st["exit_t0"] = now
+                    self.log("Лестница: обход дыры")
+                    return
+                self._ladder = None
+                self.log("Лестница: сошли")
+                return
+            if st["phase"] == "approach" and math.hypot(st["mx"] - x, st["my"] - y) < 22.0:
+                st["phase"] = "mount"
+            return
+        span = route.vertical_span_ahead(self.s, 72.0, self.map.cfg.jump_height + 10.0)
+        if span is None:
+            return
+        a, b, going_up, idx = span
+        lad = self._match_ladder(a, b)
+        if lad is None:
+            return
+        fx, fy = self._ladder_facing(lad)
+        mount = lad["bottom"] if going_up else lad["top"]
+        mx, my = mount[0] + fx * 18.0, mount[1] + fy * 18.0
+        dest = route.pts[min(len(route.pts) - 1, idx + 2)]
+        side = self._ladder_exit_side(lad, (dest[0], dest[1]), going_up)
+        dx, dy = dest[0] - (lad["top"][0] if going_up else lad["bottom"][0]), dest[1] - (
+            lad["top"][1] if going_up else lad["bottom"][1]
+        )
+        _fx, _fy = fx, fy
+        right = dx * (-_fy) + dy * _fx
+        self._ladder = {
+            "lad": lad,
+            "up": going_up,
+            "phase": "approach",
+            "mx": mx,
+            "my": my,
+            "side": side,
+            "strafe": "d" if right >= 0.0 else "a",
+            "t0": now,
+            "seen": on,
+        }
+        self.log(f"Лестница ({'вверх' if going_up else 'вниз'}, выход {side})")
+
+    def _ladder_keys(self, x: float, y: float, z: float, yaw: float, speed: float) -> set[str]:
+        st = self._ladder
+        assert st is not None
+        lad = st["lad"]
+        going_up = bool(st["up"])
+        phase = st["phase"]
+        on = self._read_on_ladder()
+        if on:
+            st["phase"] = "climb"
+            st["seen"] = True
+            exit_z = lad["top"][2] if going_up else lad["bottom"][2]
+            near_exit = (exit_z - z < 30.0) if going_up else (z - exit_z < 26.0)
+            if near_exit:
+                side = st["side"]
+                if side == "left":
+                    return {"w", "a"}
+                if side == "right":
+                    return {"w", "d"}
+                if side == "back":
+                    return {"w", str(st.get("strafe") or "d")}
+                return {"w"}
+            return {"w"} if going_up else {"s"}
+        mx, my = st["mx"], st["my"]
+        bearing = yaw_to_target(x, y, mx, my)
+        rel = shortest_yaw_err(bearing, yaw)
+        if phase == "exit" or (phase == "approach" and math.hypot(mx - x, my - y) > 22.0):
+            return self._choose_keys(rel, rel, speed, engaged=False)
+        return {"w"}
+
+    def _ladder_look(self, x: float, y: float, z: float) -> tuple[float, float]:
+        st = self._ladder
+        assert st is not None
+        lad = st["lad"]
+        going_up = bool(st["up"])
+        fx, fy = self._ladder_facing(lad)
+        bot, top = lad["bottom"], lad["top"]
+        phase = st["phase"]
+        if phase in ("approach", "exit"):
+            tx, ty, tz = st["mx"], st["my"], z + 8.0
+        elif going_up:
+            tx, ty, tz = top[0] - fx * 8.0, top[1] - fy * 8.0, min(top[2], z + 70.0)
+        else:
+            tx, ty, tz = bot[0] - fx * 8.0, bot[1] - fy * 8.0, max(bot[2], z - 40.0)
+        yaw = yaw_to_target(x, y, tx, ty)
+        horiz = math.hypot(tx - x, ty - y)
+        pitch = -math.degrees(math.atan2(tz - (z + self._eye_z), max(1.0, horiz)))
+        return yaw, max(-55.0, min(50.0, pitch))
+
+    def _want_crouch(self, x: float, y: float, z: float, route: Route, cx: float, cy: float, cz: float) -> bool:
+        if self._ladder is not None:
+            return False
+        r = 28.0
+        if self.map.near_crouch(x, y, z, radius_xy=r):
+            return True
+        if self.map.near_crouch(cx, cy, cz, radius_xy=r):
+            return True
+        ax, ay, az = route.point_at(min(route.length, self.s + 36.0))
+        return self.map.near_crouch(ax, ay, az, radius_xy=r)
 
     def _read_weapon(self) -> dict:
         fn = getattr(self.reader, "local_weapon", None)
@@ -1040,7 +1259,7 @@ class Navigator:
 
     def _rcs_offset(self, now: float) -> tuple[float, float]:
         """Куда сместить взгляд относительно головы: линия спрея с лагом и кривой."""
-        if not self._rcs_active():
+        if not self._rcs_active() or self._rcs_return or not self._fire_held:
             return 0.0, 0.0
         wid = int(self.weapon.get("id") or 0)
         wname = str(self.weapon.get("name") or "")
@@ -1095,6 +1314,54 @@ class Navigator:
             )
         finally:
             cfg.hand_wind_sigma = old_sigma
+
+    def _begin_rcs_return(self) -> None:
+        """После зажима: вернуть прицел быстро и плавно, скорость как у RCS, путь WindMouse как на маршруте."""
+        if self._rcs_return:
+            return
+        if not self._rcs_sampled or self._rcs_shots_seen < 1:
+            return
+        if self._long_spray is False:
+            return
+        lo, hi = self.cfg.rcs_return_mul
+        base = self.cfg.rcs_rate * (1.0 + self._rcs_rate_var)
+        self._rcs_return_rate = base * (lo + self._xx_u01() * (hi - lo))
+        self._rcs_return = True
+        self._rcs_return_until = self._now() + 1.45
+        self._rcs_return_seeded = False
+        self._flick = None
+        self._flick_pending = False
+        self._correct_from = 0.0
+
+    def _rcs_return_going(self, now: float, yaw_err: float, pitch_err: float) -> bool:
+        if not self._rcs_return:
+            return False
+        if self._fire_held and self._rcs_active():
+            self._rcs_return = False
+            return False
+        if math.hypot(yaw_err, pitch_err) < self.cfg.rcs_return_done or now > self._rcs_return_until:
+            self._rcs_return = False
+            return False
+        return True
+
+    def _rcs_return_step(self, yaw_err: float, pitch_err: float, dt: float) -> tuple[float, float]:
+        """Возврат: стартовая скорость как у RCS, ветер — тот же, что панорама маршрута."""
+        if not self._rcs_return_seeded:
+            mag = math.hypot(yaw_err, pitch_err)
+            if mag > 0.05:
+                v = self._rcs_return_rate
+                self._yaw_rate = v * yaw_err / mag
+                self._pitch_rate = v * pitch_err / mag
+                self._yaw_acc = 0.0
+                self._pitch_acc = 0.0
+            self._rcs_return_seeded = True
+        rate = self._rcs_return_rate
+        return self._camera_step(
+            yaw_err, pitch_err, dt, 0.0,
+            rate_max=rate, gain=self.cfg.rcs_gain,
+            pitch_gain=self.cfg.rcs_gain, pitch_rate_max=rate,
+            deadband=0.08, wind=True,
+        )
 
     # ------------------------------------------------------------ targets
 
@@ -1715,6 +1982,9 @@ class Navigator:
         self._habit = None
         self._brake = False
         self._pause_until = 0.0
+        self._ladder = None
+        self._crouch_until = 0.0
+        self._rcs_return = False
         self.done = False
         self.release()
         self.log("Умер — клавиши сброшены, ждём респавн")
@@ -1739,6 +2009,8 @@ class Navigator:
         self._target = None
         self.engaged = False
         self._hpshot_thr = None
+        self._ladder = None
+        self._crouch_until = 0.0
         try:
             self.plan(pos)
             self.log("Респавн — новый случайный маршрут")
@@ -2333,7 +2605,7 @@ class Navigator:
         # ветер до ограничения по ошибке: у цели гасим, иначе камера уезжает и виляет
         if wind:
             activity = min(1.0, (abs(self._yaw_rate) + abs(self._pitch_rate)) / 60.0)
-            activity *= min(1.0, abs(yaw_err) / 3.5)
+            activity *= min(1.0, math.hypot(yaw_err, pitch_err) / 3.5)
             wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay)
             d_yaw += wy * activity * dt
             d_pitch += wp * activity * 0.5 * dt
@@ -2724,6 +2996,9 @@ class Navigator:
                 self._pitch_rate, self._pitch_acc, 0.0, dt, cfg.yaw_accel_max, cfg.yaw_jerk_max
             )
             return self._yaw_rate * dt, self._pitch_rate * dt, "settle"
+        if self._rcs_return_going(now, yaw_err, pitch_err):
+            d_yaw, d_pitch = self._rcs_return_step(yaw_err, pitch_err, dt)
+            return d_yaw, d_pitch, "rcs_return"
         if not (self._rcs_active() and self._fire_held):
             if math.hypot(yaw_err, pitch_err) >= cfg.flick_min_deg * 1.25 and self._subflicks < 1:
                 self._subflicks += 1
@@ -3128,10 +3403,13 @@ class Navigator:
         return True
 
     def _release_fire(self) -> None:
-        if self._fire_held:
+        was = self._fire_held
+        if was:
             self.input.mouse_up("left")
         self._fire_held = False
         self._fire_release_at_tick = -1
+        if was:
+            self._begin_rcs_return()
 
     def _release_fire_if_due(self) -> None:
         if self._fire_release_at_tick >= 0 and self._tick_no >= self._fire_release_at_tick:
@@ -3302,16 +3580,13 @@ class Navigator:
                     self._replan((x, y, z), "мишень пропала, продолжаем маршрут")
             self.known_targets = list(self._known.values())
 
-        if now >= self._ladders_next_poll:
-            self._ladders_next_poll = now + 1.0 / max(0.05, cfg.ladders_poll_hz)
-            self.ladders = self._read_ladders()
-
         combat = (
             self.engaged
             or self._flick is not None
             or self._flick_pending
             or (self._target is not None)
         )
+        self._sync_ladders(now, (x, y, z), combat)
         if combat:
             if not self._cal_frozen:
                 self._cal_win.clear()
@@ -3392,7 +3667,7 @@ class Navigator:
         self.s, off = route.project(x, y, self.s)
         gx, gy, gz = route.goal
         goal_d = math.hypot(gx - x, gy - y)
-        if off > cfg.off_route_replan:
+        if off > cfg.off_route_replan and self._ladder is None:
             self._replan((x, y, z), f"ушли с маршрута на {off:.0f}u")
             route = self.route
             assert route is not None
@@ -3406,6 +3681,7 @@ class Navigator:
                 blocker is not None
                 and blocker.get("visible")
                 and self._blockers_key() != self._route_blockers
+                and self._ladder is None
             ):
                 self._replan((x, y, z), f"мишень {blocker.get('name') or blocker['index']} на пути")
                 route = self.route
@@ -3413,7 +3689,7 @@ class Navigator:
                 self.s, off = route.project(x, y, None)
 
         # скрытая мишень: заход в точку с LOS (пик), исходную дальнюю не бросаем
-        if now >= self._hunt_check_at:
+        if now >= self._hunt_check_at and self._ladder is None:
             self._hunt_check_at = now + cfg.hunt_check_s
             prev_via = (
                 None
@@ -3530,7 +3806,13 @@ class Navigator:
         else:
             self._hunt_via_since = 0.0
 
-        if not hold and self._standoff is None and dest_d <= cfg.arrive_radius and abs(dest_z - z) <= 48.0:
+        if (
+            not hold
+            and self._standoff is None
+            and self._ladder is None
+            and dest_d <= cfg.arrive_radius
+            and abs(dest_z - z) <= 48.0
+        ):
             self.log(f"Цель достигнута ({x:.0f},{y:.0f},{z:.0f})")
             if cfg.loop:
                 if self._apply_next_route((x, y, z)):
@@ -3571,6 +3853,14 @@ class Navigator:
                 look_d *= warm_k
         lx, ly, lz = route.point_at(self.s + look_d)
         cx_, cy_, cz_ = self._carrot((x, y, z), route)
+        if self._ladder is not None:
+            ph = self._ladder.get("phase")
+            if self.firing and ph in ("approach", "mount") and not self._read_on_ladder():
+                self._ladder = None
+            else:
+                self._update_ladder(now, route, x, y, z)
+        elif not self.firing:
+            self._update_ladder(now, route, x, y, z)
 
         # медленное блуждание прицела ±wander
         # блуждание взгляда: плавный дрейф (случайная скорость с инерцией), а не белый шум на точку
@@ -3612,7 +3902,11 @@ class Navigator:
             hunt_look = self._hunt_look(x, y, z, route)
             if hunt_look is None and now < self._hunt_look_until and self._hunt_look_hold is not None:
                 hunt_look = self._hunt_look_hold
-            if hunt_look is not None:
+            if self._ladder is not None:
+                look_yaw, pitch_target = self._ladder_look(x, y, z)
+                look_mode = "ladder"
+                self._hunt_look_hold = None
+            elif hunt_look is not None:
                 self._hunt_look_hold = hunt_look
                 self._hunt_look_until = now + 0.3
                 look_yaw, pitch_target = hunt_look
@@ -3663,6 +3957,11 @@ class Navigator:
             tx, ty, _ = target["position"]
             aim_dist = math.hypot(tx - x, ty - y)
             self._update_aim_chase(target, x, y, dt, now)
+            if self._rcs_return:
+                look_yaw = aim_yaw
+                pitch_target = max(-60.0, min(60.0, aim_pitch))
+                yaw_err = shortest_yaw_err(look_yaw, yaw)
+                pitch_err = pitch_target - mem_pitch
             # рука: сначала как на маршруте (та же скорость), затем флик если угол ≥ 30°
             d_yaw, d_pitch, aim_phase = self._aim_step(
                 now, dt, yaw_err, pitch_err, aim_yaw, aim_pitch, speed, aim_dist
@@ -3678,7 +3977,10 @@ class Navigator:
             self._scope_committed = False
             if not self._unscoping() and (self._scoped_now or self._scope_held):
                 self._begin_unscope(now)
-            d_yaw, d_pitch = self._camera_step(yaw_err, pitch_err, dt, speed, rate_cap, gain)
+            if self._rcs_return_going(now, yaw_err, pitch_err):
+                d_yaw, d_pitch = self._rcs_return_step(yaw_err, pitch_err, dt)
+            else:
+                d_yaw, d_pitch = self._camera_step(yaw_err, pitch_err, dt, speed, rate_cap, gain)
             dx, dy = self._send_mouse(d_yaw, d_pitch)
 
         self._unscope_tick(now)
@@ -3687,7 +3989,12 @@ class Navigator:
         yaw_next = yaw + d_yaw
         move_bearing = self._steer_bearing(x, y, v.x, v.y, cx_, cy_)
         rel = shortest_yaw_err(move_bearing, yaw_next)
-        if self.firing:
+        climbing = self._ladder is not None and (
+            self._read_on_ladder() or self._ladder.get("phase") in ("climb", "mount", "exit")
+        )
+        if self._ladder is not None and (not self.firing or climbing):
+            keys = self._ladder_keys(x, y, z, yaw_next, speed)
+        elif self.firing:
             strafe_keys = self._combat_strafe_keys(v.x, v.y, speed, yaw_next)
             if strafe_keys is not None:
                 keys = strafe_keys
@@ -3712,21 +4019,28 @@ class Navigator:
             self._brake = False            # остановились, но не дошли — дошагиваем
         if goal_d < brake_d and speed > 60.0 and not cfg.loop:
             self._brake = True
-        if self._brake or hold:
+        if (self._brake or hold) and self._ladder is None:
             keys = set()
 
         # прыжок по маршруту — только реальная ступенька, не пандус и не шум записи
         if (
-            speed > 40.0
+            self._ladder is None
+            and speed > 40.0
             and now - self._last_jump_at >= 0.55
             and math.hypot(cx_ - x, cy_ - y) < 56.0
             and self._route_needs_jump(x, y, z, cx_, cy_)
         ):
             self._jump()
 
-        override = self._handle_stuck(now, (x, y, z), speed, keys, rel)
-        if override is not None:
-            keys = override
+        if self._ladder is None:
+            override = self._handle_stuck(now, (x, y, z), speed, keys, rel)
+            if override is not None:
+                keys = override
+
+        if self._want_crouch(x, y, z, route, cx_, cy_, cz_):
+            self._crouch_until = now + 0.18
+        if now < self._crouch_until and self._ladder is None:
+            keys.add("ctrl")
 
         if frozenset(keys) == frozenset(self._keys):
             self._same_keys_ticks += 1

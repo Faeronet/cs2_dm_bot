@@ -2,7 +2,7 @@
 """Живая навигация: карта из записей → случайная точка → камера + WASD.
 
 Примеры:
-  python3 python/tools/walk_nav.py --duration 30            # вся de_dust2
+  python3 python/tools/walk_nav.py --duration 30            # вся de_mirage
   python3 python/tools/walk_nav.py -r data/recordings/de_dust2/lower_tunel1.json
   python3 python/tools/walk_nav.py -r "data/recordings/de_dust2/*.json"   # склеить всё на лету
   python3 python/tools/walk_nav.py --png /tmp/route.png     # сохранить карту+маршрут перед стартом
@@ -43,7 +43,7 @@ def main() -> int:
     parser.add_argument(
         "--recording", "-r",
         action="append",
-        help="JSON записи (glob, можно несколько). По умолчанию вся de_dust2",
+        help="JSON записи (glob, можно несколько). По умолчанию вся de_mirage",
     )
     parser.add_argument("--duration", type=float, default=120.0, help="Лимит сек (0 = без лимита)")
     parser.add_argument("--countdown", type=int, default=5)
@@ -63,7 +63,7 @@ def main() -> int:
         print("Не запускай от root", file=sys.stderr)
         return 1
 
-    recs = resolve_recordings(args.recording or ["data/recordings/de_dust2/de_dust2.json"])
+    recs = resolve_recordings(args.recording or ["data/recordings/de_mirage/de_mirage.json"])
     if not recs:
         print("Записи не найдены", file=sys.stderr)
         return 1

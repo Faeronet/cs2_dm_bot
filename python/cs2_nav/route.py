@@ -83,6 +83,20 @@ class Route:
     def remaining(self, s: float) -> float:
         return max(0.0, self.length - s)
 
+    def vertical_span_ahead(
+        self, s: float, ahead: float, min_dz: float
+    ) -> tuple[XYZ, XYZ, bool, int] | None:
+        """Ближайший отрезок маршрута с большим Δz (лестница / ярус)."""
+        i = self.next_vertex_index(s)
+        k = max(0, i - 1)
+        end_s = s + ahead
+        while k + 1 < len(self.pts) and self.cum[k] <= end_s + 12.0:
+            a, b = self.pts[k], self.pts[k + 1]
+            if abs(b[2] - a[2]) >= min_dz:
+                return a, b, b[2] > a[2], k
+            k += 1
+        return None
+
     def slope_ahead(self, s: float, dist: float) -> float:
         """Уклон (градусы, + = вверх) на участке [s, s+dist]."""
         a = self.point_at(s)
