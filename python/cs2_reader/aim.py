@@ -6,6 +6,13 @@ import math
 
 from cs2_reader.game_state import Vec3
 
+BONE_HEAD = 6
+BONE_CHEST = 4   # spine_1 / верхняя грудь
+BONE_STRIDE = 32
+BONE_ARRAY_IN_MODEL_STATE = 0x80
+HEAD_ABOVE_EYES = 4.0  # fallback: центр головы чуть выше m_vecViewOffset (глаза)
+CHEST_BELOW_EYES = 8.0  # fallback: грудь чуть ниже m_vecViewOffset (глаза)
+
 
 def normalize_yaw(yaw: float) -> float:
     while yaw > 180.0:
@@ -48,6 +55,44 @@ def forward_from_angles(pitch: float, yaw: float) -> Vec3:
 
 def eye_position(feet: Vec3, view_offset_z: float = 64.0) -> Vec3:
     return Vec3(feet.x, feet.y, feet.z + view_offset_z)
+
+
+def head_center_from_view(feet: Vec3, view_offset: Vec3) -> Vec3:
+    """Оценка центра головы, если кость недоступна: m_vecViewOffset + небольшой подъём."""
+    return Vec3(
+        feet.x + view_offset.x,
+        feet.y + view_offset.y,
+        feet.z + view_offset.z + HEAD_ABOVE_EYES,
+    )
+
+
+def head_plausible(feet: Vec3, head: Vec3) -> bool:
+    dz = head.z - feet.z
+    if dz < 50.0 or dz > 92.0:
+        return False
+    if math.hypot(head.x - feet.x, head.y - feet.y) > 48.0:
+        return False
+    return True
+
+
+def chest_center_from_view(feet: Vec3, view_offset: Vec3) -> Vec3:
+    """Оценка центра груди, если кость недоступна."""
+    return Vec3(
+        feet.x + view_offset.x,
+        feet.y + view_offset.y,
+        feet.z + view_offset.z - CHEST_BELOW_EYES,
+    )
+
+
+def chest_plausible(feet: Vec3, chest: Vec3, head: Vec3 | None = None) -> bool:
+    dz = chest.z - feet.z
+    if dz < 28.0 or dz > 58.0:
+        return False
+    if math.hypot(chest.x - feet.x, chest.y - feet.y) > 48.0:
+        return False
+    if head is not None and chest.z >= head.z - 4.0:
+        return False
+    return True
 
 
 def aim_point(

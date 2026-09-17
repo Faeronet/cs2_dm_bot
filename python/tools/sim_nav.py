@@ -76,7 +76,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Симуляция навигации по recording JSON")
     parser.add_argument(
         "--recording", "-r",
-        default="data/recordings/de_dust2/tunels.json",
+        default="data/recordings/de_dust2/de_dust2.json",
         help="путь(и) через запятую или glob — несколько записей объединяются",
     )
     parser.add_argument("--duration", type=float, default=60.0)
@@ -96,6 +96,8 @@ def main() -> int:
     parser.add_argument("--no-engage", action="store_true", help="не смотреть на мишени (только обход)")
     parser.add_argument("--no-fire", action="store_true", help="смотреть на мишени, но не стрелять")
     parser.add_argument("--shots", type=int, default=0, help="лимит выстрелов по мишени (0 = пока не пропадёт)")
+    parser.add_argument("--weapon", default="ak47", help="оружие в руках: имя или id (ak47, usp, awp, ...)")
+    parser.add_argument("--clip", type=int, default=None, help="патронов в обойме (по умолчанию полный магазин)")
     parser.add_argument("--hits-to-kill", type=int, default=3, help="попаданий, после которых мишень-макет пропадает (0 = никогда)")
     parser.add_argument("--respawn", type=float, default=6.0, help="с до повторного появления мишени (0 = навсегда)")
     parser.add_argument("--quiet", action="store_true")
@@ -151,6 +153,7 @@ def main() -> int:
             engage_targets=not args.no_engage,
             fire_enabled=not args.no_fire,
             shots_per_target=args.shots,
+            habits_enabled=False,
         )
         sim_cfg = SimConfig(
             deg_per_px=args.game_sens,
@@ -160,6 +163,8 @@ def main() -> int:
             targets=targets,
             target_hits_to_kill=args.hits_to_kill,
             target_respawn=args.respawn,
+            weapon=args.weapon,
+            weapon_clip=args.clip,
         )
         sim = NavSimulator(cm, start, nav_config=nav_cfg, sim_config=sim_cfg, initial_yaw=yaw0)
         res = sim.run(duration=args.duration, log_every=int(args.hz))

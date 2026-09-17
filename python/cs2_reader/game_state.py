@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 
+from cs2_reader.life import LocalLifeInfo
+
 
 @dataclass
 class Vec3:
@@ -52,12 +54,60 @@ class PlayerInfo:
     shots_fired: int = 0
     flags: int = 0
     position: Vec3 = field(default_factory=Vec3)
+    head_position: Vec3 = field(default_factory=Vec3)  # центр головы (кость 6)
+    chest_position: Vec3 = field(default_factory=Vec3)  # центр груди (кость 4)
     eye_angles: Vec3 = field(default_factory=Vec3)
+    velocity: Vec3 = field(default_factory=Vec3)
     distance: float = 0.0
+    vulnerable: bool = True                        # not m_bGunGameImmunity
+    spawn_immunity: bool = False                   # m_bGunGameImmunity (DM после респавна)
+    has_moved_since_spawn: bool = True             # m_bHasMovedSinceSpawn
 
-    def aim_position(self, z_offset: float = 64.0) -> Vec3:
-        """Позиция для прицела: ноги из памяти + смещение по Z (уровень глаз)."""
-        return Vec3(self.position.x, self.position.y, self.position.z + z_offset)
+    def aim_position(self) -> Vec3:
+        """Центр головы для прицела (из кости, не ноги + константа)."""
+        return self.head_position
+
+
+@dataclass
+class EnemyInfo:
+    """Игрок-цель (DM FFA): координаты всегда читаются из памяти, видимость — отдельный флаг."""
+
+    index: int = 0
+    name: str = ""
+    health: int = 0
+    armor: int = 0
+    position: Vec3 = field(default_factory=Vec3)   # ноги (m_vOldOrigin)
+    head_position: Vec3 = field(default_factory=Vec3)  # центр головы (кость 6)
+    chest_position: Vec3 = field(default_factory=Vec3)  # центр груди (кость 4)
+    visible: bool = False                          # m_bSpottedByMask[local] и не dormant
+    radar_spotted: bool = False                    # m_bSpotted (радар / кем-то замечен)
+    dormant: bool = False                          # если True — position может быть устаревшей
+    distance: float = 0.0
+    velocity: Vec3 = field(default_factory=Vec3)
+    vulnerable: bool = True
+    spawn_immunity: bool = False
+    has_moved_since_spawn: bool = True
+
+    def aim_position(self) -> Vec3:
+        return self.head_position
+
+
+@dataclass
+class WeaponInfo:
+    """Активное оружие локального игрока."""
+
+    id: int = 0
+    name: str = ""
+    clip: int = 0              # патроны в обойме (m_iClip1)
+    in_reload: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "clip": self.clip,
+            "in_reload": self.in_reload,
+        }
 
 
 @dataclass
@@ -81,10 +131,13 @@ class GameSnapshot:
     local_eye_angles: Vec3 = field(default_factory=Vec3)
     local_aim_forward: Vec3 = field(default_factory=Vec3)
     local_aim_point: Vec3 = field(default_factory=Vec3)
+    local_weapon: WeaponInfo = field(default_factory=WeaponInfo)
+    local_life: LocalLifeInfo = field(default_factory=LocalLifeInfo)
     screen_width: float = 0.0
     screen_height: float = 0.0
     view_matrix: ViewMatrix | None = None
     players: list[PlayerInfo] = field(default_factory=list)
+    enemies: list[EnemyInfo] = field(default_factory=list)
     visible_enemies: list[PlayerInfo] = field(default_factory=list)
     bomb: BombInfo | None = None
     errors: list[str] = field(default_factory=list)
@@ -92,6 +145,26 @@ class GameSnapshot:
     def to_dict(self) -> dict:
         def vec(v: Vec3) -> dict:
             return {"x": v.x, "y": v.y, "z": v.z}
+
+        def enemy_dict(e: EnemyInfo) -> dict:
+            return {
+                "index": e.index,
+                "name": e.name,
+                "health": e.health,
+                "armor": e.armor,
+                "visible": e.visible,
+                "radar_spotted": e.radar_spotted,
+                "dormant": e.dormant,
+                "position": vec(e.position),
+                "head_position": vec(e.head_position),
+                "chest_position": vec(e.chest_position),
+                "aim_position": vec(e.aim_position()),
+                "distance": e.distance,
+                "velocity": vec(e.velocity),
+                "vulnerable": e.vulnerable,
+                "spawn_immunity": e.spawn_immunity,
+                "has_moved_since_spawn": e.has_moved_since_spawn,
+            }
 
         def player_dict(p: PlayerInfo) -> dict:
             return {
@@ -109,8 +182,14 @@ class GameSnapshot:
                 "defusing": p.defusing,
                 "shots_fired": p.shots_fired,
                 "position": vec(p.position),
+                "head_position": vec(p.head_position),
+                "chest_position": vec(p.chest_position),
                 "eye_angles": vec(p.eye_angles),
                 "distance": p.distance,
+                "velocity": vec(p.velocity),
+                "vulnerable": p.vulnerable,
+                "spawn_immunity": p.spawn_immunity,
+                "has_moved_since_spawn": p.has_moved_since_spawn,
             }
 
         return {
@@ -127,8 +206,11 @@ class GameSnapshot:
             "local_eye_angles": vec(self.local_eye_angles),
             "local_aim_forward": vec(self.local_aim_forward),
             "local_aim_point": vec(self.local_aim_point),
+            "local_weapon": self.local_weapon.to_dict(),
+            "local_life": self.local_life.to_dict(),
             "screen": {"width": self.screen_width, "height": self.screen_height},
             "players": [player_dict(p) for p in self.players],
+            "enemies": [enemy_dict(e) for e in self.enemies],
             "visible_enemies": [player_dict(p) for p in self.visible_enemies],
             "bomb": {"planted": self.bomb.planted, "position": vec(self.bomb.position)} if self.bomb else None,
             "errors": self.errors,

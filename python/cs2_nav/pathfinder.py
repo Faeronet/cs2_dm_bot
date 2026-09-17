@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import random
 from dataclasses import dataclass
 from typing import Callable
 
@@ -341,4 +342,46 @@ def pick_farthest_goal(
         free = _nearest_free(cm, node, blocked)
         if free is not None:
             node = free
+    return farthest_node(cm, node.id, cfg, blocked)
+
+
+def pick_random_goal(
+    cm: CoordinateMap,
+    start: XYZ,
+    cfg: RouteConfig | None = None,
+    blocked: set[int] | None = None,
+    rng: random.Random | None = None,
+    exclude: set[int] | None = None,
+    min_dist: float = 320.0,
+) -> int:
+    """Случайная достижимая клетка (не в углу, не вплотную к старту)."""
+    cfg = cfg or RouteConfig()
+    blocked = blocked or set()
+    exclude = exclude or set()
+    rng = rng or random.Random()
+    node = cm.nearest_node(start[0], start[1], start[2])
+    if node is None:
+        raise RuntimeError(f"позиция {start} вне карты")
+    if node.id in blocked:
+        free = _nearest_free(cm, node, blocked)
+        if free is not None:
+            node = free
+    max_cl = max(n.clearance for n in cm.nodes) if cm.nodes else 0.0
+    min_cl = min(cfg.goal_min_clearance, max_cl * 0.5) if max_cl else 0.0
+    pool = [
+        n for n in cm.nodes
+        if n.clearance >= min_cl and n.id not in blocked and n.id not in exclude and n.id != node.id
+    ]
+    if not pool:
+        pool = [n for n in cm.nodes if n.id not in blocked and n.id != node.id]
+    if not pool:
+        return node.id
+    n_try = min(10, len(pool))
+    for _ in range(n_try):
+        cand = pool[rng.randrange(len(pool))]
+        if math.hypot(cand.x - start[0], cand.y - start[1]) < min_dist and len(pool) > 8:
+            continue
+        ids = astar(cm, node.id, cand.id, cfg, blocked)
+        if ids:
+            return cand.id
     return farthest_node(cm, node.id, cfg, blocked)

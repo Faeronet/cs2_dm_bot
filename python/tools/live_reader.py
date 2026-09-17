@@ -30,9 +30,17 @@ def print_snapshot(snap, json_mode: bool) -> None:
     )
     eye = snap.local_eye_angles
     aim = snap.local_aim_point
+    wpn = snap.local_weapon
     print(
         f"Aim: pitch={eye.x:.1f} yaw={eye.y:.1f} → "
         f"({aim.x:.0f}, {aim.y:.0f}, {aim.z:.0f})"
+    )
+    print(f"Weapon: {wpn.name or '<none>'} (id={wpn.id}) clip={wpn.clip}" + (" reload" if wpn.in_reload else ""))
+    life = snap.local_life
+    vuln = "vuln" if life.vulnerable else "immune"
+    print(
+        f"Life: {life.status} hp={life.health} pawn_alive={'Y' if life.pawn_alive else 'N'} "
+        f"{vuln} moved={'Y' if life.has_moved_since_spawn else 'N'}"
     )
     if snap.errors:
         print("Errors:", ", ".join(snap.errors))
@@ -47,12 +55,16 @@ def print_snapshot(snap, json_mode: bool) -> None:
             f"pos=({p.position.x:.1f}, {p.position.y:.1f}, {p.position.z:.1f}){tag}"
         )
 
-    print(f"\nVisible enemies ({len(snap.visible_enemies)}):")
-    for e in snap.visible_enemies:
+    print(f"\nEnemies ({len(snap.enemies)}): visible={sum(1 for e in snap.enemies if e.visible)}")
+    for e in snap.enemies:
+        tag = "VISIBLE" if e.visible else ("radar" if e.radar_spotted else "hidden")
         meters = e.distance / 39.37
+        vuln = "vuln" if e.vulnerable else "immune"
+        chest = e.chest_position
         print(
-            f"  {e.name or '<unknown>':16} hp={e.health} "
-            f"pos=({e.position.x:.1f}, {e.position.y:.1f}, {e.position.z:.1f}) ~{meters:.1f}m"
+            f"  [{tag:7}] {e.name or '<unknown>':16} hp={e.health} {vuln} "
+            f"head=({e.head_position.x:.1f},{e.head_position.y:.1f},{e.head_position.z:.1f}) "
+            f"chest=({chest.x:.1f},{chest.y:.1f},{chest.z:.1f}) ~{meters:.1f}m"
         )
 
 

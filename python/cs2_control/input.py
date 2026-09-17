@@ -20,6 +20,11 @@ KEY_MAP = {
     "space": "KEY_SPACE",
     "ctrl": "KEY_LEFTCTRL",
     "shift": "KEY_LEFTSHIFT",
+    "r": "KEY_R",
+    "f": "KEY_F",
+    "1": "KEY_1",
+    "2": "KEY_2",
+    "3": "KEY_3",
 }
 
 MOUSE_BUTTONS = {
@@ -53,6 +58,10 @@ class GameInput:
 
     def mouse_up(self, button: str = "left") -> None:
         raise NotImplementedError
+
+    def mouse_wheel(self, delta: int) -> None:
+        """Колесо: +1 вверх (invprev), −1 вниз (invnext)."""
+        return
 
     def mouse_click(self, button: str = "left", hold_ms: int = 30) -> None:
         self.mouse_down(button)
@@ -170,6 +179,14 @@ class EvdevInput(GameInput):
         self._ui.write(self._e.EV_KEY, code, 0)
         self._ui.syn()
         self._btn_down.discard(button)
+
+    def mouse_wheel(self, delta: int) -> None:
+        steps = int(delta)
+        if not steps:
+            return
+        with self._write_lock:
+            self._ui.write(self._e.EV_REL, self._e.REL_WHEEL, steps)
+            self._ui.syn()
 
     def key_down(self, key: str) -> None:
         if key not in KEY_MAP or key in self._down:
@@ -290,6 +307,14 @@ class XdotoolInput(GameInput):
     def mouse_up(self, button: str = "left") -> None:
         if button in MOUSE_BUTTONS:
             self._xdo("mouseup", str(MOUSE_BUTTONS[button][1]))
+
+    def mouse_wheel(self, delta: int) -> None:
+        steps = int(delta)
+        if not steps:
+            return
+        btn = "4" if steps > 0 else "5"
+        for _ in range(abs(steps)):
+            self._xdo("click", btn)
 
     def close(self) -> None:
         self.release_all()

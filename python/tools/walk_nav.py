@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Живая навигация: карта из записей → самая дальняя точка → камера + WASD.
+"""Живая навигация: карта из записей → случайная точка → камера + WASD.
 
 Примеры:
-  python3 python/tools/walk_nav.py --duration 30            # tunels.json (нижний + верхний туннели)
-  python3 python/tools/walk_nav.py -r data/recordings/de_dust2/lower_tunel1.json --loop
+  python3 python/tools/walk_nav.py --duration 30            # вся de_dust2
+  python3 python/tools/walk_nav.py -r data/recordings/de_dust2/lower_tunel1.json
   python3 python/tools/walk_nav.py -r "data/recordings/de_dust2/*.json"   # склеить всё на лету
   python3 python/tools/walk_nav.py --png /tmp/route.png     # сохранить карту+маршрут перед стартом
 """
@@ -43,20 +43,19 @@ def main() -> int:
     parser.add_argument(
         "--recording", "-r",
         action="append",
-        help="JSON записи (glob, можно несколько). По умолчанию tunels.json",
+        help="JSON записи (glob, можно несколько). По умолчанию вся de_dust2",
     )
     parser.add_argument("--duration", type=float, default=120.0, help="Лимит сек (0 = без лимита)")
     parser.add_argument("--countdown", type=int, default=5)
     parser.add_argument("--hz", type=float, default=40.0)
-    parser.add_argument("--loop", action="store_true", help="Дошли → выбрать новую дальнюю цель и идти дальше")
-    parser.add_argument("--goal", type=int, default=None, help="id узла-цели (по умолчанию самая дальняя)")
+    parser.add_argument("--no-loop", action="store_true", help="Остановиться на первой цели, не брать следующую")
+    parser.add_argument("--goal", type=int, default=None, help="id узла-цели (по умолчанию случайная точка)")
     parser.add_argument("--xdotool-mouse", action="store_true", help="Мышь через xdotool (если uinput не доходит до CS2)")
     parser.add_argument("--png", default=None, help="Сохранить карту с маршрутом перед стартом")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--no-engage", action="store_true", help="Не смотреть на мишени (только обход)")
     parser.add_argument("--no-fire", action="store_true", help="Наводиться на мишени, но не стрелять")
     parser.add_argument("--shots", type=int, default=0, help="Лимит выстрелов по мишени (0 = стрелять, пока не пропадёт)")
-    parser.add_argument("--aim-z", type=float, default=56.0, help="Точка прицеливания: юнитов над ногами мишени (56 = верх груди)")
     parser.add_argument("--quiet", action="store_true", help="Короткий лог")
     args = parser.parse_args()
 
@@ -64,7 +63,7 @@ def main() -> int:
         print("Не запускай от root", file=sys.stderr)
         return 1
 
-    recs = resolve_recordings(args.recording or ["data/recordings/de_dust2/tunels.json"])
+    recs = resolve_recordings(args.recording or ["data/recordings/de_dust2/de_dust2.json"])
     if not recs:
         print("Записи не найдены", file=sys.stderr)
         return 1
@@ -88,13 +87,12 @@ def main() -> int:
     cfg = NavConfig(
         tick_hz=args.hz,
         duration=args.duration or None,
-        loop=args.loop,
+        loop=not args.no_loop,
         seed=args.seed,
         verbose_log=not args.quiet,
         engage_targets=not args.no_engage,
         fire_enabled=not args.no_fire,
         shots_per_target=args.shots,
-        target_aim_z=args.aim_z,
     )
     inp = create_input(prefer_xdotool_mouse=args.xdotool_mouse)
     inp.prepare()

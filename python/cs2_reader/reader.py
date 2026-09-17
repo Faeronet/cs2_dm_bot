@@ -6,8 +6,22 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from cs2_reader.aim import aim_point, eye_position, forward_from_angles, normalize_yaw, yaw_to_target
-from cs2_reader.game_state import BombInfo, GameSnapshot, PlayerInfo, Vec3, ViewMatrix
+from cs2_reader.aim import (
+    BONE_ARRAY_IN_MODEL_STATE,
+    BONE_CHEST,
+    BONE_HEAD,
+    BONE_STRIDE,
+    aim_point,
+    chest_center_from_view,
+    chest_plausible,
+    eye_position,
+    forward_from_angles,
+    head_center_from_view,
+    head_plausible,
+    normalize_yaw,
+    yaw_to_target,
+)
+from cs2_reader.game_state import BombInfo, EnemyInfo, GameSnapshot, PlayerInfo, Vec3, ViewMatrix, WeaponInfo
 from cs2_reader.memory import MemoryBackend, MinidumpBackend, create_live_backend
 from cs2_reader.offsets import (
     ENTITY_LIST_CHUNK_OFFSET,
@@ -19,9 +33,18 @@ from cs2_reader.offsets import (
     Offsets,
 )
 from cs2_reader.platform import Platform, client_module_name, detect_platform, engine_module_name
+from cs2_reader.life import (
+    LIFE_ALIVE,
+    LIFE_RESPAWNING,
+    LifeTracker,
+    LocalLifeInfo,
+    LocalLifeUpdate,
+    is_playable,
+)
 from cs2_reader.schema import Schema
-
-LIFE_ALIVE = 0
+from cs2_reader.visibility import read_radar_spotted, spotted_by_viewer
+from cs2_reader.vulnerability import read_pawn_vulnerability
+from cs2_reader.weapons import is_healthshot, weapon_name
 
 
 class Reader:
@@ -49,6 +72,7 @@ class Reader:
             if self._platform == Platform.LINUX_NATIVE
             else GLOBAL_VARS_MAP_NAME_WINDOWS
         )
+        self._life_tracker = LifeTracker()
 
     @classmethod
     def from_pid(cls, pid: int) -> "Reader":
@@ -132,16 +156,22 @@ class Reader:
         return self.entity_by_index(handle & 0x7FFF)
 
     def is_visible(self, pawn: int, viewer_index: int) -> bool:
-        state = pawn + self.schema.m_entity_spotted_state
-        if self.backend.read_u8(state + self.schema.m_b_spotted):
-            return True
-        if viewer_index < 0 or viewer_index >= 64:
-            return False
-        data = self.backend.read(state + self.schema.m_b_spotted_by_mask, 8)
-        if not data:
-            return False
-        mask = int.from_bytes(data, "little")
-        return bool(mask & (1 << viewer_index))
+        """Прямая видимость для локального игрока (m_bSpottedByMask, не m_bSpotted)."""
+        return spotted_by_viewer(
+            self.backend,
+            pawn,
+            self.schema.m_entity_spotted_state,
+            self.schema.m_b_spotted_by_mask,
+            viewer_index,
+        )
+
+    def is_radar_spotted(self, pawn: int) -> bool:
+        return read_radar_spotted(
+            self.backend,
+            pawn,
+            self.schema.m_entity_spotted_state,
+            self.schema.m_b_spotted,
+        )
 
     def map_name(self) -> str:
         client = self._client_base()
@@ -206,12 +236,189 @@ class Reader:
         eye = self.backend.read_vec3(pawn + self.schema.m_ang_eye_angles)
         return Vec3(*eye) if eye else Vec3()
 
+    def pawn_view_offset(self, pawn: int) -> Vec3:
+        off = self.backend.read_vec3(pawn + self.schema.m_vec_view_offset)
+        return Vec3(*off) if off else Vec3(0.0, 0.0, 64.0)
+
+    def pawn_bone_position(self, pawn: int, bone: int = BONE_HEAD) -> Vec3 | None:
+        scene = self.backend.read_u64(pawn + self.schema.m_p_game_scene_node)
+        if not scene:
+            return None
+        bone_array = self.backend.read_u64(scene + self.schema.m_model_state + BONE_ARRAY_IN_MODEL_STATE)
+        if not bone_array:
+            return None
+        coords = self.backend.read_vec3(bone_array + bone * BONE_STRIDE)
+        if not coords:
+            return None
+        return Vec3(*coords)
+
+    def pawn_head_position(self, pawn: int, feet: Vec3) -> Vec3:
+        """Центр головы: кость 6 (CSkeletonInstance → BoneArray), иначе m_vecViewOffset + 4."""
+        head = self.pawn_bone_position(pawn, BONE_HEAD)
+        if head and head_plausible(feet, head):
+            return head
+        return head_center_from_view(feet, self.pawn_view_offset(pawn))
+
+    def pawn_chest_position(self, pawn: int, feet: Vec3, head: Vec3 | None = None) -> Vec3:
+        """Центр груди: кость 4 (spine_1), иначе m_vecViewOffset − 8."""
+        chest = self.pawn_bone_position(pawn, BONE_CHEST)
+        if chest and chest_plausible(feet, chest, head):
+            return chest
+        view = self.pawn_view_offset(pawn)
+        fallback = chest_center_from_view(feet, view)
+        if head is not None and chest_plausible(feet, fallback, head):
+            return fallback
+        if head is None and chest_plausible(feet, fallback):
+            return fallback
+        return fallback
+
+    def local_head_position(self) -> Vec3:
+        pawn = self.local_pawn()
+        if not pawn:
+            return Vec3()
+        feet = self.local_position()
+        return self.pawn_head_position(pawn, feet)
+
+    def active_weapon(self, pawn: int) -> int | None:
+        ws = self.backend.read_u64(pawn + self.schema.m_p_weapon_services)
+        if not ws:
+            return None
+        handle = self.backend.read_u32(ws + self.schema.m_h_active_weapon)
+        if not handle or handle == 0xFFFFFFFF:
+            return None
+        return self.entity_by_index(handle & 0x7FFF)
+
+    def weapon_from_entity(self, weapon: int) -> WeaponInfo | None:
+        if not weapon:
+            return None
+        s = self.schema
+        item = weapon + s.m_attribute_manager + s.m_item
+        item_id = self.backend.read_u16(item + s.m_i_item_definition_index)
+        if item_id is None:
+            return None
+        clip = self.backend.read_i32(weapon + s.m_i_clip1)
+        reloading = bool(self.backend.read_u8(weapon + s.m_b_in_reload))
+        return WeaponInfo(
+            id=item_id,
+            name=weapon_name(item_id),
+            clip=max(0, clip or 0),
+            in_reload=reloading,
+        )
+
+    def weapon_from_pawn(self, pawn: int) -> WeaponInfo:
+        weapon = self.active_weapon(pawn)
+        if not weapon:
+            return WeaponInfo()
+        info = self.weapon_from_entity(weapon)
+        return info or WeaponInfo()
+
+    def local_weapon(self) -> WeaponInfo:
+        pawn = self.local_pawn()
+        if not pawn:
+            return WeaponInfo()
+        return self.weapon_from_pawn(pawn)
+
+    def pawn_weapon_ids(self, pawn: int) -> list[int]:
+        """m_hMyWeapons: id всех предметов в инвентаре pawn."""
+        if not pawn:
+            return []
+        s = self.schema
+        if not s.m_p_weapon_services or not s.m_h_my_weapons:
+            return []
+        ws = self.backend.read_u64(pawn + s.m_p_weapon_services)
+        if not ws:
+            return []
+        vec = ws + s.m_h_my_weapons
+        size = self.backend.read_u32(vec)
+        ptr = self.backend.read_u64(vec + 8)
+        if not size or size > 64 or not ptr:
+            return []
+        ids: list[int] = []
+        for i in range(int(size)):
+            handle = self.backend.read_u32(ptr + i * 4)
+            if not handle or handle == 0xFFFFFFFF:
+                continue
+            ent = self.entity_by_index(handle & 0x7FFF)
+            if not ent:
+                continue
+            item = ent + s.m_attribute_manager + s.m_item
+            item_id = self.backend.read_u16(item + s.m_i_item_definition_index)
+            if item_id:
+                ids.append(int(item_id))
+        return ids
+
+    def local_has_healthshot(self) -> bool:
+        pawn = self.local_pawn()
+        if not pawn:
+            return False
+        w = self.local_weapon()
+        if is_healthshot(int(w.id or 0), str(w.name or "")):
+            return True
+        return any(is_healthshot(i) for i in self.pawn_weapon_ids(pawn))
+
+    def local_shots_fired(self) -> int:
+        pawn = self.local_pawn()
+        if not pawn or not self.schema.m_i_shots_fired:
+            return 0
+        return max(0, self.backend.read_i32(pawn + self.schema.m_i_shots_fired) or 0)
+
+    def local_is_scoped(self) -> bool:
+        pawn = self.local_pawn()
+        if not pawn or not self.schema.m_b_is_scoped:
+            return False
+        return bool(self.backend.read_u8(pawn + self.schema.m_b_is_scoped))
+
+    def read_local_life(self) -> LocalLifeInfo:
+        """
+        Жив ли локальный игрок (DM: после смерти False, после респавна True).
+
+        m_iHealth + m_lifeState на pawn, m_bPawnIsAlive на controller.
+        """
+        controller = self.local_controller()
+        pawn_alive_ctrl = False
+        if controller:
+            flag = self.backend.read_u8(controller + self.schema.m_b_pawn_is_alive)
+            pawn_alive_ctrl = bool(flag) if flag is not None else False
+
+        pawn = self.local_pawn()
+        if not pawn:
+            return LocalLifeInfo(
+                alive=False,
+                health=0,
+                life_state=2,
+                pawn_alive=pawn_alive_ctrl,
+                pawn=0,
+                respawning=False,
+            )
+
+        health = self.backend.read_i32(pawn + self.schema.m_i_health) or 0
+        life_raw = self.backend.read_u8(pawn + self.schema.m_life_state)
+        life_state = life_raw if life_raw is not None else 2
+        alive = is_playable(health, life_state, pawn_alive_ctrl)
+        vuln = read_pawn_vulnerability(self.backend, self.schema, pawn)
+        return LocalLifeInfo(
+            alive=alive,
+            health=max(0, health),
+            life_state=life_state,
+            pawn_alive=pawn_alive_ctrl,
+            pawn=pawn,
+            respawning=life_state == LIFE_RESPAWNING and not alive,
+            vulnerable=vuln.vulnerable,
+            spawn_immunity=vuln.spawn_immunity,
+            has_moved_since_spawn=vuln.has_moved_since_spawn,
+        )
+
+    def poll_life(self) -> LocalLifeUpdate:
+        """Состояние + импульсы died/respawned с прошлого вызова (одноразовые флаги)."""
+        state = self.read_local_life()
+        events = self._life_tracker.step(state)
+        return LocalLifeUpdate(state=state, events=events)
+
     def local_view_offset_z(self) -> float:
         pawn = self.local_pawn()
         if not pawn:
             return 64.0
-        off = self.backend.read_vec3(pawn + self.schema.m_vec_view_offset)
-        return off[2] if off else 64.0
+        return self.pawn_view_offset(pawn).z
 
     def local_eye_position(self) -> Vec3:
         return eye_position(self.local_position(), self.local_view_offset_z())
@@ -310,8 +517,17 @@ class Reader:
         if scene:
             player.dormant = bool(self.backend.read_u8(scene + self.schema.m_b_dormant))
 
+        player.head_position = self.pawn_head_position(pawn, player.position)
+        player.chest_position = self.pawn_chest_position(pawn, player.position, player.head_position)
         player.distance = player.position.distance_to(local_pos)
         player.spotted = self.is_visible(pawn, local_index)
+        vel = self.backend.read_vec3(pawn + self.schema.m_vec_velocity)
+        if vel:
+            player.velocity = Vec3(*vel)
+        vuln = read_pawn_vulnerability(self.backend, self.schema, pawn)
+        player.vulnerable = vuln.vulnerable
+        player.spawn_immunity = vuln.spawn_immunity
+        player.has_moved_since_spawn = vuln.has_moved_since_spawn
         return player
 
     def players(self) -> list[PlayerInfo]:
@@ -332,18 +548,40 @@ class Reader:
                 result.append(player)
         return result
 
-    def visible_enemies(self) -> list[PlayerInfo]:
-        local_pawn = self.local_pawn()
-        local_team = self.backend.read_i32(local_pawn + self.schema.m_i_team_num) if local_pawn else 0
-        enemies: list[PlayerInfo] = []
+    def enemies(self) -> list[EnemyInfo]:
+        """Все живые игроки кроме локального (DM FFA: каждый — цель)."""
+        out: list[EnemyInfo] = []
         for p in self.players():
-            if p.is_local or p.team == local_team or p.team <= 1:
+            if not self._is_enemy(p):
                 continue
-            if p.dormant:
-                continue
-            if p.spotted:
-                enemies.append(p)
-        return enemies
+            vis = p.spotted and not p.dormant
+            out.append(
+                EnemyInfo(
+                    index=p.index,
+                    name=p.name,
+                    health=p.health,
+                    armor=p.armor,
+                    position=p.position,
+                    head_position=p.head_position,
+                    chest_position=p.chest_position,
+                    visible=vis,
+                    radar_spotted=self.is_radar_spotted(p.pawn),
+                    dormant=p.dormant,
+                    distance=p.distance,
+                    velocity=p.velocity,
+                    vulnerable=p.vulnerable,
+                    spawn_immunity=p.spawn_immunity,
+                    has_moved_since_spawn=p.has_moved_since_spawn,
+                )
+            )
+        return out
+
+    def visible_enemies(self) -> list[PlayerInfo]:
+        return [p for p in self.players() if p.spotted and not p.dormant and self._is_enemy(p)]
+
+    def _is_enemy(self, p: PlayerInfo) -> bool:
+        """DM: любой живой игрок, кроме себя (без фильтра по команде)."""
+        return not p.is_local and p.alive and p.team > 1
 
     def bomb_info(self) -> BombInfo | None:
         client = self._client_base()
@@ -383,13 +621,18 @@ class Reader:
         snap.local_eye_angles = self.local_eye_angles()
         snap.local_aim_forward = self.local_aim_forward()
         snap.local_aim_point = self.local_aim_point()
+        snap.local_weapon = self.local_weapon()
+        snap.local_life = self.read_local_life()
 
         local_pawn = self.local_pawn()
         if local_pawn:
             snap.local_team = self.backend.read_i32(local_pawn + self.schema.m_i_team_num) or 0
 
         snap.players = self.players()
-        snap.visible_enemies = self.visible_enemies()
+        snap.enemies = self.enemies()
+        snap.visible_enemies = [
+            p for p in snap.players if self._is_enemy(p) and p.spotted and not p.dormant
+        ]
         snap.bomb = self.bomb_info()
         return snap
 

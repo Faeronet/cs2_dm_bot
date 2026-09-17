@@ -17,8 +17,10 @@ from dataclasses import dataclass, field
 from cs2_control.input import GameInput
 from cs2_nav.coord_map import CoordinateMap
 from cs2_nav.navigator import NavConfig, Navigator
-from cs2_reader.aim import shortest_yaw_err
-from cs2_reader.game_state import Vec3
+from cs2_reader.aim import forward_from_angles, shortest_yaw_err
+from cs2_reader.game_state import Vec3, WeaponInfo
+from cs2_reader.weapons import default_clip, resolve_weapon, weapon_cycle_s, weapon_is_auto, weapon_needs_scope
+from cs2_reader.recoil import recoil_offset, spray_recover_s
 
 
 class FakeInput(GameInput):
@@ -30,6 +32,8 @@ class FakeInput(GameInput):
         self.key_events = 0
         self.buttons: set[str] = set()
         self.shot_requested = False
+        self.left_presses = 0
+        self.left_hold_ticks = 0
 
     def key_down(self, key: str) -> None:
         k = key.lower()
@@ -54,7 +58,8 @@ class FakeInput(GameInput):
         if button not in self.buttons:
             self.buttons.add(button)
             if button == "left":
-                self.shot_requested = True     # нажатие = выстрел (semi-auto)
+                self.shot_requested = True     # фронт нажатия = первый выстрел
+                self.left_presses += 1
 
     def mouse_up(self, button: str = "left") -> None:
         self.buttons.discard(button)
@@ -78,7 +83,7 @@ class SimPlayer:
 
 @dataclass
 class SimTarget:
-    """Статичная мишень-макет: цилиндр радиуса radius, «глаза» на eye_z над ногами."""
+    """Макет-голова: (x,y,z) — центр объёмного овала, не ноги."""
 
     index: int
     x: float
@@ -86,15 +91,38 @@ class SimTarget:
     z: float
     name: str = ""
     health: int = 100
-    radius: float = 16.0
-    eye_z: float = 64.0
-    hits_to_kill: int = 3           # попаданий до «смерти» (мишень пропадает); 0 = бессмертная
+    radius: float = 8.0             # горизонтальный «зазор» для коллизии тела
+    rx: float = 4.5                 # полуось овала XY (голова)
+    rz: float = 5.5                 # полуось овала Z
+    hits_to_kill: int = 3
     hits: int = 0
     alive: bool = True
+    visible: bool = False
+    dormant: bool = False
+    vulnerable: bool = True
+    spawn_immunity: bool = False
+    has_moved_since_spawn: bool = True
+    immune_until: float = 0.0
     respawn_at: float = float("inf")
 
+    @property
+    def position(self) -> Vec3:
+        return Vec3(self.x, self.y, self.z)
+
+    @property
+    def head_position(self) -> Vec3:
+        return Vec3(self.x, self.y, self.z)
+
+    @property
+    def chest_position(self) -> Vec3:
+        return Vec3(self.x, self.y, self.z)
+
     def aim_position(self, z_offset: float | None = None) -> Vec3:
-        return Vec3(self.x, self.y, self.z + (self.eye_z if z_offset is None else z_offset))
+        return self.head_position
+
+    @property
+    def velocity(self) -> Vec3:
+        return Vec3(0.0, 0.0, 0.0)
 
 
 class FakeReader:
@@ -107,6 +135,7 @@ class FakeReader:
         noise: float = 0.0,
         targets: list[SimTarget] | None = None,
         visible_fn: Callable[[SimTarget], bool] | None = None,
+        weapon: WeaponInfo | None = None,
     ):
         self.p = player
         self.yaw_offset = yaw_offset
@@ -115,6 +144,10 @@ class FakeReader:
         self.targets = targets or []
         self._visible_fn = visible_fn or (lambda _t: True)
         self._visible: list[SimTarget] = []
+        self._weapon = weapon or WeaponInfo(id=7, name="ak47", clip=30)
+        self._shots_fired = 0
+        self._shots_idle_at: float | None = None
+        self._scoped = False
         self._snap = self._take()
 
     def _take(self) -> tuple[Vec3, Vec3, Vec3]:
@@ -128,7 +161,9 @@ class FakeReader:
     def latch(self) -> None:
         self._snap = self._take()
         # как m_bSpotted в игре: видимость определяется движком, не FOV камеры
-        self._visible = [t for t in self.targets if self._visible_fn(t)]
+        for t in self.targets:
+            t.visible = bool(t.alive and self._visible_fn(t))
+        self._visible = [t for t in self.targets if t.alive and t.visible]
 
     def local_position(self) -> Vec3:
         return self._snap[0]
@@ -145,6 +180,30 @@ class FakeReader:
     def visible_enemies(self) -> list[SimTarget]:
         return list(self._visible)
 
+    def enemies(self) -> list[SimTarget]:
+        """Все живые мишени (и spotted, и за стеной) — как Reader.enemies()."""
+        return [t for t in self.targets if t.alive]
+
+    def local_weapon(self) -> WeaponInfo:
+        return self._weapon
+
+    def local_shots_fired(self) -> int:
+        return self._shots_fired
+
+    def local_is_scoped(self) -> bool:
+        return self._scoped
+
+    def local_has_healthshot(self) -> bool:
+        return False
+
+    def poll_life(self):
+        from cs2_reader.life import LocalLifeInfo, LocalLifeUpdate, LifeEvents
+
+        return LocalLifeUpdate(
+            state=LocalLifeInfo(alive=True, health=100, life_state=0, pawn_alive=True, pawn=1),
+            events=LifeEvents(),
+        )
+
 
 @dataclass
 class SimConfig:
@@ -158,12 +217,17 @@ class SimConfig:
     pos_noise: float = 0.0
     mouse_delay_ticks: int = 1
     jump_duration: float = 0.45
-    # мишени-макеты: (x, y, z) ног; видимость — прямая видимость по карте в пределах target_vis_dist
+    # мишени-макеты: (x, y, z); z у пола → овал на высоте головы, иначе z = центр
     targets: list[tuple[float, float, float]] = field(default_factory=list)
-    target_radius: float = 16.0
+    target_radius: float = 8.0
+    target_rx: float = 4.5          # полуось головы по XY
+    target_rz: float = 5.5          # полуось головы по Z
     target_vis_dist: float = 1400.0
     target_hits_to_kill: int = 3    # попаданий → мишень пропадает (0 = не пропадает)
     target_respawn: float = 6.0     # с до повторного появления (0 = навсегда)
+    spawn_protect: float = 1.5      # с неуязвимости после респавна (как DM)
+    weapon: str | int = "ak47"      # id или имя активного оружия
+    weapon_clip: int | None = None  # None = полный магазин этого оружия
 
 
 @dataclass
@@ -238,10 +302,15 @@ class NavSimulator:
         self.targets: list[SimTarget] = []
         for i, (tx, ty, tz) in enumerate(self.sim.targets):
             tn = cm.nearest_node(tx, ty, tz)
+            floor_z = tn.z if tn else tz
+            # координата у пола → центр овала на высоте глаз; иначе z уже центр
+            cz = floor_z + 64.0 if abs(tz - floor_z) <= 16.0 else tz
             self.targets.append(
                 SimTarget(
-                    index=100 + i, x=tx, y=ty, z=tn.z if tn else tz, name=f"T{i + 1}",
-                    radius=self.sim.target_radius, hits_to_kill=self.sim.target_hits_to_kill,
+                    index=100 + i, x=tx, y=ty, z=cz, name=f"T{i + 1}",
+                    radius=self.sim.target_radius,
+                    rx=self.sim.target_rx, rz=self.sim.target_rz,
+                    hits_to_kill=self.sim.target_hits_to_kill,
                 )
             )
         self.reader = FakeReader(
@@ -250,14 +319,27 @@ class NavSimulator:
             noise=self.sim.pos_noise,
             targets=self.targets,
             visible_fn=self._target_visible,
+            weapon=self._make_weapon(),
         )
-        cfg = nav_config or NavConfig(verbose_log=False)
+        cfg = nav_config or NavConfig(verbose_log=False, habits_enabled=False)
         self.dt = 1.0 / cfg.tick_hz
         self.time = 0.0
         self.nav = Navigator(self.reader, self.inp, cm, cfg, clock=lambda: self.time)
         self._mouse_queue: list[tuple[int, int]] = []
         self.collisions = 0
         self.target_collisions = 0
+        self._auto_next = 0.0
+        self._scope_was_right = False
+        self._zoom_level = 0
+
+    def _make_weapon(self) -> WeaponInfo:
+        item_id, name = resolve_weapon(self.sim.weapon)
+        if not item_id:
+            item_id, name = 7, "ak47"
+        clip = self.sim.weapon_clip
+        if clip is None:
+            clip = default_clip(item_id, name)
+        return WeaponInfo(id=item_id, name=name, clip=max(0, int(clip)))
 
     # -------------------------------------------------------------- targets
 
@@ -281,36 +363,46 @@ class NavSimulator:
         return True
 
     def _resolve_shot(self) -> tuple[SimTarget | None, bool]:
-        """Луч из глаз по реальным углам камеры: попал ли в цилиндр какой-то мишени (2D + высота)."""
+        """Луч из глаз + отдача текущей пули: пересечение с овалом головы."""
         p = self.player
-        yr = math.radians(p.yaw)
-        pr = math.radians(p.pitch)
-        fx, fy = math.cos(yr) * math.cos(pr), math.sin(yr) * math.cos(pr)
-        fz = -math.sin(pr)
-        eye_z = p.z + 64.0
+        w = self.reader._weapon
+        ky, kp = recoil_offset(w.id, w.name, self.reader._shots_fired, 0.0)
+        yaw = shortest_yaw_err(p.yaw - ky, 0.0)
+        pitch = p.pitch - kp
+        fwd = forward_from_angles(pitch, yaw)
+        ex, ey, ez = p.x, p.y, p.z + 64.0
         best: SimTarget | None = None
-        best_d = float("inf")
+        best_t = float("inf")
         for t in self.targets:
             if not t.alive:
                 continue
-            dx, dy = t.x - p.x, t.y - p.y
-            # проекция центра мишени на луч (в плоскости)
-            h = math.hypot(fx, fy)
-            if h < 1e-6:
-                continue
-            along = (dx * fx + dy * fy) / h
-            if along <= 0:
-                continue
-            perp = abs(dx * fy - dy * fx) / h
-            if perp > t.radius:
-                continue
-            d3 = along / h
-            hit_z = eye_z + fz * d3
-            if t.z <= hit_z <= t.z + 72.0:
-                if along < best_d:
-                    best, best_d = t, along
-        # цель под прицелом по направлению — но ближайшая по лучу (даже если мишень не та)
+            hit_t = self._ray_oval_t(ex, ey, ez, fwd.x, fwd.y, fwd.z, t)
+            if hit_t is not None and 0.0 < hit_t < best_t:
+                best, best_t = t, hit_t
         return best, best is not None
+
+    @staticmethod
+    def _ray_oval_t(
+        ex: float, ey: float, ez: float,
+        fx: float, fy: float, fz: float,
+        t: SimTarget,
+    ) -> float | None:
+        rx, rz = max(0.2, t.rx), max(0.2, t.rz)
+        ox, oy, oz = (ex - t.x) / rx, (ey - t.y) / rx, (ez - t.z) / rz
+        dx, dy, dz = fx / rx, fy / rx, fz / rz
+        a = dx * dx + dy * dy + dz * dz
+        if a < 1e-12:
+            return None
+        b = 2.0 * (ox * dx + oy * dy + oz * dz)
+        c = ox * ox + oy * oy + oz * oz - 1.0
+        disc = b * b - 4.0 * a * c
+        if disc < 0.0:
+            return None
+        s = math.sqrt(disc)
+        t1 = (-b - s) / (2.0 * a)
+        t2 = (-b + s) / (2.0 * a)
+        hits = [u for u in (t1, t2) if u > 0.05]
+        return min(hits) if hits else None
 
     def _apply_hit(self, t: SimTarget) -> bool:
         """Попадание: считаем, «убиваем» после hits_to_kill. Возвращает True, если мишень пропала."""
@@ -324,9 +416,17 @@ class NavSimulator:
 
     def _respawn_targets(self) -> None:
         for t in self.targets:
+            if t.alive and t.spawn_immunity and self.time >= t.immune_until:
+                t.spawn_immunity = False
+                t.vulnerable = True
+                t.has_moved_since_spawn = True
             if not t.alive and self.time >= t.respawn_at:
                 t.alive = True
                 t.respawn_at = float("inf")
+                t.spawn_immunity = True
+                t.vulnerable = False
+                t.has_moved_since_spawn = False
+                t.immune_until = self.time + max(0.0, self.sim.spawn_protect)
 
     def _collide_targets(self) -> None:
         """Мишень — твёрдый цилиндр: выталкиваем игрока, гасим скорость в её сторону."""
@@ -338,7 +438,7 @@ class NavSimulator:
             dx, dy = p.x - t.x, p.y - t.y
             d = math.hypot(dx, dy)
             min_d = hull + t.radius
-            if d >= min_d or abs(p.z - t.z) > 72.0:
+            if d >= min_d or abs(p.z + 64.0 - t.z) > 40.0:
                 continue
             self.target_collisions += 1
             if d < 1e-6:
@@ -443,6 +543,53 @@ class NavSimulator:
             return
         p.vx = p.vy = 0.0
 
+    def _poll_weapon_fire(self) -> None:
+        """Автомат даёт выстрелы, пока ЛКМ зажата; тап — только по фронту нажатия."""
+        w = self.reader._weapon
+        held = "left" in self.inp.buttons
+        if held:
+            self.inp.left_hold_ticks += 1
+        auto = weapon_is_auto(w.id, w.name)
+        if auto and held:
+            cycle = weapon_cycle_s(w.id, w.name)
+            if self.inp.shot_requested:
+                self._auto_next = self.time + cycle
+                if w.clip > 0:
+                    w.clip -= 1
+            elif w.clip > 0 and self._auto_next > 0.0 and self.time + 1e-9 >= self._auto_next:
+                self.inp.shot_requested = True
+                w.clip -= 1
+                self._auto_next = self.time + cycle
+        elif (not auto) and self.inp.shot_requested and w.clip > 0:
+            w.clip -= 1
+        if not held:
+            self._auto_next = 0.0
+            if self.reader._shots_fired and self.reader._shots_idle_at is None:
+                self.reader._shots_idle_at = self.time
+            rec = spray_recover_s(w.id, w.name)
+            if (
+                self.reader._shots_idle_at is not None
+                and self.time - self.reader._shots_idle_at >= rec
+            ):
+                self.reader._shots_fired = 0
+                self.reader._shots_idle_at = None
+        else:
+            self.reader._shots_idle_at = None
+
+    def _poll_scope(self) -> None:
+        """ПКМ-клик циклит зум снайперки: 0 → 1 → 2 → 0. Отпускание само по себе не выходит."""
+        w = self.reader._weapon
+        right = "right" in self.inp.buttons
+        if not weapon_needs_scope(w.id, w.name):
+            self._zoom_level = 0
+            self.reader._scoped = False
+        elif right and not self._scope_was_right:
+            self._zoom_level = (self._zoom_level + 1) % 3
+            self.reader._scoped = self._zoom_level > 0
+        self._scope_was_right = right
+        if weapon_needs_scope(w.id, w.name):
+            self.reader._scoped = self._zoom_level > 0
+
     # -------------------------------------------------------------- run
 
     def run(self, duration: float = 60.0, log_every: int = 40) -> SimResult:
@@ -484,11 +631,19 @@ class NavSimulator:
             self.time = tick * self.dt
             self.reader.latch()
             info = self.nav.tick()
+            self._poll_scope()
+            self._poll_weapon_fire()
             # выстрел — по состоянию камеры на момент нажатия (мышь этого тика ещё не применена)
             if self.inp.shot_requested:
                 self.inp.shot_requested = False
                 spd_now = math.hypot(p.vx, p.vy)
                 hit_t, hit = self._resolve_shot()
+                self.reader._shots_fired += 1
+                self.reader._shots_idle_at = None
+                w = self.reader._weapon
+                if weapon_needs_scope(w.id, w.name) and not weapon_is_auto(w.id, w.name):
+                    self._zoom_level = 0
+                    self.reader._scoped = False
                 res.shots += 1
                 res.hits += int(hit)
                 shot_speeds.append(spd_now)

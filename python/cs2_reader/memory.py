@@ -30,6 +30,10 @@ class MemoryBackend(ABC):
         data = self.read(address, 4)
         return struct.unpack("<I", data)[0] if data else None
 
+    def read_u16(self, address: int) -> int | None:
+        data = self.read(address, 2)
+        return struct.unpack("<H", data)[0] if data else None
+
     def read_i32(self, address: int) -> int | None:
         data = self.read(address, 4)
         return struct.unpack("<i", data)[0] if data else None

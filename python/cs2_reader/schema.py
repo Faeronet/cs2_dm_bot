@@ -22,6 +22,7 @@ class Schema:
     m_armor_value: int
     m_ang_eye_angles: int
     m_vec_view_offset: int
+    m_model_state: int
     m_entity_spotted_state: int
     m_b_spotted: int
     m_b_spotted_by_mask: int
@@ -31,6 +32,16 @@ class Schema:
     m_i_ping: int = 0
     m_f_flags: int = 0
     m_vec_velocity: int = 0
+    m_p_weapon_services: int = 0
+    m_h_active_weapon: int = 0
+    m_i_clip1: int = 0
+    m_attribute_manager: int = 0
+    m_item: int = 0
+    m_i_item_definition_index: int = 0
+    m_b_in_reload: int = 0
+    m_b_gun_game_immunity: int = 0
+    m_b_has_moved_since_spawn: int = 0
+    m_h_my_weapons: int = 0
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Schema":
@@ -61,6 +72,7 @@ class Schema:
             m_armor_value=field("C_CSPlayerPawn", "m_ArmorValue"),
             m_ang_eye_angles=field("C_CSPlayerPawn", "m_angEyeAngles"),
             m_vec_view_offset=field("C_BaseModelEntity", "m_vecViewOffset"),
+            m_model_state=field("CSkeletonInstance", "m_modelState"),
             m_entity_spotted_state=field("C_CSPlayerPawn", "m_entitySpottedState"),
             m_b_spotted=field("EntitySpottedState_t", "m_bSpotted"),
             m_b_spotted_by_mask=field("EntitySpottedState_t", "m_bSpottedByMask"),
@@ -70,4 +82,14 @@ class Schema:
             m_i_ping=field("CCSPlayerController", "m_iPing"),
             m_f_flags=field("C_BaseEntity", "m_fFlags"),
             m_vec_velocity=field("C_BaseEntity", "m_vecVelocity"),
+            m_p_weapon_services=field("C_BasePlayerPawn", "m_pWeaponServices"),
+            m_h_active_weapon=field("CPlayer_WeaponServices", "m_hActiveWeapon"),
+            m_i_clip1=field("C_BasePlayerWeapon", "m_iClip1"),
+            m_attribute_manager=field("C_EconEntity", "m_AttributeManager"),
+            m_item=field("C_AttributeContainer", "m_Item"),
+            m_i_item_definition_index=field("C_EconItemView", "m_iItemDefinitionIndex"),
+            m_b_in_reload=field("C_CSWeaponBase", "m_bInReload"),
+            m_b_gun_game_immunity=field("C_CSPlayerPawn", "m_bGunGameImmunity"),
+            m_b_has_moved_since_spawn=field("C_CSPlayerPawnBase", "m_bHasMovedSinceSpawn"),
+            m_h_my_weapons=field("CPlayer_WeaponServices", "m_hMyWeapons"),
         )
