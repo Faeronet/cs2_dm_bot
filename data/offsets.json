@@ -1,82 +1,70 @@
 {
   "libclient.so": [
     {
-      "name": "dwCSGOInput",
-      "value": 73009240
-    },
-    {
       "name": "dwEntityList",
-      "value": 73238272
+      "value": 74166912
     },
     {
       "name": "dwGameEntitySystem",
-      "value": 78062416
+      "value": 79222736
     },
     {
       "name": "dwGameEntitySystem_highestEntityIndex",
-      "value": 8352
-    },
-    {
-      "name": "dwGameRules",
-      "value": 76135188
+      "value": 8480
     },
     {
       "name": "dwGlobalVars",
-      "value": 72963064
+      "value": 73924600
     },
     {
       "name": "dwGlowManager",
-      "value": 75663672
+      "value": 76749272
     },
     {
       "name": "dwLocalPlayerController",
-      "value": 75478968
+      "value": 76547736
     },
     {
       "name": "dwLocalPlayerPawn",
-      "value": 75687912
+      "value": 76777304
     },
     {
       "name": "dwPlantedC4",
-      "value": 73321831
+      "value": 74253223
     },
     {
       "name": "dwPrediction",
-      "value": 75687584
+      "value": 76776976
     },
     {
       "name": "dwSensitivity",
-      "value": 75680472
+      "value": 76769400
     },
     {
       "name": "dwSensitivity_sensitivity",
       "value": 88
     },
     {
-      "name": "dwViewAngles",
-      "value": 73010592
-    },
-    {
       "name": "dwViewMatrix",
-      "value": 75716736
+      "value": 76807552
     },
     {
       "name": "dwViewRender",
-      "value": 75717008
+      "value": 76807824
     }
   ],
   "libengine2.so": [
     {
       "name": "dwBuildNumber",
-      "value": 13068776
+      "value": 13172296
     },
     {
       "name": "dwNetworkGameClient_clientTickCount",
-      "value": 904
+      "value": 936
     },
     {
       "name": "dwNetworkGameClient_deltaTick",
-      "value": 908
+      "value": 940
     },
     {
       "name": "dwNetworkGameClient_isBackgroundMap",
@@ -100,37 +88,37 @@
     },
     {
       "name": "dwWindowHeight",
-      "value": 10386628
+      "value": 10490212
     },
     {
       "name": "dwWindowWidth",
-      "value": 10386624
+      "value": 10490208
     }
   ],
   "libinputsystem.so": [
     {
       "name": "dwInputSystem",
-      "value": 523200
+      "value": 523424
     }
   ],
   "libmatchmaking.so": [
     {
       "name": "dwGameTypes",
-      "value": 3785856
+      "value": 3789536
     },
     {
       "name": "dwGameTypes_mapName",
-      "value": 3786144
+      "value": 3789824
     }
   ],
   "libpanorama.so": [
     {
       "name": "HUD_CONTEXT",
-      "value": 6802656
+      "value": 7102848
     },
     {
       "name": "MENU_CONTEXT",
-      "value": 6802624
+      "value": 7102816
     }
   ]
 }

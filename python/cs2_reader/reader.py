@@ -129,13 +129,20 @@ class Reader:
         client = self._client_base()
         if not client:
             return None
-        pawn = self.backend.read_u64(client + self.offsets.client.dw_local_player_pawn)
+        pawn = self._usable_ptr(self.backend.read_u64(client + self.offsets.client.dw_local_player_pawn))
         if pawn:
             return pawn
         controller = self.local_controller()
         if controller:
             return self.pawn_from_controller(controller)
         return None
+
+    @staticmethod
+    def _usable_ptr(ptr: int | None) -> int | None:
+        """Отсечь 0 и мусор вроде 0xffffffff00000000 (битый dwLocalPlayerPawn)."""
+        if not ptr or ptr < 0x10000 or ptr > 0x00007FFFFFFFFFFF:
+            return None
+        return ptr
 
     def entity_by_index(self, index: int) -> int | None:
         elist = self.entity_list()

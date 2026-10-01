@@ -76,7 +76,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Симуляция навигации по recording JSON")
     parser.add_argument(
         "--recording", "-r",
-        default="data/recordings/de_mirage/de_mirage.json",
+        default="data/recordings/de_inferno/de_inferno.json",
         help="путь(и) через запятую или glob — несколько записей объединяются",
     )
     parser.add_argument("--duration", type=float, default=60.0)
