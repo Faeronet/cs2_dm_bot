@@ -38,7 +38,20 @@ from tools.launch_dm_official import (
     wait_spawn,
 )
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+def _repo_root() -> str:
+    """Каталог репозитория: поднимаемся от скрипта, пока не найдём data/maps."""
+    cur = os.path.abspath(os.path.dirname(__file__))
+    for _ in range(8):
+        if os.path.isdir(os.path.join(cur, "data", "maps")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+ROOT = _repo_root()
 MAPS_DIR = os.path.join(ROOT, "data", "maps")
 
 
@@ -47,8 +60,29 @@ def log(msg: str) -> None:
 
 
 def nav_path_for(map_name: str) -> str | None:
-    path = os.path.join(MAPS_DIR, f"{normalize_map(map_name)}.nav.json")
-    return path if os.path.isfile(path) else None
+    """Абсолютный путь data/maps/<карта>.nav.json или None."""
+    names: list[str] = []
+    raw = (map_name or "").strip()
+    if raw:
+        names.append(raw.split(".")[0])
+    norm = normalize_map(raw)
+    if norm and norm not in names:
+        names.append(norm)
+    if not names or not os.path.isdir(MAPS_DIR):
+        return None
+    for name in names:
+        path = os.path.join(MAPS_DIR, f"{name}.nav.json")
+        if os.path.isfile(path):
+            return path
+    want = {f"{name}.nav.json".lower() for name in names}
+    try:
+        listed = os.listdir(MAPS_DIR)
+    except OSError:
+        return None
+    for fn in listed:
+        if fn.lower() in want:
+            return os.path.join(MAPS_DIR, fn)
+    return None
 
 
 def dismiss_errors(menu: MenuController, reader: Reader) -> None:
@@ -93,9 +127,16 @@ def load_coord_map(map_name: str, cache: dict[str, CoordinateMap]) -> Coordinate
         return cache[map_name]
     path = nav_path_for(map_name)
     if not path:
-        log(f"нет навмеша data/maps/{map_name}.nav.json — бот на этой карте не пойдёт")
+        try:
+            listed = ", ".join(sorted(os.listdir(MAPS_DIR))) or "пусто"
+        except OSError as exc:
+            listed = f"каталог не читается ({exc})"
+        log(
+            f"нет навмеша {os.path.join(MAPS_DIR, map_name + '.nav.json')} "
+            f"— в каталоге: {listed}"
+        )
         return None
-    log(f"собираю координатную карту {map_name} ← {os.path.relpath(path, ROOT)}")
+    log(f"собираю координатную карту {map_name} ← {path}")
     cmap = CoordinateMap.from_navmesh(path)
     log(cmap.stats())
     cache[map_name] = cmap
@@ -223,6 +264,12 @@ def main() -> int:
         print("Не запускай от root", file=sys.stderr)
         return 1
 
+    try:
+        mesh_names = ", ".join(sorted(os.listdir(MAPS_DIR))) or "пусто"
+    except OSError as exc:
+        mesh_names = f"не читается ({exc})"
+    log(f"навмеши: {MAPS_DIR} → {mesh_names}")
+
     ensure_flat_accel()
     reader = Reader.from_live()
     if not reader:
@@ -245,7 +292,7 @@ def main() -> int:
                 continue
             cmap = load_coord_map(map_name, cache)
             if cmap is None:
-                log(f"навмеша для {map_name!r} нет — жду карту из data/maps, бот ещё не стартует")
+                log(f"навмеша для {map_name!r} не найден в {MAPS_DIR} — бот на этой карте не стартует, повтор")
                 time.sleep(2.0)
                 continue
             log(f"карта {map_name} подгружена — запускаю бота")
