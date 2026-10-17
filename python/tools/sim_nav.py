@@ -6,6 +6,7 @@
 
 Примеры:
   python3 python/tools/sim_nav.py
+  python3 python/tools/sim_nav.py --nav data/maps/de_vertigo.nav.json --duration 90
   python3 python/tools/sim_nav.py --start -1250,1120,20 --yaw 90
   python3 python/tools/sim_nav.py --random-starts 6 --seed 3
   python3 python/tools/sim_nav.py --invert-mouse --mem-yaw-offset 90   # проверка автокалибровки
@@ -76,8 +77,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Симуляция навигации по recording JSON")
     parser.add_argument(
         "--recording", "-r",
-        default="data/recordings/de_inferno/de_inferno.json",
+        default="data/maps/de_inferno_de_inferno.json",
         help="путь(и) через запятую или glob — несколько записей объединяются",
+    )
+    parser.add_argument(
+        "--nav",
+        default=None,
+        help="Разобранный .nav.json (вместо записи прогулки)",
     )
     parser.add_argument("--duration", type=float, default=60.0)
     parser.add_argument("--start", default=None, help="x,y,z (по умолчанию — первая точка записи)")
@@ -103,8 +109,13 @@ def main() -> int:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
-    recs = resolve_recordings(args.recording)
-    cm = CoordinateMap.from_recording(recs if len(recs) > 1 else recs[0], MapConfig())
+    if args.nav:
+        nav_path = args.nav if os.path.isabs(args.nav) else os.path.join(ROOT, args.nav)
+        print(f"Сборка карты из навмеша {nav_path}…")
+        cm = CoordinateMap.from_navmesh(nav_path, MapConfig())
+    else:
+        recs = resolve_recordings(args.recording)
+        cm = CoordinateMap.from_recording(recs if len(recs) > 1 else recs[0], MapConfig())
     print(f"Карта {cm.map_name}/{cm.location}: {json.dumps(cm.stats(), ensure_ascii=False)}")
 
     rng = random.Random(args.seed)
@@ -118,8 +129,8 @@ def main() -> int:
         sx, sy, sz = (float(v) for v in args.start.split(","))
         starts.append(((sx, sy, sz), args.yaw))
     else:
-        # старт по умолчанию — записанный узел с наибольшим clearance (гарантированно на карте)
-        n = max((n for n in cm.nodes if n.recorded), key=lambda n: n.clearance)
+        pool = [n for n in cm.nodes if n.recorded] or list(cm.nodes)
+        n = max(pool, key=lambda n: n.clearance)
         starts.append(((n.x, n.y, n.z), args.yaw))
 
     targets: list[tuple[float, float, float]] = []

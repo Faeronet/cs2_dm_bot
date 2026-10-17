@@ -9,7 +9,7 @@
 
   python3 python/tools/scan_map.py -m de_dust2 -l de_dust2
   python3 python/tools/scan_map.py -m de_mirage -l de_mirage --step 5
-  python3 python/tools/scan_map.py --contour data/recordings/de_cache/de_cache.contour.json
+  python3 python/tools/scan_map.py --contour data/maps/de_cache_de_cache.contour.json
 """
 
 from __future__ import annotations
@@ -448,11 +448,11 @@ class ScanRecorder:
 
 
 def _contour_file(map_name: str, location: str) -> Path:
-    return rc.OUT_DIR / map_name / f"{location}.contour.json"
+    return rc.OUT_DIR / f"{map_name}_{location}.contour.json"
 
 
 def _scan_file(map_name: str, location: str) -> Path:
-    return rc.OUT_DIR / map_name / f"{location}.scan.json"
+    return rc.OUT_DIR / f"{map_name}_{location}.scan.json"
 
 
 def _save_contour(

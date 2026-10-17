@@ -61,10 +61,14 @@ def print_snapshot(snap, json_mode: bool) -> None:
         meters = e.distance / 39.37
         vuln = "vuln" if e.vulnerable else "immune"
         chest = e.chest_position
+        lsh = e.left_shoulder_position
+        rsh = e.right_shoulder_position
         print(
             f"  [{tag:7}] {e.name or '<unknown>':16} hp={e.health} {vuln} "
             f"head=({e.head_position.x:.1f},{e.head_position.y:.1f},{e.head_position.z:.1f}) "
-            f"chest=({chest.x:.1f},{chest.y:.1f},{chest.z:.1f}) ~{meters:.1f}m"
+            f"chest=({chest.x:.1f},{chest.y:.1f},{chest.z:.1f}) "
+            f"L=({lsh.x:.1f},{lsh.y:.1f},{lsh.z:.1f}) "
+            f"R=({rsh.x:.1f},{rsh.y:.1f},{rsh.z:.1f}) ~{meters:.1f}m"
         )
 
     print(f"\nLadders ({len(snap.ladders)}):")
@@ -77,6 +81,40 @@ def print_snapshot(snap, json_mode: bool) -> None:
         )
     if len(snap.ladders) > 12:
         print(f"  … ещё {len(snap.ladders) - 12}")
+
+    print(f"\nDoors ({len(snap.doors)}): passable={sum(1 for d in snap.doors if d.passable)}")
+    for door in snap.doors[:12]:
+        meters = door.distance / 39.37
+        lock = "locked" if door.locked else "unlocked"
+        print(
+            f"  #{door.index:4} {door.name:22} {door.state:8} {lock:8} "
+            f"pos=({door.position.x:.0f},{door.position.y:.0f},{door.position.z:.0f}) "
+            f"w={door.width:.0f} ~{meters:.0f}m pass={'yes' if door.passable else 'no'}"
+        )
+    if len(snap.doors) > 12:
+        print(f"  … ещё {len(snap.doors) - 12}")
+
+    blocking = sum(1 for br in snap.breakables if not br.passable)
+    print(f"\nBreakables ({len(snap.breakables)}): blocking={blocking}")
+    for br in snap.breakables[:16]:
+        meters = br.distance / 39.37
+        if br.broken:
+            state = "broken"
+        elif br.passable and br.model and "/entities/" in br.model.lower():
+            state = "visual"
+        else:
+            state = f"hp={br.health}"
+        model = br.model.rsplit("/", 1)[-1] if br.model else ""
+        label = br.name if len(br.name) <= 24 else br.name[:21] + "..."
+        if model and model != label:
+            label = f"{label} ({model[:18]})" if len(label) < 20 else label
+        print(
+            f"  #{br.index:4} {br.kind:8} {label:32} {state:8} "
+            f"pos=({br.position.x:.0f},{br.position.y:.0f},{br.position.z:.0f}) "
+            f"w={br.width:.0f} ~{meters:.0f}m pass={'yes' if br.passable else 'no'}"
+        )
+    if len(snap.breakables) > 16:
+        print(f"  … ещё {len(snap.breakables) - 16}")
 
 
 def main() -> int:

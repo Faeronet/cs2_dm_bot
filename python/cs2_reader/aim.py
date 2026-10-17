@@ -7,7 +7,9 @@ import math
 from cs2_reader.game_state import Vec3
 
 BONE_HEAD = 6
-BONE_CHEST = 4   # spine_1 / верхняя грудь
+BONE_CHEST = 4          # spine_1 / верхняя грудь
+BONE_LEFT_SHOULDER = 8  # clavicle_L
+BONE_RIGHT_SHOULDER = 13  # clavicle_R
 BONE_STRIDE = 32
 BONE_ARRAY_IN_MODEL_STATE = 0x80
 HEAD_ABOVE_EYES = 4.0  # fallback: центр головы чуть выше m_vecViewOffset (глаза)
@@ -91,6 +93,25 @@ def chest_plausible(feet: Vec3, chest: Vec3, head: Vec3 | None = None) -> bool:
     if math.hypot(chest.x - feet.x, chest.y - feet.y) > 48.0:
         return False
     if head is not None and chest.z >= head.z - 4.0:
+        return False
+    return True
+
+
+def shoulder_plausible(
+    feet: Vec3,
+    shoulder: Vec3,
+    chest: Vec3 | None = None,
+    head: Vec3 | None = None,
+) -> bool:
+    """Кость плеча (clavicle): между грудью и головой, чуть шире по XY."""
+    dz = shoulder.z - feet.z
+    if dz < 38.0 or dz > 82.0:
+        return False
+    if math.hypot(shoulder.x - feet.x, shoulder.y - feet.y) > 58.0:
+        return False
+    if chest is not None and shoulder.z < chest.z - 6.0:
+        return False
+    if head is not None and shoulder.z > head.z + 4.0:
         return False
     return True
 

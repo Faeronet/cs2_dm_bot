@@ -129,9 +129,12 @@ class ProcMemoryBackend(MemoryBackend):
         fd = self._open_mem()
         if fd is None or not address:
             return None
+        # Валидный пользовательский диапазон x86-64 Linux: 0x1000..0x7FFFFFFFFFFF
+        if address < 0x1000 or address > 0x7FFFFFFFFFFF:
+            return None
         try:
             return os.pread(fd, size, address)
-        except OSError:
+        except (OSError, OverflowError, ValueError):
             return None
 
     def write(self, address: int, data: bytes) -> bool:

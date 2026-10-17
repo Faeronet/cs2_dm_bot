@@ -25,9 +25,10 @@ XYZ = tuple[float, float, float]
 class RouteConfig:
     preferred_clearance: float = 40.0   # хотим быть не ближе этого к стене (2.5 hull)
     wall_weight: float = 3.0            # сила штрафа за близость к стене
-    jump_penalty: float = 80.0
-    drop_penalty: float = 24.0
-    ladder_penalty: float = 36.0            # лестница дешевле прыжка, дороже пола
+    jump_penalty: float = 55.0
+    crouch_jump_penalty: float = 75.0       # ящик 64u: прыжок+присед, иначе обход
+    drop_penalty: float = 40.0
+    ladder_penalty: float = 28.0            # лестница дешевле прыжка и спрыга, дороже пола
     climb_weight: float = 0.6           # за каждый юнит подъёма
     los_min_clearance: float = 12.0     # минимум clearance на прямом отрезке (0.75 hull)
     los_sample: float = 4.0             # шаг проверки отрезка (юниты)
@@ -46,6 +47,8 @@ def _edge_cost(cm: CoordinateMap, a: Node, b: Node, hdist: float, kind: str, cfg
         cost += dz * cfg.climb_weight
     if kind == "jump":
         cost += cfg.jump_penalty
+    elif kind == "crouch_jump":
+        cost += cfg.crouch_jump_penalty
     elif kind == "drop":
         cost += cfg.drop_penalty
     elif kind == "ladder":
@@ -54,6 +57,7 @@ def _edge_cost(cm: CoordinateMap, a: Node, b: Node, hdist: float, kind: str, cfg
 
 
 Obstacle = tuple[float, float, float, float]   # x, y, z, radius — динамическое препятствие (мишень, игрок)
+BoxObstacle = tuple[float, float, float, float, float, float]  # xmin, ymin, zmin, xmax, ymax, zmax
 
 
 def blocked_by_obstacles(cm: CoordinateMap, obstacles: list[Obstacle], z_tol: float = 72.0) -> set[int]:
@@ -78,6 +82,48 @@ def blocked_by_obstacles(cm: CoordinateMap, obstacles: list[Obstacle], z_tol: fl
                     continue
                 for n in layers:
                     if abs(n.z - oz) <= z_tol:
+                        blocked.add(n.id)
+    return blocked
+
+
+def blocked_by_box_obstacles(
+    cm: CoordinateMap,
+    boxes: list[BoxObstacle],
+    *,
+    z_pad: float = 8.0,
+) -> set[int]:
+    """Клетки, пересекающие AABB препятствия (решётки, двери) в world space."""
+    blocked: set[int] = set()
+    if not boxes:
+        return blocked
+    hull = cm.cfg.hull_radius
+    cell = cm.cfg.cell
+    pad = hull + cell
+    for xmin, ymin, zmin, xmax, ymax, zmax in boxes:
+        if xmax < xmin:
+            xmin, xmax = xmax, xmin
+        if ymax < ymin:
+            ymin, ymax = ymax, ymin
+        if zmax < zmin:
+            zmin, zmax = zmax, zmin
+        xmin -= pad
+        ymin -= pad
+        xmax += pad
+        ymax += pad
+        zmin -= z_pad
+        zmax += z_pad
+        cx0, cy0 = cm.cell_of(xmin, ymin)
+        cx1, cy1 = cm.cell_of(xmax, ymax)
+        for cx in range(cx0, cx1 + 1):
+            for cy in range(cy0, cy1 + 1):
+                layers = cm.cells.get((cx, cy))
+                if not layers:
+                    continue
+                x, y = cm.cell_center(cx, cy)
+                if not (xmin <= x <= xmax and ymin <= y <= ymax):
+                    continue
+                for n in layers:
+                    if zmin <= n.z <= zmax:
                         blocked.add(n.id)
     return blocked
 
@@ -114,6 +160,8 @@ def dijkstra(
                 step = hdist + abs(b.z - a.z) * 0.5
                 if kind == "jump":
                     step += cfg.jump_penalty
+                elif kind == "crouch_jump":
+                    step += cfg.crouch_jump_penalty
                 elif kind == "ladder":
                     step += abs(b.z - a.z) * 0.2
             else:
@@ -173,7 +221,13 @@ def astar(
     g[start_id] = 0.0
 
     def h(node: Node) -> float:
-        return node.dist2d(goal.x, goal.y)
+        # На одном этаже — обычное XY. На другом (Вертиго, паласы) высота не спрямляется.
+        # 0.25*|dz| не больше стоимости спрыга/лестницы (drop_penalty + hdist).
+        dxy = node.dist2d(goal.x, goal.y)
+        dz = abs(node.z - goal.z)
+        if dz <= cm.cfg.crouch_jump_height:
+            return dxy
+        return math.hypot(dxy, dz * 0.25)
 
     heap = [(h(cm.nodes[start_id]), start_id)]
     closed = [False] * n
@@ -387,7 +441,7 @@ def pick_random_goal(
     n_try = min(10, len(pool))
     for _ in range(n_try):
         cand = pool[rng.randrange(len(pool))]
-        if math.hypot(cand.x - start[0], cand.y - start[1]) < min_dist and len(pool) > 8:
+        if math.hypot(cand.x - start[0], cand.y - start[1], cand.z - start[2]) < min_dist and len(pool) > 8:
             continue
         ids = astar(cm, node.id, cand.id, cfg, blocked)
         if ids:

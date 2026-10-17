@@ -56,6 +56,8 @@ class PlayerInfo:
     position: Vec3 = field(default_factory=Vec3)
     head_position: Vec3 = field(default_factory=Vec3)  # центр головы (кость 6)
     chest_position: Vec3 = field(default_factory=Vec3)  # центр груди (кость 4)
+    left_shoulder_position: Vec3 = field(default_factory=Vec3)   # clavicle_L (кость 8)
+    right_shoulder_position: Vec3 = field(default_factory=Vec3)  # clavicle_R (кость 13)
     eye_angles: Vec3 = field(default_factory=Vec3)
     velocity: Vec3 = field(default_factory=Vec3)
     distance: float = 0.0
@@ -79,7 +81,14 @@ class EnemyInfo:
     position: Vec3 = field(default_factory=Vec3)   # ноги (m_vOldOrigin)
     head_position: Vec3 = field(default_factory=Vec3)  # центр головы (кость 6)
     chest_position: Vec3 = field(default_factory=Vec3)  # центр груди (кость 4)
-    visible: bool = False                          # m_bSpottedByMask[local] и не dormant
+    left_shoulder_position: Vec3 = field(default_factory=Vec3)   # clavicle_L (кость 8)
+    right_shoulder_position: Vec3 = field(default_factory=Vec3)  # clavicle_R (кость 13)
+    spotted: bool = False                          # m_bSpottedByMask[local] (движок, может моргать)
+    visible: bool = False                          # LOS: хотя бы одна кость не за стеной (off-screen OK)
+    head_visible: bool = False
+    chest_visible: bool = False
+    left_shoulder_visible: bool = False
+    right_shoulder_visible: bool = False
     radar_spotted: bool = False                    # m_bSpotted (радар / кем-то замечен)
     dormant: bool = False                          # если True — position может быть устаревшей
     distance: float = 0.0
@@ -141,6 +150,8 @@ class GameSnapshot:
     visible_enemies: list[PlayerInfo] = field(default_factory=list)
     bomb: BombInfo | None = None
     ladders: list = field(default_factory=list)  # list[LadderInfo]
+    doors: list = field(default_factory=list)  # list[DoorInfo]
+    breakables: list = field(default_factory=list)  # list[BreakableInfo]
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -153,12 +164,19 @@ class GameSnapshot:
                 "name": e.name,
                 "health": e.health,
                 "armor": e.armor,
+                "spotted": e.spotted,
                 "visible": e.visible,
+                "head_visible": e.head_visible,
+                "chest_visible": e.chest_visible,
+                "left_shoulder_visible": e.left_shoulder_visible,
+                "right_shoulder_visible": e.right_shoulder_visible,
                 "radar_spotted": e.radar_spotted,
                 "dormant": e.dormant,
                 "position": vec(e.position),
                 "head_position": vec(e.head_position),
                 "chest_position": vec(e.chest_position),
+                "left_shoulder_position": vec(e.left_shoulder_position),
+                "right_shoulder_position": vec(e.right_shoulder_position),
                 "aim_position": vec(e.aim_position()),
                 "distance": e.distance,
                 "velocity": vec(e.velocity),
@@ -185,6 +203,8 @@ class GameSnapshot:
                 "position": vec(p.position),
                 "head_position": vec(p.head_position),
                 "chest_position": vec(p.chest_position),
+                "left_shoulder_position": vec(p.left_shoulder_position),
+                "right_shoulder_position": vec(p.right_shoulder_position),
                 "eye_angles": vec(p.eye_angles),
                 "distance": p.distance,
                 "velocity": vec(p.velocity),
@@ -215,5 +235,7 @@ class GameSnapshot:
             "visible_enemies": [player_dict(p) for p in self.visible_enemies],
             "bomb": {"planted": self.bomb.planted, "position": vec(self.bomb.position)} if self.bomb else None,
             "ladders": [lad.to_dict() for lad in self.ladders],
+            "doors": [door.to_dict() for door in self.doors],
+            "breakables": [br.to_dict() for br in self.breakables],
             "errors": self.errors,
         }

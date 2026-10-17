@@ -22,6 +22,11 @@ from cs2_reader.game_state import Vec3, WeaponInfo
 from cs2_reader.weapons import default_clip, resolve_weapon, weapon_cycle_s, weapon_is_auto, weapon_needs_scope
 from cs2_reader.recoil import recoil_offset, spray_recover_s
 
+# CS2: sv_gravity 800, sv_jump_impulse 301.993 → высота стоя 57u; с приседом ящик 64u.
+_CS2_GRAVITY = 800.0
+_CS2_JUMP_IMPULSE = 301.993
+_CS2_LADDER_SPEED = 200.0
+
 
 class FakeInput(GameInput):
     def __init__(self) -> None:
@@ -78,7 +83,10 @@ class SimPlayer:
     pitch: float
     vx: float = 0.0
     vy: float = 0.0
-    airborne: float = 0.0  # секунд в прыжке
+    vz: float = 0.0
+    airborne: float = 0.0  # >0 в прыжке
+    ground_z: float = 0.0
+    crouched: bool = False
 
 
 @dataclass
@@ -117,6 +125,14 @@ class SimTarget:
     def chest_position(self) -> Vec3:
         return Vec3(self.x, self.y, self.z)
 
+    @property
+    def left_shoulder_position(self) -> Vec3:
+        return Vec3(self.x, self.y, self.z)
+
+    @property
+    def right_shoulder_position(self) -> Vec3:
+        return Vec3(self.x, self.y, self.z)
+
     def aim_position(self, z_offset: float | None = None) -> Vec3:
         return self.head_position
 
@@ -148,6 +164,7 @@ class FakeReader:
         self._shots_fired = 0
         self._shots_idle_at: float | None = None
         self._scoped = False
+        self._ladders: list[dict] = []
         self._snap = self._take()
 
     def _take(self) -> tuple[Vec3, Vec3, Vec3]:
@@ -175,7 +192,7 @@ class FakeReader:
         return self._snap[2]
 
     def local_view_offset_z(self) -> float:
-        return 64.0
+        return 46.0 if self.p.crouched else 64.0
 
     def visible_enemies(self) -> list[SimTarget]:
         return list(self._visible)
@@ -197,10 +214,16 @@ class FakeReader:
         return False
 
     def ladders(self, force_refresh: bool = False):
+        return list(self._ladders)
+
+    def doors(self, force_refresh: bool = False):
+        return []
+
+    def breakables(self, force_refresh: bool = False):
         return []
 
     def local_on_ladder(self) -> bool:
-        return False
+        return _player_on_ladder(self.p.x, self.p.y, self.p.z, self._ladders)
 
     def poll_life(self):
         from cs2_reader.life import LocalLifeInfo, LocalLifeUpdate, LifeEvents
@@ -222,7 +245,8 @@ class SimConfig:
     yaw_offset: float = 0.0         # смещение yaw в «памяти»
     pos_noise: float = 0.0
     mouse_delay_ticks: int = 1
-    jump_duration: float = 0.45
+    jump_impulse: float = _CS2_JUMP_IMPULSE
+    gravity: float = _CS2_GRAVITY
     # мишени-макеты: (x, y, z); z у пола → овал на высоте головы, иначе z = центр
     targets: list[tuple[float, float, float]] = field(default_factory=list)
     target_radius: float = 8.0
@@ -287,6 +311,58 @@ class SimResult:
     path_curvature: float = 0.0       # средняя кривизна траектории прицела при наводке (0 = прямая)
 
 
+def _closest_ladder_dict(x: float, y: float, z: float, ladders: list[dict]) -> dict | None:
+    best = None
+    best_d = 64.0
+    for lad in ladders:
+        bot = lad.get("bottom"); top = lad.get("top")
+        if not bot or not top:
+            continue
+        zb = min(bot[2], top[2]); zt = max(bot[2], top[2])
+        if not (zb - 24.0 <= z <= zt + 24.0):
+            continue
+        bx, by = bot[0], bot[1]; tx, ty = top[0], top[1]
+        dx, dy = tx - bx, ty - by
+        seg = dx * dx + dy * dy
+        if seg <= 1.0:
+            d = math.hypot(x - bx, y - by)
+        else:
+            t = max(0.0, min(1.0, ((x - bx) * dx + (y - by) * dy) / seg))
+            d = math.hypot(x - (bx + dx * t), y - (by + dy * t))
+        if d < best_d:
+            best_d = d; best = lad
+    return best
+
+
+def _player_on_ladder(x: float, y: float, z: float, ladders: list[dict]) -> bool:
+    for lad in ladders:
+        bot = lad.get("bottom")
+        top = lad.get("top")
+        if not bot or not top:
+            continue
+        if top[2] < bot[2]:
+            bot, top = top, bot
+        if not (bot[2] - 4.0 <= z <= top[2] + 16.0):
+            continue
+        meta = lad.get("ladder") or {}
+        width = float(meta.get("width") or 32.0)
+        radius = max(32.0, width * 0.5 + 20.0)
+        # дистанция до отрезка bot_xy..top_xy (так покрываем диагональные/наклонные лестницы)
+        bx, by = bot[0], bot[1]
+        tx, ty = top[0], top[1]
+        dx, dy = tx - bx, ty - by
+        seg = dx * dx + dy * dy
+        if seg <= 1.0:
+            d = math.hypot(x - bx, y - by)
+        else:
+            t = max(0.0, min(1.0, ((x - bx) * dx + (y - by) * dy) / seg))
+            px, py = bx + dx * t, by + dy * t
+            d = math.hypot(x - px, y - py)
+        if d <= radius:
+            return True
+    return False
+
+
 class NavSimulator:
     def __init__(
         self,
@@ -303,7 +379,9 @@ class NavSimulator:
         node = cm.nearest_node(*start)
         if node is None:
             raise ValueError(f"старт {start} вне карты")
-        self.player = SimPlayer(x=start[0], y=start[1], z=node.z, yaw=initial_yaw, pitch=initial_pitch)
+        self.player = SimPlayer(
+            x=start[0], y=start[1], z=node.z, yaw=initial_yaw, pitch=initial_pitch, ground_z=node.z
+        )
         self.inp = FakeInput()
         self.targets: list[SimTarget] = []
         for i, (tx, ty, tz) in enumerate(self.sim.targets):
@@ -331,12 +409,24 @@ class NavSimulator:
         self.dt = 1.0 / cfg.tick_hz
         self.time = 0.0
         self.nav = Navigator(self.reader, self.inp, cm, cfg, clock=lambda: self.time)
+        self.reader._ladders = self._sim_ladders()
         self._mouse_queue: list[tuple[int, int]] = []
         self.collisions = 0
         self.target_collisions = 0
         self._auto_next = 0.0
         self._scope_was_right = False
         self._zoom_level = 0
+
+    def _sim_ladders(self) -> list[dict]:
+        out: list[dict] = []
+        for lk in getattr(self.cm, "ladder_links", []) or []:
+            lad = dict(lk.get("ladder") or {})
+            if "bottom" not in lad:
+                lad["bottom"] = lk.get("bottom")
+                lad["top"] = lk.get("top")
+            if lad.get("bottom") and lad.get("top"):
+                out.append(lad)
+        return out
 
     def _make_weapon(self) -> WeaponInfo:
         item_id, name = resolve_weapon(self.sim.weapon)
@@ -362,7 +452,7 @@ class NavSimulator:
         z = p.z
         for i in range(1, steps + 1):
             k = i / steps
-            node = self.cm.layer_at(p.x + dx * k, p.y + dy * k, z, dz_max=self.cm.cfg.jump_height)
+            node = self.cm.layer_at(p.x + dx * k, p.y + dy * k, z, dz_max=self.cm.cfg.crouch_jump_height)
             if node is None:
                 return False
             z = node.z
@@ -496,15 +586,141 @@ class NavSimulator:
         p = self.player
         dt = self.dt
         sim = self.sim
+        c = self.cm.cfg
+        p.crouched = "ctrl" in self.inp.keys
         speed = math.hypot(p.vx, p.vy)
+        on_lad = _player_on_ladder(p.x, p.y, p.z, self.reader._ladders)
+        nav_lad = getattr(self.nav, "_ladder", None)
+        # если nav не в ladder-режиме и игрок на nav-клетке — считаем, что сошли
+        if on_lad and nav_lad is None and self.cm.layer_at(p.x, p.y, p.z, dz_max=4.0) is not None:
+            on_lad = False
+        # «залипание» лестницы: пока nav явно просит climb/mount, не выпускаем из ladder-режима
+        if not on_lad:
+            if nav_lad is not None and nav_lad.get("phase") in ("climb", "mount"):
+                lad = nav_lad.get("lad") or {}
+                bot = lad.get("bottom"); top = lad.get("top")
+                if bot and top:
+                    tb = min(bot[2], top[2]) + 4.0
+                    tt = max(bot[2], top[2]) + 20.0
+                    if tb <= p.z <= tt:
+                        # сравним дистанцию до оси лестницы
+                        bx, by = bot[0], bot[1]
+                        tx, ty = top[0], top[1]
+                        dx, dy = tx - bx, ty - by
+                        seg = dx * dx + dy * dy
+                        if seg <= 1.0:
+                            d = math.hypot(p.x - bx, p.y - by)
+                        else:
+                            t = max(0.0, min(1.0, ((p.x - bx) * dx + (p.y - by) * dy) / seg))
+                            d = math.hypot(p.x - (bx + dx * t), p.y - (by + dy * t))
+                        if d <= 36.0:
+                            on_lad = True
 
-        if p.airborne > 0.0:
-            p.airborne = max(0.0, p.airborne - dt)
-        elif self.inp.jump_requested:
-            p.airborne = sim.jump_duration
+        if on_lad:
+            self.inp.jump_requested = False
+            p.airborne = 0.0
+            p.vz = 0.0
+            # на лестнице W/S двигают по оси лестницы в зависимости от pitch:
+            # pitch > 0 (смотрит вниз) → W = спуск; pitch < 0 (вверх) → W = подъём.
+            pitch_rad = math.radians(p.pitch)
+            dir_sign = -math.sin(pitch_rad)  # +1 вверх при pitch<0, −1 вниз при pitch>0
+            if abs(dir_sign) < 0.25 and nav_lad is not None:
+                dir_sign = 1.0 if nav_lad.get("up") else -1.0
+            if "w" in self.inp.keys:
+                climb = dir_sign * _CS2_LADDER_SPEED
+            elif "s" in self.inp.keys:
+                climb = -dir_sign * _CS2_LADDER_SPEED
+            else:
+                climb = 0.0
+            p.z += climb * dt
+            # ограничение: нельзя пройти ниже нижней площадки / выше верхней;
+            # у подножия лестницы телепортируем бот на ближайшую nav-клетку
+            lad_src = (nav_lad.get("lad") if nav_lad is not None else None) \
+                or _closest_ladder_dict(p.x, p.y, p.z, self.reader._ladders)
+            if lad_src is not None:
+                bot = lad_src.get("bottom"); top = lad_src.get("top")
+                if bot and top:
+                    zb = min(bot[2], top[2])
+                    zt = max(bot[2], top[2])
+                    if p.z <= zb + 2.0:
+                        p.z = zb
+                        land = self.cm.layer_at(p.x, p.y, zb, dz_max=c.step_height + 8.0)
+                        if land is None:
+                            best = None
+                            best_d = 48.0
+                            for n in self.cm.nodes:
+                                if abs(n.z - zb) > 24.0:
+                                    continue
+                                d = math.hypot(n.x - p.x, n.y - p.y)
+                                if d < best_d:
+                                    best_d = d
+                                    best = n
+                            land = best
+                        if land is not None:
+                            p.x = land.x
+                            p.y = land.y
+                            p.z = land.z
+                            p.ground_z = land.z
+                            p.vx = p.vy = 0.0
+                            return
+                    elif p.z > zt + 4.0:
+                        p.z = zt + 4.0
+            # залипание на оси лестницы: тянем XY к ближайшей точке на линии bot_xy..top_xy
+            if nav_lad is not None:
+                lad = nav_lad.get("lad") or {}
+                bot = lad.get("bottom"); top = lad.get("top")
+                if bot and top:
+                    bx, by = bot[0], bot[1]
+                    tx, ty = top[0], top[1]
+                    dx, dy = tx - bx, ty - by
+                    seg = dx * dx + dy * dy
+                    if seg > 1.0:
+                        t = max(0.0, min(1.0, ((p.x - bx) * dx + (p.y - by) * dy) / seg))
+                        p.x += (bx + dx * t - p.x) * min(1.0, dt * 8.0)
+                        p.y += (by + dy * t - p.y) * min(1.0, dt * 8.0)
+                    else:
+                        p.x += (bx - p.x) * min(1.0, dt * 8.0)
+                        p.y += (by - p.y) * min(1.0, dt * 8.0)
+            # лёгкий сайд-страфинг
+            if "a" in self.inp.keys or "d" in self.inp.keys:
+                import math as _m
+                yaw_r = _m.radians(p.yaw)
+                side = -_m.sin(yaw_r), _m.cos(yaw_r)
+                sgn = 1.0 if "d" in self.inp.keys else -1.0
+                p.x += side[0] * sgn * 40.0 * dt
+                p.y += side[1] * sgn * 40.0 * dt
+            p.vx *= 0.2
+            p.vy *= 0.2
+            p.ground_z = p.z
+            return
+
+        if p.airborne <= 0.0 and self.inp.jump_requested:
+            p.vz = sim.jump_impulse
+            p.airborne = 1.0
         self.inp.jump_requested = False
 
-        # трение (на земле)
+        if p.airborne > 0.0:
+            p.vz -= sim.gravity * dt
+            p.z += p.vz * dt
+            climb = c.crouch_jump_height if p.crouched else c.jump_height
+            land = self.cm.layer_at(p.x, p.y, p.z, dz_max=max(12.0, climb))
+            if p.vz <= 8.0 and land is not None and p.z <= land.z + 3.0:
+                up = land.z - p.ground_z
+                if up <= 0.2 or (p.crouched and up <= c.crouch_jump_height + 2.0) or (
+                    not p.crouched and up <= c.jump_height + 2.0
+                ):
+                    p.z = land.z
+                    p.vz = 0.0
+                    p.airborne = 0.0
+                    p.ground_z = land.z
+            elif p.z < p.ground_z - c.drop_height:
+                fall = self.cm.layer_at(p.x, p.y, p.z, dz_max=c.drop_height)
+                if fall is not None:
+                    p.z = fall.z
+                    p.vz = 0.0
+                    p.airborne = 0.0
+                    p.ground_z = fall.z
+
         if speed > 0.1 and p.airborne <= 0.0:
             control = max(speed, sim.stop_speed)
             drop = control * sim.friction * dt
@@ -517,35 +733,68 @@ class NavSimulator:
             wx, wy = wish
             cur = p.vx * wx + p.vy * wy
             add = sim.max_speed - cur
+            accel_k = sim.accelerate if p.airborne <= 0.0 else 1.2
             if add > 0:
-                accel = min(add, sim.accelerate * sim.max_speed * dt)
+                accel = min(add, accel_k * sim.max_speed * dt)
                 p.vx += wx * accel
                 p.vy += wy * accel
             spd = math.hypot(p.vx, p.vy)
-            if spd > sim.max_speed:
-                p.vx *= sim.max_speed / spd
-                p.vy *= sim.max_speed / spd
+            cap = sim.max_speed
+            if spd > cap:
+                p.vx *= cap / spd
+                p.vy *= cap / spd
 
         nx, ny = p.x + p.vx * dt, p.y + p.vy * dt
-        dz_max = self.cm.cfg.jump_height if p.airborne > 0.0 else self.cm.cfg.step_height
-        node = self.cm.layer_at(nx, ny, p.z, dz_max)
+        if p.airborne > 0.0:
+            dz_max = c.crouch_jump_height if p.crouched else c.jump_height
+            ref_z = p.ground_z
+        else:
+            dz_max = c.step_height
+            ref_z = p.z
+        node = self.cm.layer_at(nx, ny, ref_z, dz_max)
+        if node is None and p.airborne <= 0.0:
+            # ступеньки нет вверх — может быть drop вниз (шаг за край)
+            drop = self.cm.layer_at(nx, ny, ref_z, dz_max=c.drop_height)
+            if drop is not None and drop.z < ref_z - c.step_height:
+                # падаем: включаем airborne и уводим z вниз
+                p.airborne = 1.0
+                p.vz = 0.0
+                node = drop
+                ref_z = drop.z
         if node is not None:
             p.x, p.y = nx, ny
-            p.z += (node.z - p.z) * min(1.0, dt * 12.0)
+            if p.airborne <= 0.0:
+                p.z += (node.z - p.z) * min(1.0, dt * 12.0)
+                p.ground_z = node.z
             return
-        # скольжение вдоль стены
         self.collisions += 1
-        node = self.cm.layer_at(nx, p.y, p.z, dz_max)
+        node = self.cm.layer_at(nx, p.y, ref_z, dz_max)
+        if node is None and p.airborne <= 0.0:
+            drop = self.cm.layer_at(nx, p.y, ref_z, dz_max=c.drop_height)
+            if drop is not None and drop.z < ref_z - c.step_height:
+                p.airborne = 1.0
+                p.vz = 0.0
+                node = drop
         if node is not None:
             p.x = nx
             p.vy = 0.0
-            p.z += (node.z - p.z) * min(1.0, dt * 12.0)
+            if p.airborne <= 0.0:
+                p.z += (node.z - p.z) * min(1.0, dt * 12.0)
+                p.ground_z = node.z
             return
-        node = self.cm.layer_at(p.x, ny, p.z, dz_max)
+        node = self.cm.layer_at(p.x, ny, ref_z, dz_max)
+        if node is None and p.airborne <= 0.0:
+            drop = self.cm.layer_at(p.x, ny, ref_z, dz_max=c.drop_height)
+            if drop is not None and drop.z < ref_z - c.step_height:
+                p.airborne = 1.0
+                p.vz = 0.0
+                node = drop
         if node is not None:
             p.y = ny
             p.vx = 0.0
-            p.z += (node.z - p.z) * min(1.0, dt * 12.0)
+            if p.airborne <= 0.0:
+                p.z += (node.z - p.z) * min(1.0, dt * 12.0)
+                p.ground_z = node.z
             return
         p.vx = p.vy = 0.0
 
@@ -598,11 +847,11 @@ class NavSimulator:
 
     # -------------------------------------------------------------- run
 
-    def run(self, duration: float = 60.0, log_every: int = 40) -> SimResult:
+    def run(self, duration: float = 60.0, log_every: int = 40, goal_id: int | None = None) -> SimResult:
         res = SimResult()
         p = self.player
         self.reader.latch()
-        self.nav.plan((p.x, p.y, p.z))
+        self.nav.plan((p.x, p.y, p.z), goal_id=goal_id)
         assert self.nav.route is not None
         res.route = list(self.nav.route.pts)
         res.route_len = self.nav.route.length

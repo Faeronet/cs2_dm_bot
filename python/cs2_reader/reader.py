@@ -11,6 +11,8 @@ from cs2_reader.aim import (
     BONE_ARRAY_IN_MODEL_STATE,
     BONE_CHEST,
     BONE_HEAD,
+    BONE_LEFT_SHOULDER,
+    BONE_RIGHT_SHOULDER,
     BONE_STRIDE,
     aim_point,
     chest_center_from_view,
@@ -20,6 +22,7 @@ from cs2_reader.aim import (
     head_center_from_view,
     head_plausible,
     normalize_yaw,
+    shoulder_plausible,
     yaw_to_target,
 )
 from cs2_reader.game_state import BombInfo, EnemyInfo, GameSnapshot, PlayerInfo, Vec3, ViewMatrix, WeaponInfo
@@ -34,6 +37,13 @@ from cs2_reader.offsets import (
     Offsets,
 )
 from cs2_reader.platform import Platform, client_module_name, detect_platform, engine_module_name
+from cs2_reader.breakables import (
+    BreakableInfo,
+    is_breakable_candidate,
+    merge_breakables,
+    read_breakable,
+)
+from cs2_reader.doors import DoorInfo, is_door_entity, read_door
 from cs2_reader.ladders import LadderInfo, entity_designer_name, is_ladder_entity, read_ladder
 from cs2_reader.life import (
     LIFE_ALIVE,
@@ -50,6 +60,9 @@ from cs2_reader.weapons import is_healthshot, weapon_name
 
 MAX_ENTITIES = 8192
 LADDER_CACHE_TTL = 5.0
+DOOR_CACHE_TTL = 1.0
+BREAKABLE_CACHE_TTL = 1.0
+BREAKABLE_SCAN_MAX = 4096
 
 
 class Reader:
@@ -81,6 +94,12 @@ class Reader:
         self._ladder_cache: list[LadderInfo] = []
         self._ladder_cache_at = 0.0
         self._ladder_map = ""
+        self._door_cache: list[DoorInfo] = []
+        self._door_cache_at = 0.0
+        self._door_map = ""
+        self._breakable_cache: list[BreakableInfo] = []
+        self._breakable_cache_at = 0.0
+        self._breakable_map = ""
 
     @classmethod
     def from_pid(cls, pid: int) -> "Reader":
@@ -295,6 +314,22 @@ class Reader:
         if head is None and chest_plausible(feet, fallback):
             return fallback
         return fallback
+
+    def pawn_shoulder_positions(
+        self,
+        pawn: int,
+        feet: Vec3,
+        chest: Vec3 | None = None,
+        head: Vec3 | None = None,
+    ) -> tuple[Vec3, Vec3]:
+        """Левое/правое плечо: кости clavicle_L (8) и clavicle_R (13). Без кости — (0,0,0)."""
+        left = self.pawn_bone_position(pawn, BONE_LEFT_SHOULDER)
+        right = self.pawn_bone_position(pawn, BONE_RIGHT_SHOULDER)
+        if not left or not shoulder_plausible(feet, left, chest, head):
+            left = Vec3()
+        if not right or not shoulder_plausible(feet, right, chest, head):
+            right = Vec3()
+        return left, right
 
     def local_head_position(self) -> Vec3:
         pawn = self.local_pawn()
@@ -543,6 +578,9 @@ class Reader:
 
         player.head_position = self.pawn_head_position(pawn, player.position)
         player.chest_position = self.pawn_chest_position(pawn, player.position, player.head_position)
+        player.left_shoulder_position, player.right_shoulder_position = self.pawn_shoulder_positions(
+            pawn, player.position, player.chest_position, player.head_position,
+        )
         player.distance = player.position.distance_to(local_pos)
         player.spotted = self.is_visible(pawn, local_index)
         vel = self.backend.read_vec3(pawn + self.schema.m_vec_velocity)
@@ -578,7 +616,7 @@ class Reader:
         for p in self.players():
             if not self._is_enemy(p):
                 continue
-            vis = p.spotted and not p.dormant
+            spotted = p.spotted and not p.dormant
             out.append(
                 EnemyInfo(
                     index=p.index,
@@ -588,7 +626,10 @@ class Reader:
                     position=p.position,
                     head_position=p.head_position,
                     chest_position=p.chest_position,
-                    visible=vis,
+                    left_shoulder_position=p.left_shoulder_position,
+                    right_shoulder_position=p.right_shoulder_position,
+                    spotted=spotted,
+                    visible=False,  # LOS — заполняет navigator / apply_los_visibility
                     radar_spotted=self.is_radar_spotted(p.pawn),
                     dormant=p.dormant,
                     distance=p.distance,
@@ -658,6 +699,88 @@ class Reader:
         self._ladder_map = map_name
         return out
 
+    def doors(self, force_refresh: bool = False) -> list[DoorInfo]:
+        """Двери на карте: положение, состояние (open/closed/…), locked (кэш ~1 с)."""
+        map_name = self.map_name()
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._door_cache
+            and now - self._door_cache_at < DOOR_CACHE_TTL
+            and self._door_map == map_name
+        ):
+            local = self.local_position()
+            for door in self._door_cache:
+                door.distance = door.position.distance_to(local)
+            return self._door_cache
+
+        local = self.local_position()
+        out: list[DoorInfo] = []
+        seen: set[tuple[int, int, int]] = set()
+        scan_hi = max(self.highest_entity_index(), 512)
+        for i in range(1, scan_hi + 1):
+            ent = self.entity_by_index(i)
+            if not ent or ent < 0x10000:
+                continue
+            cls = entity_designer_name(self.backend, self.schema, ent)
+            if not is_door_entity(cls):
+                continue
+            door = read_door(self.backend, self.schema, ent, i, local, name=cls or "door")
+            if not door:
+                continue
+            key = (
+                round(door.position.x),
+                round(door.position.y),
+                round(door.position.z),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(door)
+
+        out.sort(key=lambda door: door.distance)
+        self._door_cache = out
+        self._door_cache_at = now
+        self._door_map = map_name
+        return out
+
+    def breakables(self, force_refresh: bool = False) -> list[BreakableInfo]:
+        """Ломаемые entity (решётки, окна, func_breakable): позиция и целостность."""
+        map_name = self.map_name()
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._breakable_cache
+            and now - self._breakable_cache_at < BREAKABLE_CACHE_TTL
+            and self._breakable_map == map_name
+        ):
+            local = self.local_position()
+            for item in self._breakable_cache:
+                item.distance = item.position.distance_to(local)
+            return self._breakable_cache
+
+        local = self.local_position()
+        out: list[BreakableInfo] = []
+        scan_hi = max(self.highest_entity_index(), BREAKABLE_SCAN_MAX)
+        for i in range(1, scan_hi + 1):
+            ent = self.entity_by_index(i)
+            if not ent or ent < 0x10000:
+                continue
+            cls = entity_designer_name(self.backend, self.schema, ent)
+            if not is_breakable_candidate(self.backend, self.schema, ent, name=cls):
+                continue
+            br = read_breakable(self.backend, self.schema, ent, i, local, name=cls)
+            if not br:
+                continue
+            out.append(br)
+
+        out = merge_breakables(out)
+        out.sort(key=lambda item: item.distance)
+        self._breakable_cache = out
+        self._breakable_cache_at = now
+        self._breakable_map = map_name
+        return out
+
     def bomb_info(self) -> BombInfo | None:
         client = self._client_base()
         if not client or not self.offsets.client.dw_planted_c4:
@@ -710,6 +833,8 @@ class Reader:
         ]
         snap.bomb = self.bomb_info()
         snap.ladders = self.ladders()
+        snap.doors = self.doors()
+        snap.breakables = self.breakables()
         return snap
 
     def _read_build_number(self, engine: int) -> int:

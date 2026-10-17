@@ -26,8 +26,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from cs2_reader.reader import Reader
 
 ROOT = Path(__file__).resolve().parents[2]
-OUT_DIR = ROOT / "data" / "recordings"
-MAPS_DIR = ROOT / "data" / "maps"
+OUT_DIR = ROOT / "data" / "maps"
+MAPS_DIR = OUT_DIR
 
 KNOWN_LOCATIONS = (
     "ct_spawn",
@@ -153,7 +153,7 @@ def _wait_for_stop(stop: threading.Event) -> None:
 
 
 def _recording_path(map_name: str, location: str) -> Path:
-    return OUT_DIR / map_name / f"{location}.json"
+    return OUT_DIR / f"{map_name}_{location}.json"
 
 
 def _load_recording(path: Path) -> dict | None:

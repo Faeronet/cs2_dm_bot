@@ -10,10 +10,11 @@ cs2-memory-damp/
 ├── python/cs2_control/      # Ввод: клавиши (uinput) и мышь
 ├── python/cs2_nav/          # Навигация: карта → маршрут → контроллер, симулятор
 ├── python/tools/            # CLI утилиты
+├── nav_export/              # Выгрузка навмеша из VPK → data/maps
 ├── scripts/                 # Оффсеты и валидация
 ├── data/
 │   ├── offsets.json         # Оффсеты (после dump_live)
-│   └── recordings/          # Записанные координаты локаций
+│   └── maps/                # Навмеши и записи координат (плоские файлы)
 └── external/cs2-dumper/     # Снятие оффсетов
 ```
 
@@ -41,7 +42,7 @@ python3 scripts/update_offsets.py
 ```bash
 python3 python/tools/record_coords.py -m de_dust2 -l b_tunnel
 # бег по зоне, затем в консоли: stop
-# → data/recordings/de_dust2/b_tunnel.json
+# → data/maps/de_dust2_b_tunnel.json
 python3 python/tools/record_coords.py --list
 ```
 
@@ -74,9 +75,9 @@ python3 python/tools/walk_test.py --leg 1.5 --circle 8
 локации: новая/расширенная запись подхватывается автоматически.
 
 ```bash
-# Живой запуск (CS2 в фокусе). По умолчанию data/recordings/de_inferno/de_inferno.json
+# Живой запуск (CS2 в фокусе). По умолчанию data/maps/de_inferno_de_inferno.json
 python3 python/tools/walk_nav.py --duration 30
-python3 python/tools/walk_nav.py -r data/recordings/de_dust2/lower_tunel1.json --loop --png /tmp/route.png
+python3 python/tools/walk_nav.py -r data/maps/de_dust2_lower_tunel1.json --loop --png /tmp/route.png
 
 # Карта локации как PNG-радар (проверить, что запись «сложилась»)
 python3 python/tools/render_map.py -o /tmp/map.png --clearance
@@ -94,7 +95,7 @@ python3 python/tools/walk_nav.py --duration 60 --aim-z 48                       
 
 # Склеить несколько записей в один файл (перекрытия на стыке убираются, radius 8u)
 python3 python/tools/merge_recordings.py -l tunels \
-    data/recordings/de_dust2/lower_tunel1.json data/recordings/de_dust2/uper_tunel.json
+    data/maps/de_dust2_lower_tunel1.json data/maps/de_dust2_uper_tunel.json
 ```
 
 Как это работает (`python/cs2_nav/`):
@@ -112,8 +113,8 @@ python3 python/tools/merge_recordings.py -l tunels \
 
 ```bash
 python3 python/tools/record_coords.py -m de_dust2 -l mid
-python3 python/tools/merge_recordings.py -l tunels_mid data/recordings/de_dust2/tunels.json data/recordings/de_dust2/mid.json
-python3 python/tools/walk_nav.py -r data/recordings/de_dust2/tunels_mid.json
+python3 python/tools/merge_recordings.py -l tunels_mid data/maps/de_dust2_tunels.json data/maps/de_dust2_mid.json
+python3 python/tools/walk_nav.py -r data/maps/de_dust2_tunels_mid.json
 ```
 
 ## API
@@ -128,7 +129,7 @@ pos = reader.local_position()
 eye = reader.local_eye_angles()      # pitch, yaw
 aim = reader.local_aim_point()       # координаты в мире
 
-cmap = CoordinateMap.from_recording(["data/recordings/de_dust2/lower_tunel.json"])
+cmap = CoordinateMap.from_recording(["data/maps/de_dust2_lower_tunel.json"])
 nav = Navigator(reader, create_input(), cmap, NavConfig(loop=True))
 nav.plan((pos.x, pos.y, pos.z))
 nav.run(duration=120)

@@ -1,12 +1,12 @@
-# de_cache.vpk
+# nav_export
 
-Достаёт `maps/de_cache.nav` из архива `data/de_cache.vpk` и печатает зоны, координаты углов, связи, лестницы и параметры генерации.
+Достаёт навигационную сетку (`maps/<карта>.nav`) из VPK и пишет разбор в `data/maps`.
 
 ```bash
-python3 decompile_nav.py
+python3 nav_export/decompile_nav.py data/de_cache.vpk
 ```
 
-Результат пишется в `out/de_cache.nav` и `out/de_cache.nav.json`.
+Результат: `data/maps/de_cache.nav` и `data/maps/de_cache.nav.json`.
 
 Разбор каталога VPK и формата `.nav` (версии 30–36, блоки KV3 в версии 36) сделан по коду Source 2 Viewer в `ValveResourceFormat/`.
 

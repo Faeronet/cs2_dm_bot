@@ -27,9 +27,12 @@ from typing import Callable
 
 from cs2_control.input import GameInput
 from cs2_nav.coord_map import CoordinateMap, _ladder_as_dict
+from cs2_nav.los_visibility import apply_los_visibility, los_clear, visible_bone_parts
 from cs2_nav.pathfinder import (
+    BoxObstacle,
     Obstacle,
     RouteConfig,
+    blocked_by_box_obstacles,
     blocked_by_obstacles,
     pick_farthest_goal,
     pick_random_goal,
@@ -37,7 +40,14 @@ from cs2_nav.pathfinder import (
     segment_clear,
 )
 from cs2_nav.route import Route
-from cs2_reader.aim import chest_plausible, head_plausible, shortest_yaw_err, yaw_to_target
+from cs2_reader.aim import (
+    chest_plausible,
+    forward_from_angles,
+    head_plausible,
+    shoulder_plausible,
+    shortest_yaw_err,
+    yaw_to_target,
+)
 from cs2_reader.game_state import Vec3
 from cs2_reader.weapons import (
     default_clip,
@@ -65,6 +75,58 @@ _KEY_DIRS: list[tuple[float, frozenset[str]]] = [
     (-45.0, frozenset({"w", "d"})),
 ]
 _DIR_OF_KEYS: dict[frozenset[str], float] = {k: a for a, k in _KEY_DIRS}
+
+class _PendingAxis:
+    """Градусы, отправленные мышью, но ещё не отразившиеся в памяти игры (задержка ввода 1–3 тика).
+
+    Без учёта этого замкнутая петля дожима «не видит» своих последних движений, досылает ещё и
+    перелетает точку — прицел ёрзает влево-вправо около мишени. Сопоставляем пришедшее Δугла
+    с самыми старыми отправками того же знака (FIFO); остаток = «в полёте». Старые записи
+    истекают, поэтому ошибка калибровки °/px не копится."""
+
+    __slots__ = ("q", "expire")
+
+    def __init__(self, expire_ticks: int = 5) -> None:
+        self.q: list[list[float]] = []      # [tick, remaining_deg]
+        self.expire = expire_ticks
+
+    def sent(self, tick: int, deg: float) -> None:
+        if abs(deg) > 1e-9:
+            self.q.append([float(tick), deg])
+
+    def observed(self, tick: int, deg: float) -> None:
+        rem = deg
+        for item in self.q:
+            if abs(rem) < 1e-9:
+                break
+            if item[1] * rem > 0:
+                take = item[1] if abs(item[1]) <= abs(rem) else rem
+                item[1] -= take
+                rem -= take
+        self.q = [it for it in self.q if abs(it[1]) > 1e-9 and tick - it[0] < self.expire]
+
+    def value(self) -> float:
+        return sum(it[1] for it in self.q)
+
+    def clear(self) -> None:
+        self.q.clear()
+
+
+# Какие кости бот умеет брать на мушку. Порядок = приоритет fallback'а,
+# если выбранная часть вдруг не видна или отсутствует в кадре.
+_AIM_PART_KEYS: dict[str, str] = {
+    "head": "head_position",
+    "chest": "chest_position",
+    "left_shoulder": "left_shoulder_position",
+    "right_shoulder": "right_shoulder_position",
+}
+_AIM_PARTS_ORDER: tuple[str, ...] = ("head", "chest", "left_shoulder", "right_shoulder")
+_AIM_PART_RU: dict[str, str] = {
+    "head": "голова",
+    "chest": "грудь",
+    "left_shoulder": "лев. плечо",
+    "right_shoulder": "прав. плечо",
+}
 
 # xxHash32, урезанный под (зерно, счётчик) — как в разборе генераторов на Хабре:
 # https://habr.com/ru/companies/vk/articles/574414/
@@ -127,6 +189,7 @@ class NavConfig:
     steer_smooth: float = 0.55               # EMA вектора руления (0 = без сглаживания)
     key_hysteresis_deg: float = 9.0
     key_min_hold: float = 0.12               # с: не дёргать клавиши чаще
+    forward_only_deg: float = 32.0           # |rel| в конусе — только W, без лёгкого A/D
     strafe_only_deg: float = 70.0            # цель сильно сбоку → только A/D + поворот
     turn_in_place_deg: float = 105.0         # цель сзади → стоим, крутим камеру
     arrive_radius: float = 24.0
@@ -149,6 +212,16 @@ class NavConfig:
     engage_targets: bool = True              # смотреть на видимую вокруг мишень, продолжая идти по маршруту
     enemies_poll_hz: float = 20.0            # как часто читать список врагов из памяти (перебор 64 сущностей)
     ladders_poll_hz: float = 0.5             # лестницы меняются редко — полный перебор entity list
+    doors_poll_hz: float = 2.0               # двери: состояние open/closed меняется чаще
+    door_block_margin: float = 20.0          # запас вокруг запертой двери при обходе
+    door_use_dist: float = 96.0              # u: +use достаёт, жмём на ходу
+    door_use_approach: float = 140.0         # u: дверь впереди по маршруту
+    door_use_hold: tuple[float, float] = (0.07, 0.12)
+    door_use_retry: float = 0.55             # с: повтор, если всё ещё закрыта
+    breakables_poll_hz: float = 1.0          # решётки/окна: hp меняется реже дверей
+    breakable_block_margin: float = 16.0     # запас вокруг целой решётки, если её нельзя прострелить
+    breakable_engage_dist: float = 340.0     # u: решётка на маршруте впереди — начинаем наводку
+    breakable_aim_deg: tuple[float, float] = (1.6, 3.4)  # °: точка рядом с прицелом на старте, xxHash
     target_memory: float = 45.0              # с: помним, где стояла мишень, когда её уже не видно (для обхода)
     standoff_dist: float = 110.0             # u: если мишень перекрыла проход — подойти на столько и стрелять с места
     standoff_wait: float = 4.0               # с: стоим на дистанции без мишени в прицеле → бросаем, другая цель
@@ -165,8 +238,8 @@ class NavConfig:
     peek_overshoot: tuple[float, float] = (34.0, 64.0)  # u: прицел чуть дальше угла, в проём
     target_forget_polls: int = 5             # опросов подряд «место видно, мишени нет» → забываем (пропала/убита)
     target_max_dist: float = 1400.0          # дальше — игнорируем
-    target_reaction: tuple[float, float] = (0.12, 0.25)   # с: обычная реакция, если не пик
-    target_fast_reaction: tuple[float, float] = (0.03, 0.08)  # с: слепой выход, 40%
+    target_reaction: tuple[float, float] = (0.05, 0.10)   # с: быстрая реакция (было (0.12,0.25))
+    target_fast_reaction: tuple[float, float] = (0.015, 0.045)  # с: слепой выход, 40%
     target_hold: float = 0.85                # с: spotted в CS2 мигает — не бросаем наводку на каждый кадр
     target_yaw_rate_max: float = 330.0       # °/с: (режим без стрельбы) наводка резче панорамы
     target_yaw_gain: float = 9.0             # 1/с: (режим без стрельбы)
@@ -178,41 +251,44 @@ class NavConfig:
     target_behind_deg: float = 125.0         # мишень позади по ходу движения → не бежим спиной, отпускаем
     # --- наводка «как рука»: баллистический флик (minimum-jerk) + короткая коррекция по зрению
     aim_flick_deg: float = 30.0              # ≥ столько ° по любой оси — флик как сейчас; меньше — как навигация
-    aim_handoff_s: float = 0.18              # с: с начала наводки крутим той же динамикой, что маршрут
+    aim_handoff_s: float = 0.10              # с: с начала наводки крутим той же динамикой, что маршрут (было 0.18)
     aim_close_dist: float = 140.0            # u: ближе — мышь чуть быстрее панорамы маршрута
     aim_far_dist: float = 750.0
-    aim_close_boost: float = 1.42            # к потолку °/с навигации на ближней дистанции
-    aim_far_boost: float = 1.08
-    aim_speed_jitter: float = 0.09           # ± доля: скорость наводки плавает, даже на той же дистанции
-    flick_ramp: float = 0.18                 # с: набор к профилю флика (подхват текущей скорости маршрута)
+    aim_close_boost: float = 2.84            # ещё ×≈1.33 (суммарно ×2.0 к исходному 1.42)
+    aim_far_boost: float = 2.16              # ещё ×≈1.33 (суммарно ×2.0 к исходному 1.08)
+    aim_speed_jitter: float = 0.12           # ± доля: скорость наводки плавает (xxHash → цифры не повторяются)
+    flick_ramp: float = 0.12                 # с: набор к профилю флика (короче — быстрее подхват)
     flick_min_deg: float = 4.0               # меньше — без флика, сразу коррекция
-    flick_base_time: float = 0.09            # с: длительность флика = base + per_deg × угол (закон Фиттса)
-    flick_per_deg: float = 0.0021            # с/°: 30° ≈ 0.15 с, 90° ≈ 0.28 с, 180° ≈ 0.47 с
-    flick_rate_max: float = 720.0            # °/с: пик скорости флика (min-jerk: 1.875 × угол / T)
+    flick_base_time: float = 0.04            # ещё ÷1.5 (суммарно ÷≈2.25): база длительности флика
+    flick_per_deg: float = 0.0010            # ещё ÷1.4 (90° ≈ 0.13 с, 180° ≈ 0.22 с)
+    flick_rate_max: float = 1440.0           # ×≈1.33 ещё: пик скорости флика
     flick_undershoot: float = 0.0            # без недовода: овал головы маленький
     flick_error_frac: float = 0.004
     flick_error_min: float = 0.05            # °
-    aim_correct_delay: tuple[float, float] = (0.03, 0.06)
-    aim_lock_gain: float = 22.0              # 1/с: дожим в центр (обе оси одинаково)
-    aim_lock_rate: float = 340.0             # °/с
-    aim_correct_gain: float = 22.0
-    aim_correct_rate: float = 340.0
+    aim_correct_delay: tuple[float, float] = (0.015, 0.030)  # вдвое короче (почти без паузы на коррекцию)
+    aim_lock_gain: float = 44.0              # ×≈1.33 ещё: дожим в центр
+    aim_lock_rate: float = 680.0             # ×≈1.33 ещё
+    aim_correct_gain: float = 44.0           # ×≈1.33 ещё
+    aim_correct_rate: float = 680.0          # ×≈1.33 ещё
     aim_max_px_per_tick: int = 480           # px: флик — реальный быстрый мах мышью
-    aim_chase_speed: tuple[float, float] = (1.06, 1.22)  # xxHash: чуть быстрее вести бегущую
-    aim_chase_move: float = 95.0             # u/s: мишень бежит / идёт
-    aim_chase_strafe: float = 52.0           # u/s поперёк луча — стрейф влево-вправо
-    aim_chase_rise: float = 0.12             # с: набор к быстрой наводке (с текущей скорости)
+    aim_chase_speed: tuple[float, float] = (1.25, 1.55)  # xxHash: чуть быстрее вести бегущую
+    aim_chase_move: float = 160.0            # u/s: мишень реально бежит (было 95 — срабатывало на любой поворот)
+    aim_chase_strafe: float = 95.0           # u/s поперёк луча (было 52 — любой шажок считался стрейфом)
+    aim_chase_rise: float = 0.08             # с: быстрее добирать скорость при появлении бегущей
     aim_chase_fall: float = 0.22             # с: возврат, когда остановилась
     aim_track_pace: tuple[float, float] = (0.90, 1.12)  # xxHash: то чуть быстрее, то чуть медленнее
-    aim_overshoot_u: tuple[float, float] = (2.2, 5.5)  # u: чуть за мишень, потом назад
-    aim_overshoot_s: tuple[float, float] = (0.20, 0.42)
-    aim_miss_chance: float = 0.10            # xxHash: выстрел мимо
-    aim_miss_u: tuple[float, float] = (3.0, 6.5)  # u: промах чуть мимо овала, не через всю модель
-    aim_chest_chance: float = 0.20           # xxHash: грудь вместо головы
+    aim_overshoot_u: tuple[float, float] = (0.4, 1.2)   # u: микро-упреждение по стрейфу (было (2.2,5.5))
+    aim_overshoot_s: tuple[float, float] = (0.08, 0.16)  # с: вдвое короче окно перевода
+    aim_miss_chance: float = 0.015           # xxHash: редкий промах (было 10%, теперь 1.5%)
+    aim_miss_u: tuple[float, float] = (0.8, 2.2)   # u: если и мимо — то едва мимо овала
+    aim_chest_chance: float = 0.20           # xxHash: грудь вместо головы (если грудь видна)
+    aim_shoulder_chance: float = 0.08        # xxHash: плечо вместо головы (если видно только плечо — всегда)
     aim_head_off_xy: tuple[float, float] = (0.5, 2.2)   # u: точка на голове, не всегда центр
     aim_head_off_z: tuple[float, float] = (-1.5, 1.6)
     aim_chest_off_xy: tuple[float, float] = (0.8, 4.0)
     aim_chest_off_z: tuple[float, float] = (-3.2, 3.0)
+    aim_shoulder_off_xy: tuple[float, float] = (0.4, 1.8)  # u: плечо мелкое — разброс поменьше
+    aim_shoulder_off_z: tuple[float, float] = (-1.2, 1.2)
     aim_bone_off_along: tuple[float, float] = (-0.7, 0.7)  # u: чуть ближе/дальше по лучу
     unscope_click_chance: float = 0.20       # xxHash: выход из скоупа 2×ПКМ, иначе нож→оружие
     unscope_click_gap: tuple[float, float] = (0.14, 0.34)  # с между кликами ПКМ
@@ -223,15 +299,15 @@ class NavConfig:
     fire_tolerance_pitch_deg: float = 0.10
     fire_target_half_width: float = 4.5      # u: полуось овала по XY
     fire_target_up_margin: float = 5.5       # u: полуось овала по Z
-    fire_oval_frac: float = 0.28             # стреляем только во внутренней ~¼ овала
-    fire_confirm_s: float = 0.04             # с: прицел должен удержаться в допуске
+    fire_oval_frac: float = 0.45             # шире окно попадания (было 0.28 — слишком узкое, выстрел задерживался)
+    fire_confirm_s: float = 0.015            # с: прицел должен удержаться в допуске (было 0.04)
     fire_interval: tuple[float, float] = (0.14, 0.22)   # запасной интервал тапа, если нет таблицы
-    fire_first_delay: tuple[float, float] = (0.04, 0.08)
+    fire_first_delay: tuple[float, float] = (0.015, 0.035)  # почти моментальный первый выстрел (было (0.04,0.08))
     fire_hold_ticks: int = 1                 # тиков держим ЛКМ на тапе (≥1 тик игры)
     fire_stop_moving: bool = True            # стоим на месте во время стрельбы (точность как у игрока)
     vuln_fire_delay: tuple[float, float] = (0.86, 1.18)  # с: после снятия spawn-защиты, xxHash около 1 с
-    combat_strafe_chance: float = 0.60       # xxHash: A/D шаги и выстрел на контрстрейфе
-    combat_strafe_dist: tuple[float, float] = (24.0, 72.0)  # u: длина шага, каждый раз новая
+    combat_strafe_chance: float = 0.25       # xxHash: A/D шаги МЕЖДУ выстрелами (первый — всегда с места)
+    combat_strafe_dist: tuple[float, float] = (18.0, 44.0)  # u: короткий шаг, каждый раз новый
     # --- скоуп снайперок без хипфайр-прицела (AWP/SSG/автоснайпер)
     scope_noscope_chance: float = 0.30       # xxHash: навестись и выстрелить без скоупа
     scope_enter_deg: tuple[float, float] = (1.8, 4.6)   # °: радиус прицела, чтобы войти в скоуп
@@ -240,9 +316,9 @@ class NavConfig:
     # --- антиотдача: ведём линию мышью, не телепортируем прицел на точку пули
     rcs_enabled: bool = True
     rcs_rate: float = 28.0                   # °/с база ведения линии (потом плавает)
-    rcs_rate_jitter: float = 0.045           # ± доля скорости xxHash
+    rcs_rate_jitter: float = 0.030           # ± доля скорости xxHash (меньше дрейфа — точнее линия)
     rcs_gain: float = 10.5                   # 1/с: догон линии, не lock 340°/с
-    rcs_wind_sigma: float = 0.32             # °/с ветер WindMouse на линии
+    rcs_wind_sigma: float = 0.20             # °/с ветер WindMouse на линии (меньше бокового разноса)
     rcs_return_mul: tuple[float, float] = (0.92, 1.32)  # xxHash: скорость возврата от скорости RCS
     rcs_return_done: float = 0.65            # °: считаем, что вернулись
     rcs_break_deg: float = 5.5               # °: сошли с линии слишком далеко — отпускаем зажим
@@ -285,6 +361,7 @@ class _PoseSource:
     def poll_life(self): ...
     def ladders(self): ...
     def local_on_ladder(self): ...
+    def doors(self): ...
 
 
 class Navigator:
@@ -346,10 +423,14 @@ class Navigator:
         self._track_phase = "center"
         self._track_until = 0.0
         self._track_pace = 1.0
-        self._aim_chest = False
+        self._aim_part = "head"               # head/chest/left_shoulder/right_shoulder
+        self._aim_chest = False               # back-compat alias (_aim_part == "chest")
+        self._aim_bone_delta = (0.0, 0.0, 0.0)  # кость − голова на момент выбора (если кость пропала из чтения)
         self._aim_spot = (0.0, 0.0, 0.0)      # lat, along, up — точка на кости (xxHash, на мишень)
         self._shot_miss: bool | None = None
         self._prev_mem = None  # (yaw, pitch)
+        self._pend_yaw = _PendingAxis()       # мышь «в полёте»: отправлено, в памяти ещё нет
+        self._pend_pitch = _PendingAxis()
         self._cal_win: list[tuple[int, int, float, float]] = []
         self._mouse_dead_ticks = 0
         self._sign_flips_yaw = 0
@@ -360,6 +441,12 @@ class Navigator:
         self._stuck_since: float | None = None
         self._last_jump_at = -10.0
         self._stuck_level = 0
+        self._stuck_plan: list[str] = []      # манёвры текущего эпизода застревания
+        self._face_turn_since: float | None = None
+        self._progress_s = 0.0
+        self._progress_at = 0.0
+        self._noprog_replans = 0
+        self._ladder_cooldown_until = 0.0
         self._override_until = 0.0
         self._override_keys: set[str] = set()
         self._pause_until = 0.0
@@ -370,7 +457,16 @@ class Navigator:
         self._brake = False
         self.visible_enemies: list[dict] = []
         self.all_enemies: list[dict] = []        # видимые + скрытые (координаты из памяти)
-        self.ladders: list[dict] = []            # func_ladder на карте (из entity list)
+        self.ladders: list[dict] = [
+            dict(lk["ladder"])
+            for lk in getattr(coord_map, "ladder_links", [])
+            if lk.get("ladder")
+        ]
+        self.doors: list[dict] = []              # prop_door / func_door на карте
+        self.breakables: list[dict] = []       # func_breakable, решётки, окна
+        self._break_aim: dict | None = None    # точка на решётке, выбранная в начале наводки
+        self._door_use_at: dict[int, float] = {}
+        self._door_ahead: dict | None = None
         self._ladders_linked = False
         self._ladder: dict | None = None         # подъём/спуск по лестнице
         self._crouch_until = 0.0
@@ -408,6 +504,11 @@ class Navigator:
         self._target_contact_since: float | None = None
         self._enemies_next_poll = 0.0
         self._ladders_next_poll = 0.0
+        self._doors_next_poll = 0.0
+        self._doors_blocked = 0
+        self._breakables_next_poll = 0.0
+        self._breakables_blocked = 0
+        self._breakables_logged = False
         # соглашение yaw подтверждено движением (до этого не стреляем — прицел может быть смещён)
         self.yaw_verified = not self.cfg.detect_yaw_offset
         # стрельба
@@ -492,20 +593,52 @@ class Navigator:
     def _enemy_feet(self, e: dict) -> tuple[float, float, float]:
         return e.get("feet", e["position"])
 
+    def _apply_los_visibility(self, e: dict, x: float, y: float, z: float) -> None:
+        """Видимость по LOS (не за стеной). Off-screen OK. Заполняет visible и *_visible."""
+        apply_los_visibility(
+            e, self.map, x, y, z,
+            eye_z=self._eye_z,
+            hull_radius=self.map.cfg.hull_radius,
+            target_body_radius=self.cfg.target_body_radius,
+        )
+
     def _around_visible(self, e: dict, x: float, y: float, z: float) -> bool:
-        """Прямая видимость вокруг бота (карта / движок), не конус камеры."""
+        """Прямая видимость вокруг бота (LOS по карте), не конус камеры."""
         if e.get("dormant"):
             return False
-        if e.get("visible"):
-            return True
-        fx, fy, fz = self._enemy_feet(e)
-        return self._los_clear(x, y, z, fx, fy, fz)
+        if "visible" not in e or e.get("_vis_pos") != (round(x), round(y), round(z)):
+            self._apply_los_visibility(e, x, y, z)
+            e["_vis_pos"] = (round(x), round(y), round(z))
+        return bool(e.get("visible"))
+
+    def _visible_parts(self, e: dict, x: float, y: float, z: float) -> dict[str, tuple[float, float, float] | None]:
+        """Какие кости видны из глаз бота (LOS по 2.5D-карте).
+        Ключи — 'head' / 'chest' / 'left_shoulder' / 'right_shoulder'."""
+        parts_vis = visible_bone_parts(
+            e, self.map, x, y, z,
+            eye_z=self._eye_z,
+            hull_radius=self.map.cfg.hull_radius,
+            target_body_radius=self.cfg.target_body_radius,
+        )
+        out: dict[str, tuple[float, float, float] | None] = {}
+        for part, key in _AIM_PART_KEYS.items():
+            pos = e.get(key)
+            out[part] = pos if parts_vis.get(part) and pos is not None else None
+        return out
+
+    def _reset_aim_bone(self) -> None:
+        self._aim_part = "head"
+        self._aim_chest = False
+        self._aim_spot = (0.0, 0.0, 0.0)
+        self._aim_bone_delta = (0.0, 0.0, 0.0)
 
     def _enemy_from_reader(self, p) -> dict:
         """Мишень: position = центр овала (голова / макет). Ноги — если кость правдоподобна."""
         feet = p.position if hasattr(p, "position") else Vec3(getattr(p, "x", 0), getattr(p, "y", 0), getattr(p, "z", 0))
         head = getattr(p, "head_position", None)
         chest = getattr(p, "chest_position", None)
+        left_sh = getattr(p, "left_shoulder_position", None)
+        right_sh = getattr(p, "right_shoulder_position", None)
         if head is not None and head_plausible(feet, head):
             aim, ground = head, feet
         else:
@@ -514,12 +647,10 @@ class Navigator:
             ground = feet
             if abs(aim.z - feet.z) < 24.0:
                 aim = feet
-        if hasattr(p, "visible"):
-            visible = bool(p.visible)
-        elif hasattr(p, "spotted"):
-            visible = bool(p.spotted) and not bool(getattr(p, "dormant", False))
-        else:
-            visible = False
+        spotted = bool(getattr(p, "spotted", False)) and not bool(getattr(p, "dormant", False))
+        if not spotted and hasattr(p, "visible"):
+            # совместимость со старым EnemyInfo.visible = spotted
+            spotted = bool(p.visible) and not bool(getattr(p, "dormant", False))
         spawn_immunity = bool(getattr(p, "spawn_immunity", False))
         vel = getattr(p, "velocity", None)
         if vel is not None and hasattr(vel, "x"):
@@ -531,6 +662,16 @@ class Navigator:
         chest_xyz = None
         if chest is not None and hasattr(chest, "x") and chest_plausible(feet, chest, head):
             chest_xyz = (chest.x, chest.y, chest.z)
+
+        def _shoulder_xyz(sh) -> tuple[float, float, float] | None:
+            if sh is None or not hasattr(sh, "x"):
+                return None
+            if not shoulder_plausible(feet, sh, chest, head):
+                return None
+            return (sh.x, sh.y, sh.z)
+
+        left_sh_xyz = _shoulder_xyz(left_sh)
+        right_sh_xyz = _shoulder_xyz(right_sh)
         return {
             "index": p.index,
             "name": getattr(p, "name", ""),
@@ -538,8 +679,15 @@ class Navigator:
             "position": (aim.x, aim.y, aim.z),
             "head_position": (aim.x, aim.y, aim.z),
             "chest_position": chest_xyz,
+            "left_shoulder_position": left_sh_xyz,
+            "right_shoulder_position": right_sh_xyz,
             "feet": (ground.x, ground.y, ground.z),
-            "visible": visible,
+            "spotted": spotted,
+            "visible": False,
+            "head_visible": False,
+            "chest_visible": False,
+            "left_shoulder_visible": False,
+            "right_shoulder_visible": False,
             "radar_spotted": bool(getattr(p, "radar_spotted", False)),
             "dormant": bool(getattr(p, "dormant", False)),
             "vulnerable": bool(getattr(p, "vulnerable", not spawn_immunity)),
@@ -603,6 +751,38 @@ class Navigator:
             return self.ladders
         return out
 
+    def _read_doors(self) -> list[dict]:
+        fn = getattr(self.reader, "doors", None)
+        if not callable(fn):
+            return []
+        out: list[dict] = []
+        try:
+            for door in fn():
+                if hasattr(door, "to_dict"):
+                    out.append(door.to_dict())
+                elif isinstance(door, dict):
+                    out.append(door)
+        except Exception as exc:
+            self.log(f"doors: ошибка чтения ({exc})")
+            return self.doors
+        return out
+
+    def _read_breakables(self) -> list[dict]:
+        fn = getattr(self.reader, "breakables", None)
+        if not callable(fn):
+            return []
+        out: list[dict] = []
+        try:
+            for br in fn():
+                if hasattr(br, "to_dict"):
+                    out.append(br.to_dict())
+                elif isinstance(br, dict):
+                    out.append(br)
+        except Exception as exc:
+            self.log(f"breakables: ошибка чтения ({exc})")
+            return self.breakables
+        return out
+
     def _read_on_ladder(self) -> bool:
         fn = getattr(self.reader, "local_on_ladder", None)
         if not callable(fn):
@@ -617,8 +797,10 @@ class Navigator:
         if now < self._ladders_next_poll:
             return
         self._ladders_next_poll = now + 1.0 / max(0.05, cfg.ladders_poll_hz)
-        self.ladders = self._read_ladders()
-        if not self.ladders:
+        live = self._read_ladders()
+        if live:
+            self.ladders = live
+        elif not self.ladders:
             return
         n = self.map.attach_ladders(self.ladders)
         if n and not self._ladders_linked:
@@ -627,7 +809,137 @@ class Navigator:
             if self.route is not None and not combat:
                 self._replan(pos, "лестницы подключены")
 
+    def _sync_doors(self, now: float, pos: XYZ, combat: bool) -> None:
+        cfg = self.cfg
+        if now < self._doors_next_poll:
+            return
+        self._doors_next_poll = now + 1.0 / max(0.05, cfg.doors_poll_hz)
+        prev_blocked = self._doors_blocked
+        self.doors = self._read_doors()
+        blocked = sum(1 for d in self.doors if self._door_blocks_route(d))
+        self._doors_blocked = blocked
+        if self.doors and blocked != prev_blocked and self.route is not None and not combat:
+            self._replan(pos, "запертая дверь")
+
+    def _sync_breakables(self, now: float, pos: XYZ, combat: bool) -> None:
+        cfg = self.cfg
+        if now < self._breakables_next_poll:
+            return
+        self._breakables_next_poll = now + 1.0 / max(0.05, cfg.breakables_poll_hz)
+        self.breakables = self._read_breakables()
+        self._breakables_blocked = sum(
+            1 for br in self.breakables if not br.get("passable") and not br.get("broken")
+        )
+        if self.cfg.verbose_log and self.breakables and not self._breakables_logged:
+            self._breakables_logged = True
+            blocking = [br for br in self.breakables if not br.get("passable") and not br.get("broken")]
+            self.log(f"Решётки/окна: {len(self.breakables)} шт., {len(blocking)} на прострел")
+            for br in blocking[:8]:
+                self.log(self._breakable_summary(br))
+            if len(blocking) > 8:
+                self.log(f"  … ещё {len(blocking) - 8}")
+
+    @staticmethod
+    def _vec3_dict(raw) -> tuple[float, float, float] | None:
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            try:
+                return float(raw["x"]), float(raw["y"]), float(raw["z"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        if hasattr(raw, "x"):
+            return float(raw.x), float(raw.y), float(raw.z)
+        if isinstance(raw, (tuple, list)) and len(raw) >= 3:
+            return float(raw[0]), float(raw[1]), float(raw[2])
+        return None
+
+    @classmethod
+    def _object_aabb(cls, obj: dict, margin: float = 0.0) -> BoxObstacle | None:
+        mins = cls._vec3_dict(obj.get("bounds_mins"))
+        maxs = cls._vec3_dict(obj.get("bounds_maxs"))
+        if mins and maxs:
+            span = max(abs(maxs[0] - mins[0]), abs(maxs[1] - mins[1]), abs(maxs[2] - mins[2]))
+            if span >= 1.0:
+                m = margin
+                return (
+                    min(mins[0], maxs[0]) - m,
+                    min(mins[1], maxs[1]) - m,
+                    min(mins[2], maxs[2]),
+                    max(mins[0], maxs[0]) + m,
+                    max(mins[1], maxs[1]) + m,
+                    max(mins[2], maxs[2]),
+                )
+        pos = cls._vec3_dict(obj.get("position"))
+        if not pos:
+            return None
+        try:
+            width = max(float(obj.get("width") or 32.0), 4.0)
+            depth = max(float(obj.get("depth") or width), 4.0)
+            height = max(float(obj.get("height") or 64.0), 4.0)
+        except (TypeError, ValueError):
+            return None
+        m = margin
+        return (
+            pos[0] - width * 0.5 - m,
+            pos[1] - depth * 0.5 - m,
+            pos[2],
+            pos[0] + width * 0.5 + m,
+            pos[1] + depth * 0.5 + m,
+            pos[2] + height,
+        )
+
+    @classmethod
+    def _breakable_summary(cls, br: dict) -> str:
+        pos = cls._vec3_dict(br.get("position")) or (0.0, 0.0, 0.0)
+        mins = cls._vec3_dict(br.get("bounds_mins"))
+        maxs = cls._vec3_dict(br.get("bounds_maxs"))
+        name = str(br.get("name") or br.get("model") or "?")[:28]
+        w = float(br.get("width") or 0.0)
+        d = float(br.get("depth") or 0.0)
+        h = float(br.get("height") or 0.0)
+        if mins and maxs:
+            bounds = (
+                f"bbox=({mins[0]:.0f},{mins[1]:.0f},{mins[2]:.0f})"
+                f"→({maxs[0]:.0f},{maxs[1]:.0f},{maxs[2]:.0f})"
+            )
+        else:
+            bounds = "bbox=?"
+        return (
+            f"  #{int(br.get('index') or 0):4} {name:28} "
+            f"pos=({pos[0]:.0f},{pos[1]:.0f},{pos[2]:.0f}) "
+            f"{w:.0f}x{d:.0f}x{h:.0f} {bounds}"
+        )
+
+    def _known_ladders(self) -> list[dict]:
+        seen: set[tuple[int, int, int, int, int, int]] = set()
+        out: list[dict] = []
+        extras = [lk.get("ladder") for lk in getattr(self.map, "ladder_links", [])]
+        for raw in list(self.ladders) + extras:
+            lad = _ladder_as_dict(raw)
+            if not lad:
+                continue
+            bot, top = lad["bottom"], lad["top"]
+            key = (
+                round(bot[0]), round(bot[1]), round(bot[2]),
+                round(top[0]), round(top[1]), round(top[2]),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(lad)
+        return out
+
     def _ladder_facing(self, lad: dict) -> tuple[float, float]:
+        dirn = str(lad.get("direction") or "").strip().lower()
+        nav_face = {
+            "north": (0.0, 1.0),
+            "south": (0.0, -1.0),
+            "east": (1.0, 0.0),
+            "west": (-1.0, 0.0),
+        }
+        if dirn in nav_face:
+            return nav_face[dirn]
         bot = lad["bottom"]
         mins = lad.get("bounds_mins")
         maxs = lad.get("bounds_maxs")
@@ -653,11 +965,8 @@ class Navigator:
     def _match_ladder(self, a: XYZ, b: XYZ) -> dict | None:
         lo_z, hi_z = (a[2], b[2]) if a[2] <= b[2] else (b[2], a[2])
         best = None
-        best_d = 80.0
-        for raw in self.ladders:
-            lad = _ladder_as_dict(raw)
-            if not lad:
-                continue
+        best_d = 110.0
+        for lad in self._known_ladders():
             bot, top = lad["bottom"], lad["top"]
             if top[2] < bot[2]:
                 bot, top = top, bot
@@ -667,11 +976,45 @@ class Navigator:
                 math.hypot(b[0] - bot[0], b[1] - bot[1]) + abs(b[2] - bot[2]) * 0.4,
                 math.hypot(b[0] - top[0], b[1] - top[1]) + abs(b[2] - top[2]) * 0.4,
             )
-            if abs(bot[2] - lo_z) > 72.0 and abs(top[2] - hi_z) > 72.0:
+            if abs(bot[2] - lo_z) > 96.0 and abs(top[2] - hi_z) > 96.0:
                 continue
             if d < best_d:
                 best_d, best = d, lad
         return best
+
+    def _nearest_ladder(self, x: float, y: float, z: float, max_d: float = 72.0) -> dict | None:
+        best = None
+        best_d = max_d
+        for lad in self._known_ladders():
+            bot, top = lad["bottom"], lad["top"]
+            if top[2] < bot[2]:
+                bot, top = top, bot
+            lo_z, hi_z = bot[2] - 24.0, top[2] + 24.0
+            if z < lo_z or z > hi_z:
+                continue
+            d = min(
+                math.hypot(x - bot[0], y - bot[1]),
+                math.hypot(x - top[0], y - top[1]),
+            )
+            if d < best_d:
+                best_d, best = d, lad
+        return best
+
+    def _route_uses_ladder(self, route: Route, lad: dict, s: float, ahead: float = 200.0) -> bool:
+        bot, top = lad["bottom"], lad["top"]
+        if top[2] < bot[2]:
+            bot, top = top, bot
+        i = max(0, route.next_vertex_index(s) - 1)
+        end_s = s + ahead
+        near_bot = near_top = False
+        while i < len(route.pts) and route.cum[i] <= end_s + 16.0:
+            p = route.pts[i]
+            if math.hypot(p[0] - bot[0], p[1] - bot[1]) < 72.0 and abs(p[2] - bot[2]) < 48.0:
+                near_bot = True
+            if math.hypot(p[0] - top[0], p[1] - top[1]) < 72.0 and abs(p[2] - top[2]) < 48.0:
+                near_top = True
+            i += 1
+        return near_bot and near_top
 
     def _ladder_exit_side(self, lad: dict, dest: tuple[float, float], going_up: bool) -> str:
         """Куда уходит маршрут после лестницы: left / right / forward / back."""
@@ -686,64 +1029,35 @@ class Navigator:
             return "right" if right > 0.0 else "left"
         return "forward"
 
-    def _update_ladder(self, now: float, route: Route, x: float, y: float, z: float) -> None:
-        on = self._read_on_ladder()
-        if self._ladder is not None:
-            st = self._ladder
-            lad = st["lad"]
-            going_up = bool(st["up"])
-            exit_z = lad["top"][2] if going_up else lad["bottom"][2]
-            done_z = (z >= exit_z - 14.0) if going_up else (z <= exit_z + 18.0)
-            if st["phase"] == "exit":
-                if math.hypot(st["mx"] - x, st["my"] - y) < 28.0 or now - st.get("exit_t0", st["t0"]) > 1.5:
-                    self._ladder = None
-                    self.log("Лестница: обошли дыру")
-                return
-            if now - st["t0"] > 9.0:
-                self._ladder = None
-                return
-            if on:
-                st["phase"] = "climb"
-                st["seen"] = True
-                return
-            if st.get("seen") and done_z:
-                if st["side"] == "back":
-                    fx, fy = self._ladder_facing(lad)
-                    sx, sy = (-fy, fx) if st.get("strafe") == "d" else (fy, -fx)
-                    exit_pt = lad["top"] if going_up else lad["bottom"]
-                    st["phase"] = "exit"
-                    st["mx"] = exit_pt[0] + sx * 52.0 + fx * 10.0
-                    st["my"] = exit_pt[1] + sy * 52.0 + fy * 10.0
-                    st["exit_t0"] = now
-                    self.log("Лестница: обход дыры")
-                    return
-                self._ladder = None
-                self.log("Лестница: сошли")
-                return
-            if st["phase"] == "approach" and math.hypot(st["mx"] - x, st["my"] - y) < 22.0:
-                st["phase"] = "mount"
-            return
-        span = route.vertical_span_ahead(self.s, 72.0, self.map.cfg.jump_height + 10.0)
-        if span is None:
-            return
-        a, b, going_up, idx = span
-        lad = self._match_ladder(a, b)
-        if lad is None:
-            return
+    def _begin_ladder(
+        self,
+        now: float,
+        route: Route,
+        lad: dict,
+        going_up: bool,
+        idx: int,
+        on: bool,
+        x: float,
+        y: float,
+    ) -> None:
         fx, fy = self._ladder_facing(lad)
         mount = lad["bottom"] if going_up else lad["top"]
-        mx, my = mount[0] + fx * 18.0, mount[1] + fy * 18.0
-        dest = route.pts[min(len(route.pts) - 1, idx + 2)]
+        mx, my = mount[0] + fx * 22.0, mount[1] + fy * 22.0
+        exit_z = lad["top"][2] if going_up else lad["bottom"][2]
+        k = max(idx, route.next_vertex_index(self.s))
+        while k + 1 < len(route.pts) and abs(route.pts[k][2] - exit_z) > 28.0:
+            k += 1
+        dest = route.pts[min(len(route.pts) - 1, k + 1)]
         side = self._ladder_exit_side(lad, (dest[0], dest[1]), going_up)
         dx, dy = dest[0] - (lad["top"][0] if going_up else lad["bottom"][0]), dest[1] - (
             lad["top"][1] if going_up else lad["bottom"][1]
         )
-        _fx, _fy = fx, fy
-        right = dx * (-_fy) + dy * _fx
+        right = dx * (-fy) + dy * fx
+        near_mount = math.hypot(mx - x, my - y) < 28.0
         self._ladder = {
             "lad": lad,
             "up": going_up,
-            "phase": "approach",
+            "phase": "mount" if (on or near_mount) else "approach",
             "mx": mx,
             "my": my,
             "side": side,
@@ -752,6 +1066,101 @@ class Navigator:
             "seen": on,
         }
         self.log(f"Лестница ({'вверх' if going_up else 'вниз'}, выход {side})")
+
+    def _update_ladder(self, now: float, route: Route, x: float, y: float, z: float) -> None:
+        on = self._read_on_ladder()
+        # cooldown: не хвататься за лестницу сразу после "сошли/достигли конца"
+        if self._ladder is None and now < getattr(self, "_ladder_cooldown_until", 0.0):
+            return
+        if self._ladder is not None:
+            st = self._ladder
+            lad = st["lad"]
+            going_up = bool(st["up"])
+            exit_z = lad["top"][2] if going_up else lad["bottom"][2]
+            done_z = (z >= exit_z - 14.0) if going_up else (z <= exit_z + 18.0)
+            if st["phase"] == "exit":
+                if math.hypot(st["mx"] - x, st["my"] - y) < 28.0 or now - st.get("exit_t0", st["t0"]) > 1.8:
+                    self._ladder = None
+                    self.log("Лестница: обошли дыру")
+                return
+            if now - st["t0"] > 14.0:
+                self._ladder = None
+                return
+            if on:
+                st["phase"] = "climb"
+                st["seen"] = True
+                # если достигли выхода — сойти с лестницы и не хвататься за неё повторно
+                reached_end = (z >= exit_z - 4.0) if going_up else (z <= exit_z + 12.0)
+                if reached_end:
+                    self._ladder = None
+                    self._ladder_cooldown_until = now + 2.0
+                    self._stuck_level = 0
+                    self._stuck_since = None
+                    self._override_until = 0.0
+                    self._override_keys = set()
+                    self.log("Лестница: достигли конца")
+                    return
+                return
+            if st.get("seen") and done_z:
+                if st["side"] == "back":
+                    fx, fy = self._ladder_facing(lad)
+                    sx, sy = (-fy, fx) if st.get("strafe") == "d" else (fy, -fx)
+                    exit_pt = lad["top"] if going_up else lad["bottom"]
+                    st["phase"] = "exit"
+                    st["mx"] = exit_pt[0] + sx * 56.0 + fx * 14.0
+                    st["my"] = exit_pt[1] + sy * 56.0 + fy * 14.0
+                    st["exit_t0"] = now
+                    self.log("Лестница: обход дыры")
+                    return
+                self._ladder = None
+                self._ladder_cooldown_until = now + 2.0
+                self._stuck_level = 0
+                self._stuck_since = None
+                self._override_until = 0.0
+                self._override_keys = set()
+                self.log("Лестница: сошли")
+                return
+            if st["phase"] in ("approach", "mount") and done_z and math.hypot(st["mx"] - x, st["my"] - y) > 48.0:
+                # уже на том этаже (ящики / пандус) — лестница не нужна
+                self._ladder = None
+                return
+            if st["phase"] == "approach" and math.hypot(st["mx"] - x, st["my"] - y) < 26.0:
+                st["phase"] = "mount"
+            return
+        if on:
+            lad = self._nearest_ladder(x, y, z, max_d=96.0)
+            if lad is not None:
+                top_z = max(lad["top"][2], lad["bottom"][2])
+                bot_z = min(lad["top"][2], lad["bottom"][2])
+                # куда идти — выбираем по целевому z дальше по маршруту
+                ahead_s = min(route.length, self.s + max(90.0, (top_z - bot_z) + 40.0))
+                ahead_z = route.point_at(ahead_s)[2]
+                # маршрут не требует подниматься/спускаться — не лезем на лестницу
+                if abs(ahead_z - z) < 24.0:
+                    return
+                going_up = ahead_z >= z + 24.0
+                idx = route.next_vertex_index(self.s)
+                self._begin_ladder(now, route, lad, going_up, idx, True, x, y)
+            return
+        span = route.vertical_span_ahead(self.s, 160.0, self.map.cfg.jump_height + 10.0)
+        lad = None
+        going_up = True
+        idx = route.next_vertex_index(self.s)
+        if span is not None:
+            a, b, going_up, idx = span
+            lad = self._match_ladder(a, b)
+        if lad is None:
+            for cand in self._known_ladders():
+                if self._route_uses_ladder(route, cand, self.s):
+                    bot, top = cand["bottom"], cand["top"]
+                    if top[2] < bot[2]:
+                        bot, top = top, bot
+                    going_up = abs(z - bot[2]) <= abs(z - top[2]) + 8.0
+                    lad = cand
+                    break
+        if lad is None:
+            return
+        self._begin_ladder(now, route, lad, going_up, idx, on, x, y)
 
     def _ladder_keys(self, x: float, y: float, z: float, yaw: float, speed: float) -> set[str]:
         st = self._ladder
@@ -764,7 +1173,8 @@ class Navigator:
             st["phase"] = "climb"
             st["seen"] = True
             exit_z = lad["top"][2] if going_up else lad["bottom"][2]
-            near_exit = (exit_z - z < 30.0) if going_up else (z - exit_z < 26.0)
+            near_exit = (exit_z - z < 36.0) if going_up else (z - exit_z < 32.0)
+            # на лестнице W + корректный pitch делает подъём/спуск; S даёт обратное.
             if near_exit:
                 side = st["side"]
                 if side == "left":
@@ -773,13 +1183,15 @@ class Navigator:
                     return {"w", "d"}
                 if side == "back":
                     return {"w", str(st.get("strafe") or "d")}
-                return {"w"}
-            return {"w"} if going_up else {"s"}
+            return {"w"}
         mx, my = st["mx"], st["my"]
         bearing = yaw_to_target(x, y, mx, my)
         rel = shortest_yaw_err(bearing, yaw)
-        if phase == "exit" or (phase == "approach" and math.hypot(mx - x, my - y) > 22.0):
+        if phase == "exit" or (phase == "approach" and math.hypot(mx - x, my - y) > 26.0):
             return self._choose_keys(rel, rel, speed, engaged=False)
+        # у входа — только вперёд (W), подъём/спуск определяется pitch'ом
+        if abs(rel) > 55.0:
+            return {"a"} if rel > 0 else {"d"}
         return {"w"}
 
     def _ladder_look(self, x: float, y: float, z: float) -> tuple[float, float]:
@@ -792,6 +1204,10 @@ class Navigator:
         phase = st["phase"]
         if phase in ("approach", "exit"):
             tx, ty, tz = st["mx"], st["my"], z + 8.0
+        elif phase == "mount":
+            mount = bot if going_up else top
+            tx, ty = mount[0] - fx * 6.0, mount[1] - fy * 6.0
+            tz = mount[2] + (18.0 if going_up else -8.0)
         elif going_up:
             tx, ty, tz = top[0] - fx * 8.0, top[1] - fy * 8.0, min(top[2], z + 70.0)
         else:
@@ -889,13 +1305,14 @@ class Navigator:
             return self._scoped_now
 
     def _rcs_resample(self) -> None:
-        """Новый спрей: лёгкий хаос xxHash (~⅓–¼ прежнего разброса)."""
-        self._rcs_scale_x = 0.970 + self._xx_u01() * 0.050
-        self._rcs_scale_y = 0.978 + self._xx_u01() * 0.036
-        self._rcs_rot = (self._xx_u01() - 0.5) * 1.8
-        self._rcs_lag = 0.016 + self._xx_u01() * 0.032
-        self._rcs_under = 0.986 + self._xx_u01() * 0.022
-        self._rcs_arc = (self._xx_u01() - 0.5) * 0.13
+        """Новый спрей: лёгкий хаос xxHash. Разброс сжат, under всегда <1 (как игрок:
+        чуть недо-компенсируем, не перекидываем камеру за траекторию отдачи)."""
+        self._rcs_scale_x = 0.955 + self._xx_u01() * 0.040   # 0.955..0.995: не overshoot по yaw
+        self._rcs_scale_y = 0.960 + self._xx_u01() * 0.035   # 0.960..0.995: не overshoot по pitch
+        self._rcs_rot = (self._xx_u01() - 0.5) * 0.9          # ±0.45° поворот паттерна
+        self._rcs_lag = 0.020 + self._xx_u01() * 0.020       # 0.020..0.040 с реакция руки
+        self._rcs_under = 0.955 + self._xx_u01() * 0.035     # 0.955..0.990 всегда недо-коррекция
+        self._rcs_arc = (self._xx_u01() - 0.5) * 0.08         # ±0.04 — мягкий изгиб линии
         self._rcs_rate_var = (self._xx_u01() - 0.5) * self.cfg.rcs_rate_jitter
         self._rcs_sampled = True
 
@@ -1471,7 +1888,7 @@ class Navigator:
             else:
                 self._sample_combat_strafe(e["index"])
             if not resume:
-                self._sample_aim_bone(e)
+                self._sample_aim_bone(e, x, y, z)
 
         def drop(reason: str, cooldown: float | None = None, *, unscope_knife: bool = True) -> None:
             if self._target is not None:
@@ -1570,35 +1987,83 @@ class Navigator:
         pitch = -math.degrees(math.atan2(tz - (z + self._eye_z), max(1.0, horiz)))
         return yaw, pitch
 
-    def _sample_aim_bone(self, target: dict) -> None:
-        """На захват: 20% грудь, иначе голова; точка на кости из диапазона (xxHash)."""
+    def _sample_aim_bone(self, target: dict, x: float, y: float, z: float) -> None:
+        """На захват мишени: выбираем часть тела под прицел с учётом видимости.
+        База: голова (с вероятностью (1-chest-shoulder)), грудь, плечо (lev/prav).
+        Если движок говорит spotted, но LOS в выбранную кость закрыт — пробуем
+        другие части по приоритету head → chest → плечо. Точку на кости
+        псевдо-рандомим через xxHash (lat/along/up в своём диапазоне)."""
         cfg = self.cfg
-        has_chest = target.get("chest_position") is not None
-        self._aim_chest = bool(has_chest and self._xx_u01() < cfg.aim_chest_chance)
-        if self._aim_chest:
+        parts = self._visible_parts(target, x, y, z)
+        # Только LOS по кости (не за стеной); off-screen OK. Частичный peek = одно плечо.
+        allow: dict[str, bool] = {}
+        for part, key in _AIM_PART_KEYS.items():
+            allow[part] = bool(target.get(f"{part}_visible")) or parts.get(part) is not None
+
+        base = {
+            "head": max(0.0, 1.0 - cfg.aim_chest_chance - cfg.aim_shoulder_chance),
+            "chest": cfg.aim_chest_chance,
+            "left_shoulder": cfg.aim_shoulder_chance * 0.5,
+            "right_shoulder": cfg.aim_shoulder_chance * 0.5,
+        }
+        weights = {k: (base[k] if allow.get(k) else 0.0) for k in _AIM_PARTS_ORDER}
+        total = sum(weights.values())
+
+        if total <= 0.0:
+            # ни одна часть не видна и не спотится — целимся в голову вслепую
+            pick = "head"
+        else:
+            r = self._xx_u01() * total
+            acc = 0.0
+            pick = "head"
+            for part in _AIM_PARTS_ORDER:
+                w = weights[part]
+                if w <= 0.0:
+                    continue
+                acc += w
+                if r <= acc:
+                    pick = part
+                    break
+
+        self._aim_part = pick
+        self._aim_chest = (pick == "chest")
+        head = target.get("head_position") or target["position"]
+        bone = target.get(_AIM_PART_KEYS[pick])
+        self._aim_bone_delta = (
+            (bone[0] - head[0], bone[1] - head[1], bone[2] - head[2]) if bone is not None else (0.0, 0.0, 0.0)
+        )
+
+        if pick == "chest":
             rlo, rhi = cfg.aim_chest_off_xy
             zlo, zhi = cfg.aim_chest_off_z
+        elif pick in ("left_shoulder", "right_shoulder"):
+            rlo, rhi = cfg.aim_shoulder_off_xy
+            zlo, zhi = cfg.aim_shoulder_off_z
         else:
             rlo, rhi = cfg.aim_head_off_xy
             zlo, zhi = cfg.aim_head_off_z
+
         lat = (rlo + self._xx_u01() * (rhi - rlo)) * (1.0 if self._xx_u01() < 0.5 else -1.0)
         alo, ahi = cfg.aim_bone_off_along
         along = alo + self._xx_u01() * (ahi - alo)
         up = zlo + self._xx_u01() * (zhi - zlo)
         self._aim_spot = (lat, along, up)
-        bone = "грудь" if self._aim_chest else "голова"
-        self.log(f"Точка прицела: {bone} ({lat:+.1f}/{along:+.1f}/{up:+.1f}u)")
+        self.log(f"Точка прицела: {_AIM_PART_RU.get(pick, pick)} "
+                 f"({lat:+.1f}/{along:+.1f}/{up:+.1f}u)")
 
     def _target_aim_xyz(self, target: dict, x: float, y: float) -> tuple[float, float, float]:
-        """Мировая точка на выбранной кости + смещение, зафиксированное на эту мишень."""
-        if self._aim_chest:
-            c = target.get("chest_position")
-            if c is not None:
-                bx, by, bz = c
-            else:
-                bx, by, bz = target.get("head_position") or target["position"]
-        else:
-            bx, by, bz = target.get("head_position") or target["position"]
+        """Мировая точка на выбранной кости + смещение, зафиксированное на мишень.
+        Если выбранная кость временно пропала из данных — спускаемся по приоритету
+        head → chest → лев./прав. плечо → position (ноги)."""
+        key = _AIM_PART_KEYS.get(self._aim_part, "head_position")
+        bone = target.get(key)
+        if bone is None:
+            # кость на этот тик не прочиталась — держим ту же точку через смещение от головы,
+            # а не прыгаем на другую часть тела (иначе прицел дёргается между костями)
+            head = target.get("head_position") or target["position"]
+            d = self._aim_bone_delta
+            bone = (head[0] + d[0], head[1] + d[1], head[2] + d[2])
+        bx, by, bz = bone
         lat, along, up = self._aim_spot
         dx, dy = bx - x, by - y
         dist = math.hypot(dx, dy) or 1.0
@@ -1629,8 +2094,10 @@ class Navigator:
             # смена мишени вокруг нас — иначе бот не поворачивает дальше узкого конуса
             self._look_yaw_f = want
             return want
-        # как yaw_rate_max навигации, не 16°/тик (это 640°/с — рывок)
-        cap = cfg.yaw_rate_max_moving * dt
+        # как yaw_rate_max навигации, не 16°/тик (это 640°/с — рывок);
+        # в прицеливании точка взгляда не должна отставать от руки — иначе прицел «догоняет»
+        # уезжающую цель и ёрзает около мишени
+        cap = (cfg.aim_lock_rate if mode == "aim" else cfg.yaw_rate_max_moving) * dt
         if self._cam_warm_t0 is not None:
             warm = (now - self._cam_warm_t0) / max(0.05, cfg.cam_warm_s)
             if warm < 1.0:
@@ -1713,20 +2180,57 @@ class Navigator:
         self.input.key_down("space")
         self.input.key_up("space")
 
-    def _route_needs_jump(self, x: float, y: float, z: float, cx: float, cy: float) -> bool:
-        """Прыжок только если впереди ступенька выше step_height, а не шум z / пандус."""
+    def _do_climb(self, kind: str, now: float) -> None:
+        """Прыжок или прыжок+присед. Выше crouch_jump не прыгаем — обход."""
+        if kind == "crouch_jump":
+            self._crouch_until = max(self._crouch_until, now + 0.48)
+        self._jump()
+
+    def _climb_kind(self, dz: float) -> str | None:
         step = self.map.cfg.step_height
         jmp = self.map.cfg.jump_height
+        cjmp = self.map.cfg.crouch_jump_height
+        if dz <= step + 2.0:
+            return None
+        if dz <= jmp + 1.0:
+            return "jump"
+        if dz <= cjmp + 2.0:
+            return "crouch_jump"
+        return None
+
+    def _climb_needed(
+        self, x: float, y: float, z: float, cx: float, cy: float, cz: float | None = None
+    ) -> str | None:
+        """
+        Что нужно, чтобы забраться на клетку морковки:
+        jump — обычный прыжок (≤57u), crouch_jump — с приседом (≤64u),
+        None — пандус / стена выше прыжка (тогда обходим).
+        """
+        step = self.map.cfg.step_height
+        cjmp = self.map.cfg.crouch_jump_height
         cell = max(4.0, self.map.cfg.cell)
-        here = self.map.layer_at(x, y, z, jmp)
+        here = self.map.layer_at(x, y, z, cjmp)
         if here is None:
-            return False
+            return None
         dx, dy = cx - x, cy - y
         dist = math.hypot(dx, dy)
+        if cz is not None and dist < 48.0:
+            kind = self._climb_kind(cz - here.z)
+            if kind is not None:
+                return kind
+        above = self.map.higher_layer(x, y, here.z, cjmp + 2.0)
+        if above is not None:
+            kind = self._climb_kind(above.z - here.z)
+            if kind is not None:
+                return kind
         if dist < 8.0:
-            return False
+            land = self.map.higher_layer(cx, cy, here.z, cjmp + 2.0)
+            if land is None:
+                return None
+            return self._climb_kind(land.z - here.z)
         steps = max(1, int(dist / cell))
         zcur = here.z
+        need: str | None = None
         for i in range(1, steps + 1):
             t = i / steps
             px, py = x + dx * t, y + dy * t
@@ -1734,25 +2238,273 @@ class Navigator:
             if walk is not None:
                 zcur = walk.z
                 continue
-            land = self.map.layer_at(px, py, zcur, jmp)
+            land = self.map.layer_at(px, py, zcur, cjmp + 2.0)
             if land is None:
-                return False
-            if land.z - zcur > step + 2.0:
-                return True
+                return None
+            kind = self._climb_kind(land.z - zcur)
+            if kind == "crouch_jump":
+                need = kind
+            elif kind == "jump" and need is None:
+                need = kind
             zcur = land.z
-        return False
+        return need
 
     # ------------------------------------------------------------ planning
 
-    def _obstacles(self) -> list[Obstacle]:
-        """Видимые мишени как твёрдые препятствия на полу (feet — ноги на земле).
-        Скрытые координаты знаем, но клетку не блокируем — иначе маршрут «ломается» об стену."""
+    def _door_xyz(self, door: dict) -> tuple[float, float, float] | None:
+        pos = door.get("position")
+        if not isinstance(pos, dict):
+            return None
+        try:
+            return float(pos["x"]), float(pos["y"]), float(pos["z"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _door_blocks_route(self, door: dict) -> bool:
+        """Запертую или неиспользуемую дверь обходим. Закрытую, но открываемую — проходим."""
+        if door.get("locked") or door.get("usable") is False:
+            return True
+        return False
+
+    def _door_needs_open(self, door: dict) -> bool:
+        if self._door_blocks_route(door) or door.get("passable"):
+            return False
+        state = str(door.get("state") or "")
+        return state not in ("open", "ajar", "opening")
+
+    def _closed_door_ahead(self, route: Route, x: float, y: float, z: float) -> dict | None:
+        """Закрытая дверь на маршруте впереди, ближайшая к боту."""
+        cfg = self.cfg
+        best = None
+        best_d = cfg.door_use_approach + 1.0
+        end = min(route.length, self.s + cfg.door_use_approach + 24.0)
+        for door in self.doors:
+            if not self._door_needs_open(door):
+                continue
+            pt = self._door_xyz(door)
+            if pt is None or abs(pt[2] - z) > 96.0:
+                continue
+            rad = max(float(door.get("width") or 40.0) * 0.5, 28.0) + 16.0
+            hit = False
+            d = self.s
+            while d <= end:
+                px, py, pz = route.point_at(d)
+                if abs(pz - pt[2]) <= 80.0 and math.hypot(px - pt[0], py - pt[1]) <= rad:
+                    hit = True
+                    break
+                d += 10.0
+            if not hit:
+                continue
+            dist = math.hypot(pt[0] - x, pt[1] - y)
+            if dist < best_d:
+                best, best_d = door, dist
+        return best
+
+    def _door_look(self, x: float, y: float, z: float) -> tuple[float, float] | None:
+        door = self._door_ahead
+        if door is None or self.engaged:
+            return None
+        pt = self._door_xyz(door)
+        if pt is None:
+            return None
+        yaw = yaw_to_target(x, y, pt[0], pt[1])
+        horiz = math.hypot(pt[0] - x, pt[1] - y)
+        pitch = -math.degrees(math.atan2((pt[2] + 36.0) - (z + self._eye_z), max(1.0, horiz)))
+        return yaw, max(-25.0, min(30.0, pitch))
+
+    def _door_use(self, now: float, x: float, y: float) -> None:
+        """Короткое E на ходу. Клавиши движения не трогаем."""
+        door = self._door_ahead
+        if door is None or self.firing:
+            return
+        pt = self._door_xyz(door)
+        if pt is None:
+            return
+        if math.hypot(pt[0] - x, pt[1] - y) > self.cfg.door_use_dist:
+            return
+        idx = int(door.get("index") or 0)
+        if now < self._door_use_at.get(idx, 0.0):
+            return
+        lo, hi = self.cfg.door_use_hold
+        self._pulse_key("e", now, lo + self._xx_u01() * (hi - lo))
+        self._door_use_at[idx] = now + self.cfg.door_use_retry
+        self.log(f"Дверь закрыта — открываю на ходу ({door.get('state') or 'closed'})")
+
+    def _obstacle_circles(self) -> list[Obstacle]:
+        """Круглые препятствия: видимые мишени."""
         r = self.cfg.target_body_radius + 16.0 * self._target_bumps
         return [
             (*self._enemy_feet(e), r)
             for e in self.known_targets
             if e.get("visible")
         ]
+
+    def _obstacle_boxes(self) -> list[BoxObstacle]:
+        """Прямоугольные препятствия: только запертые двери. Решётку на пути простреливаем."""
+        boxes: list[BoxObstacle] = []
+        for door in self.doors:
+            if not self._door_blocks_route(door):
+                continue
+            box = self._object_aabb(door, self.cfg.door_block_margin)
+            if box:
+                boxes.append(box)
+        return boxes
+
+    def _breakable_shootable(self, br: dict) -> bool:
+        return not br.get("passable") and not br.get("broken")
+
+    def _breakable_ahead(self, route: Route, x: float, y: float, z: float) -> dict | None:
+        """Целая решётка, через которую проходит маршрут впереди."""
+        cfg = self.cfg
+        best = None
+        best_d = cfg.breakable_engage_dist + 1.0
+        end = min(route.length, self.s + cfg.breakable_engage_dist)
+        for br in self.breakables:
+            if not self._breakable_shootable(br):
+                continue
+            box = self._object_aabb(br, 8.0)
+            if box is None:
+                continue
+            hit = False
+            d = self.s
+            while d <= end:
+                px, py, pz = route.point_at(d)
+                if (
+                    box[0] <= px <= box[3]
+                    and box[1] <= py <= box[4]
+                    and box[2] - 48.0 <= pz <= box[5] + 48.0
+                ):
+                    hit = True
+                    break
+                d += 12.0
+            if not hit:
+                continue
+            cx = (box[0] + box[3]) * 0.5
+            cy = (box[1] + box[4]) * 0.5
+            dist = math.hypot(cx - x, cy - y)
+            if dist < best_d:
+                best, best_d = br, dist
+        return best
+
+    def _ray_on_box(
+        self, origin: XYZ, direction: tuple[float, float, float], box: BoxObstacle
+    ) -> XYZ:
+        ox, oy, oz = origin
+        dx, dy, dz = direction
+        tmin, tmax = 0.0, 900.0
+        hit = True
+        for o, d, lo, hi in (
+            (ox, dx, box[0], box[3]),
+            (oy, dy, box[1], box[4]),
+            (oz, dz, box[2], box[5]),
+        ):
+            if abs(d) < 1e-8:
+                if o < lo or o > hi:
+                    hit = False
+                    break
+                continue
+            t1, t2 = (lo - o) / d, (hi - o) / d
+            if t1 > t2:
+                t1, t2 = t2, t1
+            tmin = max(tmin, t1)
+            tmax = min(tmax, t2)
+            if tmin > tmax:
+                hit = False
+                break
+        if hit and tmin >= 0.0:
+            return ox + dx * tmin, oy + dy * tmin, oz + dz * tmin
+        cx = (box[0] + box[3]) * 0.5
+        cy = (box[1] + box[4]) * 0.5
+        cz = (box[2] + box[5]) * 0.5
+        t = max(0.0, (cx - ox) * dx + (cy - oy) * dy + (cz - oz) * dz)
+        px, py, pz = ox + dx * t, oy + dy * t, oz + dz * t
+        return (
+            min(box[3], max(box[0], px)),
+            min(box[4], max(box[1], py)),
+            min(box[5], max(box[2], pz)),
+        )
+
+    def _sample_break_point(
+        self, box: BoxObstacle, x: float, y: float, z: float, yaw: float, pitch: float
+    ) -> XYZ:
+        """Точка на модели рядом с текущим прицелом. Смещение — xxHash, внутри габарита."""
+        eye = (x, y, z + self._eye_z)
+        fwd = forward_from_angles(pitch, yaw)
+        aim = self._ray_on_box(eye, (fwd.x, fwd.y, fwd.z), box)
+        dist = math.hypot(aim[0] - eye[0], aim[1] - eye[1], aim[2] - eye[2])
+        lo, hi = self.cfg.breakable_aim_deg
+        ang = lo + self._xx_u01() * (hi - lo)
+        cap = max(2.0, dist * math.tan(math.radians(ang)))
+        off = [(self._xx_u01() * 2.0 - 1.0) * cap for _ in range(3)]
+        ln = math.hypot(*off)
+        if ln > cap and ln > 1e-6:
+            off = [v * cap / ln for v in off]
+        inset = 3.0
+        spans = (box[3] - box[0], box[4] - box[1], box[5] - box[2])
+        pads = tuple(min(inset, s * 0.2) if s > inset * 2.0 else 0.0 for s in spans)
+        return (
+            min(box[3] - pads[0], max(box[0] + pads[0], aim[0] + off[0])),
+            min(box[4] - pads[1], max(box[1] + pads[1], aim[1] + off[1])),
+            min(box[5] - pads[2], max(box[2] + pads[2], aim[2] + off[2])),
+        )
+
+    def _angles_to(self, x: float, y: float, z: float, tx: float, ty: float, tz: float) -> tuple[float, float]:
+        yaw = yaw_to_target(x, y, tx, ty)
+        horiz = math.hypot(tx - x, ty - y)
+        pitch = -math.degrees(math.atan2(tz - (z + self._eye_z), max(1.0, horiz)))
+        return yaw, pitch
+
+    def _update_break_aim(
+        self, route: Route, x: float, y: float, z: float, yaw: float, pitch: float, now: float
+    ) -> dict | None:
+        """Решётка на пути: одна точка на старте наводки, дальше та же рука, что на мишень."""
+        br = self._breakable_ahead(route, x, y, z)
+        if br is None:
+            self._break_aim = None
+            return None
+        idx = int(br.get("index") or 0)
+        box = self._object_aabb(br, 0.0)
+        if box is None:
+            self._break_aim = None
+            return None
+        if self._break_aim is None or self._break_aim.get("index") != idx:
+            point = self._sample_break_point(box, x, y, z, yaw, pitch)
+            self._flick = None
+            self._flick_pending = True
+            self._aim_handoff_t0 = None
+            self._aim_used_flick = False
+            self._aim_fast_peek = False
+            self._subflicks = 0
+            self._aim_speed_resample()
+            self._reset_aim_bone()
+            self._shots_on_target = 0
+            self._aimed_since = None
+            self._shot_miss = False
+            self._long_spray = None
+            self._combat_strafe = None
+            self._strafe_fire_ok = True
+            self._release_fire()
+            self._sample_scope(idx)
+            self._break_aim = {"index": idx, "point": point, "t0": now}
+            name = str(br.get("name") or br.get("kind") or "решётка")
+            self.log(
+                f"Решётка на пути — наводка ({point[0]:.0f},{point[1]:.0f},{point[2]:.0f}) {name}"
+            )
+        pt = self._break_aim["point"]
+        return {
+            "index": idx,
+            "name": str(br.get("name") or "решётка"),
+            "position": pt,
+            "head_position": pt,
+            "vulnerable": True,
+            "visible": True,
+            "velocity": (0.0, 0.0, 0.0),
+        }
+
+    def _blocked_nodes(self) -> set[int]:
+        blocked = blocked_by_obstacles(self.map, self._obstacle_circles())
+        blocked |= blocked_by_box_obstacles(self.map, self._obstacle_boxes())
+        return blocked
 
     def _blockers_key(self) -> frozenset:
         return frozenset(
@@ -1762,7 +2514,7 @@ class Navigator:
         )
 
     def plan(self, pos: XYZ, goal_id: int | None = None) -> Route:
-        blocked = blocked_by_obstacles(self.map, self._obstacles())
+        blocked = self._blocked_nodes()
         picking_new = goal_id is None
         if picking_new:
             given_up_now = {e["index"] for e in self.known_targets if self._given_up.get(e["index"], 0.0) > self._now()}
@@ -1833,6 +2585,9 @@ class Navigator:
         self.route = Route(pts)
         self.s = 0.0
         self._stuck_level = 0
+        self._progress_s = 0.0
+        self._progress_at = self._now()
+        self._face_turn_since = None
         self._route_blockers = self._blockers_key()
         self._blocked = blocked
         g = self.map.nodes[goal_id]
@@ -1984,6 +2739,9 @@ class Navigator:
         self._pause_until = 0.0
         self._ladder = None
         self._crouch_until = 0.0
+        self._door_use_at.clear()
+        self._door_ahead = None
+        self._break_aim = None
         self._rcs_return = False
         self.done = False
         self.release()
@@ -2074,7 +2832,7 @@ class Navigator:
             self._stuck_level = 0
             self._brake = False
             self._route_blockers = self._blockers_key()
-            self.s, _off = nxt.project(pos[0], pos[1], None)
+            self.s, _off = nxt.project(pos[0], pos[1], None, z=pos[2])
             g = self.map.nodes[nid]
             self.log(
                 f"Следующая точка ({g.x:.0f},{g.y:.0f},{g.z:.0f}), "
@@ -2110,24 +2868,13 @@ class Navigator:
         return any(math.hypot(e["position"][0] - x, e["position"][1] - y) <= reach for e in self.known_targets)
 
     def _los_clear(self, x: float, y: float, z: float, tx: float, ty: float, tz: float) -> bool:
-        """Прямая от нас до места мишени идёт по проходимым клеткам карты (не через стену).
-        Последние hull+radius юнитов не проверяем: сама мишень может стоять чуть вне записанной полосы."""
-        dx, dy = tx - x, ty - y
-        d = math.hypot(dx, dy)
-        stop = d - (self.map.cfg.hull_radius + self.cfg.target_body_radius + 8.0)
-        if stop <= 0.0:
-            return True
-        if abs(tz - z) > 96.0:
-            return False           # другой этаж: по 2D-карте не судим
-        steps = max(1, int(stop / 8.0))
-        cz = z
-        for i in range(1, steps + 1):
-            k = (i / steps) * (stop / d)
-            node = self.map.layer_at(x + dx * k, y + dy * k, cz, dz_max=self.map.cfg.jump_height)
-            if node is None:
-                return False
-            cz = node.z
-        return True
+        """Прямая до цели не через стену (2D навмеш + Z). z — ноги локального."""
+        return los_clear(
+            self.map, x, y, z, tx, ty, tz,
+            eye_z=self._eye_z,
+            hull_radius=self.map.cfg.hull_radius,
+            target_body_radius=self.cfg.target_body_radius,
+        )
 
     def _hidden_enemies(self, now: float) -> list[dict]:
         """Были видимы, спрятались — не тех, кого никогда не видели (за стеной с рождения)."""
@@ -2474,13 +3221,27 @@ class Navigator:
         remaining = route.remaining(self.s)
         if remaining <= cfg.carrot_dist:
             return route.goal
-        need = self.map.cfg.hull_radius * 0.5
+        # не срезать косяк двери: запас ≈ 0.85 hull (раньше 0.5 — бот влетал в раму)
+        need = max(cfg.route.los_min_clearance, self.map.cfg.hull_radius * 0.85)
         d = cfg.carrot_dist
+        cl = self.map.clearance_at(pos[0], pos[1], pos[2])
+        if cl < 22.0:
+            d = min(d, 32.0)
         # рядом с мишенью идём точнее по линии маршрута (он уже построен в обход)
         if self.known_targets and self._near_target(pos[0], pos[1], margin=cfg.target_avoid_dist):
             d = min(d, 36.0)
+        # не перескакивать вертикальный пролёт (лестница / этаж) — ноги к входу, не к XY верха
+        span = route.vertical_span_ahead(self.s, max(d, 96.0), self.map.cfg.crouch_jump_height + 8.0)
+        if span is not None:
+            climb_s = route.cum[span[3]]
+            if climb_s > self.s + 10.0:
+                d = min(d, climb_s - self.s)
+        max_dz = self.map.cfg.crouch_jump_height + 8.0
         while d > 16.0:
             c = route.point_at(self.s + d)
+            if abs(c[2] - pos[2]) > max_dz:
+                d -= 8.0
+                continue
             if segment_clear(self.map, pos, c, need, cfg.route, self._blocked):
                 return c
             d -= 8.0
@@ -2490,6 +3251,7 @@ class Navigator:
         """
         Куда толкать тело: желаемая скорость (к морковке, полная) минус текущая.
         Так момент гасится заранее (counter-strafe), тело не выносит в стену на повороте.
+        На прямой damping не крутит вектор вбок — иначе W+A/W+D на ровном участке.
         """
         dx, dy = tx - x, ty - y
         d = math.hypot(dx, dy)
@@ -2498,9 +3260,21 @@ class Navigator:
         vmax = self.cfg.max_speed
         des_x, des_y = dx / d * vmax, dy / d * vmax
         des_x, des_y = self._avoid_targets(x, y, des_x, des_y)
-        sx, sy = des_x - vx * self.cfg.steer_damping, des_y - vy * self.cfg.steer_damping
-        if math.hypot(sx, sy) < vmax * 0.15:
+        speed = math.hypot(vx, vy)
+        heading_err = 0.0
+        if speed > 20.0:
+            heading_err = abs(
+                shortest_yaw_err(
+                    math.degrees(math.atan2(vy, vx)),
+                    math.degrees(math.atan2(des_y, des_x)),
+                )
+            )
+        if heading_err < 22.0:
             sx, sy = des_x, des_y
+        else:
+            sx, sy = des_x - vx * self.cfg.steer_damping, des_y - vy * self.cfg.steer_damping
+            if math.hypot(sx, sy) < vmax * 0.15:
+                sx, sy = des_x, des_y
         # намерение «куда толкать» у человека не меняется каждые 25 мс — сглаживаем вектор
         a = self.cfg.steer_smooth
         px, py = self._steer_vec
@@ -2530,24 +3304,35 @@ class Navigator:
             return set(best_keys)
         if arel > self.cfg.turn_in_place_deg:
             # цель сзади: как человек — остановиться и развернуться
-            # (но если уже бежим — можно погасить момент клавишей назад)
             if speed > 120.0:
                 return {"s"} if arel > 157.5 else ({"s", "a"} if rel > 0 else {"s", "d"})
+            # на малой скорости сначала ждём, пока камера довернёт (yaw_err большой).
+            # если yaw_err мал > wait_turn — значит look_target впереди по маршруту (U-turn),
+            # идём назад по rel, иначе так и будем стоять.
             if abs(yaw_err) > 10.0:
-                return set()       # камера ещё доворачивается — ждём
-            # камера уже смотрит куда надо (вдоль маршрута), а шагнуть нужно назад/вбок
-            # (например, отойти от мишени) — игрок в таком случае просто пятится, не крутясь
+                self._face_turn_since = None
+                return set()
+            if self._face_turn_since is None:
+                self._face_turn_since = self._now()
+            if self._now() - self._face_turn_since < 0.35:
+                return set()
             _, back_keys = min(_KEY_DIRS, key=lambda kd: abs(shortest_yaw_err(kd[0], rel)))
             return set(back_keys)
+        else:
+            self._face_turn_since = None
         if arel > self.cfg.strafe_only_deg:
             return {"a"} if rel > 0 else {"d"}
+        # прямо по маршруту — только W, даже если морковка/damping чуть сбоку
+        if arel <= self.cfg.forward_only_deg:
+            return {"w"}
 
         cur = frozenset(self._keys)
         best_angle, best_keys = min(_KEY_DIRS, key=lambda kd: abs(shortest_yaw_err(kd[0], rel)))
         if cur in _DIR_OF_KEYS and cur != best_keys:
             cur_err = abs(shortest_yaw_err(_DIR_OF_KEYS[cur], rel))
-            # гистерезис: не отпускаем текущую комбинацию, пока она «примерно туда»
-            if cur_err <= 22.5 + self.cfg.key_hysteresis_deg:
+            # на прямой легко отпускаем A/D; на повороте держим комбинацию
+            hold_cone = 12.0 if ("a" in cur or "d" in cur) and "w" in cur else (22.5 + self.cfg.key_hysteresis_deg)
+            if cur_err <= hold_cone:
                 return set(cur)
             # минимальное удержание: человек не перебирает клавиши каждые 25 мс
             if self._now() - self._keys_since < self.cfg.key_min_hold and cur_err < 80.0:
@@ -2776,20 +3561,27 @@ class Navigator:
         self._slew_track_aim(dt)
 
     def _begin_track_over(self, now: float) -> None:
-        """Чуть перевести за мишень, потом вернуть — не липнуть к точке."""
+        """Одно упреждение по стрейфу: вывести прицел по направлению движения мишени
+        на доли градуса и вернуть в центр. НЕ зацикленно (чтобы прицел не вилял
+        влево-вправо на малых скоростях). Если стрейфа почти нет — ничего не делаем."""
         cfg = self.cfg
+        # Нет внятного поперечного движения — не трогаем прицел, просто ведём центр.
+        if abs(self._tgt_lat) < 22.0:
+            self._track_phase = "center"
+            self._track_want = (0.0, 0.0)
+            self._track_until = now
+            return
         lo, hi = cfg.aim_overshoot_u
         lead_u = lo + self._xx_u01() * (hi - lo)
         lead = math.degrees(math.atan2(lead_u, max(80.0, self._tgt_aim_dist)))
         cap = 0.28 if self._scoped_now else 0.65
         lead = min(lead, cap)
         sign = 1.0 if self._tgt_lat >= 0.0 else -1.0
-        if abs(self._tgt_lat) < 22.0:
-            sign = 1.0 if self._xx_u01() < 0.5 else -1.0
         plo, phi = cfg.aim_track_pace
         self._track_pace = plo + self._xx_u01() * (phi - plo)
         slo, shi = cfg.aim_overshoot_s
-        self._track_want = (sign * lead, (self._xx_u01() - 0.5) * 0.16)
+        # pitch-компонента нулевая: по вертикали не виляем вообще
+        self._track_want = (sign * lead, 0.0)
         self._track_phase = "over"
         self._track_until = now + slo + self._xx_u01() * (shi - slo)
 
@@ -2799,12 +3591,16 @@ class Navigator:
         cfg = self.cfg
         slo, shi = cfg.aim_overshoot_s
         if self._track_phase == "over":
+            # После упреждения — возврат в центр и всё, цикл не продолжаем.
             self._track_phase = "back"
             self._track_want = (0.0, 0.0)
             self._track_until = now + 0.10 + self._xx_u01() * (shi - slo) * 0.7
             return
         if self._track_phase == "back":
-            self._begin_track_over(now)
+            # Остановились на мишени. Повторный «over» — только если стрейф поменяет знак
+            # (это проверяется в _update_aim_chase через adad), а здесь — тишина.
+            self._track_phase = "center"
+            self._track_want = (0.0, 0.0)
 
     def _slew_track_aim(self, dt: float) -> None:
         wy, wp = self._track_want
@@ -2839,6 +3635,13 @@ class Navigator:
         lag = dt
         ey = yaw_err - self._yaw_rate * lag
         ep = pitch_err - self._pitch_rate * lag
+        # меньше полупикселя — не дёргаем мышь туда-сюда (иначе ±1 px дрожание у точки)
+        if abs(ey) < 0.55 * abs(cfg.yaw_per_px):
+            ey = 0.0
+            self._yaw_rate, self._yaw_acc = 0.0, 0.0
+        if abs(ep) < 0.55 * abs(cfg.pitch_per_px):
+            ep = 0.0
+            self._pitch_rate, self._pitch_acc = 0.0, 0.0
         vmax_y = math.sqrt(2.0 * 0.7 * acc * abs(ey)) if ey else 0.0
         vmax_p = math.sqrt(2.0 * 0.7 * acc * abs(ep)) if ep else 0.0
         des_y = max(-min(r, vmax_y), min(min(r, vmax_y), g * ey))
@@ -2936,9 +3739,30 @@ class Navigator:
         """
         Наводка: сначала продолжаем поворот как на маршруте (та же скорость), затем
         при угле ≥ aim_flick_deg — флик; иначе так и ведём камеру, чуть быстрее на ближней.
+
+        Ошибку считаем с учётом движений мыши «в полёте» (отправлены, в памяти ещё нет):
+        иначе петля досылает уже посланное, перелетает и ёрзает около точки.
         """
-        cfg = self.cfg
         self._aim_speed_step()
+        return self._aim_step_inner(
+            now, dt,
+            yaw_err - self._pend_yaw.value(),
+            pitch_err - self._pend_pitch.value(),
+            aim_yaw, aim_pitch, speed, dist,
+        )
+
+    def _aim_step_inner(
+        self,
+        now: float,
+        dt: float,
+        yaw_err: float,
+        pitch_err: float,
+        aim_yaw: float,
+        aim_pitch: float,
+        speed: float,
+        dist: float,
+    ) -> tuple[float, float, str]:
+        cfg = self.cfg
         axis = max(abs(yaw_err), abs(pitch_err))
         if self._flick_pending:
             if self._aim_handoff_t0 is None:
@@ -3005,7 +3829,7 @@ class Navigator:
                 self._plan_flick(now, yaw_err, pitch_err, corrective=True)
                 if self._flick is not None:
                     self._flick["aim_prev"] = (aim_yaw, aim_pitch)
-                    return self._aim_step(now, dt, yaw_err, pitch_err, aim_yaw, aim_pitch, speed, dist)
+                    return self._aim_step_inner(now, dt, yaw_err, pitch_err, aim_yaw, aim_pitch, speed, dist)
         if self._rcs_active() and self._fire_held:
             d_yaw, d_pitch = self._rcs_step(yaw_err, pitch_err, dt)
             return d_yaw, d_pitch, "rcs"
@@ -3030,6 +3854,7 @@ class Navigator:
             else:
                 self._px_carry[i] = want - px
             out[i] = px
+            (self._pend_yaw if i == 0 else self._pend_pitch).sent(self._tick_no, px * k)
         dx, dy = out
         if dx or dy:
             self.input.mouse_move(dx, dy)
@@ -3085,17 +3910,36 @@ class Navigator:
             self.stucks -= 1
             return self._bump_target(now, pos)
         if lvl == 1:
+            # план манёвров на этот эпизод: сначала перепрыгнуть, потом обойти
+            cx, cy = pos[0], pos[1]
+            cz = None
+            if self.route is not None:
+                c = self._carrot(pos, self.route)
+                cx, cy, cz = c[0], c[1], c[2]
+            kind = self._climb_needed(pos[0], pos[1], pos[2], cx, cy, cz)
+            if kind is None:
+                # карта не знает о препятствии (ящик, пропс, бортик), а мы упёрлись в него
+                # с зажатым W — прыгаем вслепую: сначала обычный, потом с приседом
+                self._stuck_plan = ["jump", "crouch_jump", "strafe", "back"]
+            else:
+                self._stuck_plan = [kind, "strafe", "back"]
+        step = self._stuck_plan.pop(0) if self._stuck_plan else None
+        if step in ("jump", "crouch_jump"):
             if now - self._last_jump_at >= 0.55:
-                self.log("Застрял → прыжок")
-                self._jump()
+                self.log("Застрял → " + ("прыжок+присед" if step == "crouch_jump" else "прыжок"))
+                self._do_climb(step, now)
+                # держим ход вперёд, чтобы залететь на препятствие, а не подпрыгнуть на месте
+                self._override_keys = ((moving_keys or {"w"}) - {"s"}) or {"w"}
+                self._override_until = now + (0.5 if step == "crouch_jump" else 0.45)
+                return set(self._override_keys)
             return None
-        if lvl == 2:
+        if step == "strafe":
             side = {"d"} if rel < 0 else {"a"}
             self._override_keys = side | {"w"}
             self._override_until = now + 0.35
             self.log(f"Застрял → страйф {''.join(sorted(side)).upper()}")
             return set(self._override_keys)
-        if lvl == 3:
+        if step == "back":
             self._override_keys = {"s"}
             self._override_until = now + 0.3
             self.log("Застрял → шаг назад")
@@ -3332,7 +4176,11 @@ class Navigator:
             self._release_fire()
             return False
         spray = self._should_spray(dist)
-        on_oval = self._fire_on_oval(yaw_err, pitch_err, dist)
+        # где прицел окажется, когда долетит уже отправленная мышь (память отстаёт на 1–3 тика):
+        # для движущейся мишени «по памяти» точка кости всегда чуть в стороне и выстрел не наступает
+        on_oval = self._fire_on_oval(
+            yaw_err - self._pend_yaw.value(), pitch_err - self._pend_pitch.value(), dist
+        )
         if self._shot_miss is None and not (spray and self._fire_held):
             self._shot_miss = self._xx_u01() < cfg.aim_miss_chance
         if self._shot_miss and not (spray and self._fire_held):
@@ -3467,10 +4315,12 @@ class Navigator:
             self._strafe_fire_ok = False
             return
         if st["phase"] == "wait":
-            st["phase"] = "go"
-            st["ox"], st["oy"] = x, y
-            st["t0"] = now
-            self._strafe_fire_ok = False
+            # Сначала выстрел с места (как только встали), шаг в сторону — уже после него.
+            # Иначе бот секунду-две ёрзает прицелом за собственным стрейфом до первого выстрела.
+            self._strafe_fire_ok = speed < 80.0
+            if st["fired"] and now >= st["next_at"]:
+                self._combat_strafe_begin_go(st, now, x, y)
+                self._strafe_fire_ok = False
             return
         if st.get("stand"):
             self._strafe_fire_ok = speed < 80.0
@@ -3544,12 +4394,15 @@ class Navigator:
         if now >= self._enemies_next_poll:
             self._enemies_next_poll = now + 1.0 / max(1.0, cfg.enemies_poll_hz)
             self.all_enemies = self._read_enemies()
+            for e in self.all_enemies:
+                self._apply_los_visibility(e, x, y, z)
+                e["_vis_pos"] = (round(x), round(y), round(z))
             self.visible_enemies = [e for e in self.all_enemies if e.get("visible")]
             alive_ids = {e["index"] for e in self.all_enemies}
             for e in self.all_enemies:
                 idx = e["index"]
                 self._note_vulnerability(e, now)
-                around = self._around_visible(e, x, y, z)
+                around = bool(e.get("visible"))
                 if around:
                     self._known[idx] = {**e, "seen": now, "last_visible": now}
                 elif idx in self._known:
@@ -3587,6 +4440,8 @@ class Navigator:
             or (self._target is not None)
         )
         self._sync_ladders(now, (x, y, z), combat)
+        self._sync_doors(now, (x, y, z), combat)
+        self._sync_breakables(now, (x, y, z), combat)
         if combat:
             if not self._cal_frozen:
                 self._cal_win.clear()
@@ -3597,6 +4452,10 @@ class Navigator:
             self._cal_frozen = False
             self._calibrate_mouse(mem_yaw, mem_pitch)
         self._detect_yaw_offset(mem_yaw, v.x, v.y, speed)
+        if self._prev_mem is not None:
+            # что из отправленного мышью уже дошло до игры (углы меняет только наша мышь)
+            self._pend_yaw.observed(self._tick_no, shortest_yaw_err(mem_yaw, self._prev_mem[0]))
+            self._pend_pitch.observed(self._tick_no, mem_pitch - self._prev_mem[1])
         self._prev_mem = (mem_yaw, mem_pitch)
         yaw = shortest_yaw_err(mem_yaw + self.yaw_offset, 0.0)
 
@@ -3608,6 +4467,8 @@ class Navigator:
             "visible_enemies": self.visible_enemies,
             "all_enemies": self.all_enemies,
             "ladders": self.ladders,
+            "doors": self.doors,
+            "breakables": self.breakables,
             "weapon": self.weapon,
             "life": self.life,
         }
@@ -3664,14 +4525,35 @@ class Navigator:
         assert route is not None
 
         # --- прогресс по маршруту
-        self.s, off = route.project(x, y, self.s)
+        self.s, off = route.project(x, y, self.s, z=z)
         gx, gy, gz = route.goal
         goal_d = math.hypot(gx - x, gy - y)
         if off > cfg.off_route_replan and self._ladder is None:
             self._replan((x, y, z), f"ушли с маршрута на {off:.0f}u")
             route = self.route
             assert route is not None
-            self.s, off = route.project(x, y, None)
+            self.s, off = route.project(x, y, None, z=z)
+
+        # детектор отсутствия прогресса: s не растёт больше N секунд (бот стоит в стороне от маршрута)
+        if self.s - self._progress_s >= 32.0:
+            self._progress_s = self.s
+            self._progress_at = now
+            self._noprog_replans = 0
+        elif (
+            self._ladder is None
+            and now - self._progress_at > 2.5
+            and goal_d > cfg.arrive_radius + 24.0
+        ):
+            self._progress_at = now
+            self._noprog_replans += 1
+            new_goal = self._noprog_replans >= 2  # повторный тупик — другая цель
+            self._replan((x, y, z), f"нет прогресса по маршруту (#{self._noprog_replans})", new_goal=new_goal)
+            route = self.route
+            assert route is not None
+            self.s, off = route.project(x, y, None, z=z)
+            self._progress_s = self.s
+            if new_goal:
+                self._noprog_replans = 0
 
         # мишень встала на маршруте впереди (и маршрут строился без неё) → обойти заранее
         if now >= self._block_check_at:
@@ -3686,7 +4568,7 @@ class Navigator:
                 self._replan((x, y, z), f"мишень {blocker.get('name') or blocker['index']} на пути")
                 route = self.route
                 assert route is not None
-                self.s, off = route.project(x, y, None)
+                self.s, off = route.project(x, y, None, z=z)
 
         # скрытая мишень: заход в точку с LOS (пик), исходную дальнюю не бросаем
         if now >= self._hunt_check_at and self._ladder is None:
@@ -3712,7 +4594,7 @@ class Navigator:
                     self.s = 0.0
                     self._hunt_routed = hunt["peek_id"]
                     route = self.route
-                    self.s, off = route.project(x, y, None)
+                    self.s, off = route.project(x, y, None, z=z)
                     pk = hunt["peek"]
                     self.log(
                         f"Заход на позицию для выстрела @ ({pk[0]:.0f},{pk[1]:.0f}) "
@@ -3731,7 +4613,7 @@ class Navigator:
                     self._replan((x, y, z), "пик больше не нужен, продолжаем маршрут")
                     route = self.route
                     assert route is not None
-                    self.s, off = route.project(x, y, None)
+                    self.s, off = route.project(x, y, None, z=z)
 
         hold = False
         if self._standoff is not None and goal_d <= cfg.arrive_radius + 16.0:
@@ -3747,19 +4629,19 @@ class Navigator:
                 self._replan((x, y, z), "мишень пропала, продолжаем маршрут")
                 route = self.route
                 assert route is not None
-                self.s, off = route.project(x, y, None)
+                self.s, off = route.project(x, y, None, z=z)
             elif gave_up:
                 self._replan((x, y, z), "мишень не уходит → другая цель", new_goal=True)
                 route = self.route
                 assert route is not None
-                self.s, off = route.project(x, y, None)
+                self.s, off = route.project(x, y, None, z=z)
             else:
                 hold = True
         elif self._standoff is not None and self._given_up.get(self._standoff, 0.0) > now:
             self._replan((x, y, z), "мишень не уходит → другая цель", new_goal=True)
             route = self.route
             assert route is not None
-            self.s, off = route.project(x, y, None)
+            self.s, off = route.project(x, y, None, z=z)
 
         dest_id = self._intended_goal_id if self._intended_goal_id is not None else self.goal_id
         dest = self.map.nodes[dest_id] if dest_id is not None else None
@@ -3790,7 +4672,7 @@ class Navigator:
                 self._replan((x, y, z), "пик: мишени нет, продолжаем маршрут")
                 route = self.route
                 assert route is not None
-                self.s, off = route.project(x, y, None)
+                self.s, off = route.project(x, y, None, z=z)
             elif not e.get("visible") and not self._los_clear(x, y, z, fx, fy, fz):
                 if now - self._hunt_via_since > 1.6:
                     self._hunt = None
@@ -3798,7 +4680,7 @@ class Navigator:
                     self._replan((x, y, z), "пик без обзора, продолжаем маршрут")
                     route = self.route
                     assert route is not None
-                    self.s, off = route.project(x, y, None)
+                    self.s, off = route.project(x, y, None, z=z)
                 else:
                     hold = True
             else:
@@ -3811,14 +4693,18 @@ class Navigator:
             and self._standoff is None
             and self._ladder is None
             and dest_d <= cfg.arrive_radius
-            and abs(dest_z - z) <= 48.0
+            and abs(dest_z - z) <= 10.0
+            and (
+                (here := self.map.layer_at(x, y, z, self.map.cfg.step_height + 2.0)) is not None
+                and abs(here.z - dest_z) <= 8.0
+            )
         ):
             self.log(f"Цель достигнута ({x:.0f},{y:.0f},{z:.0f})")
             if cfg.loop:
                 if self._apply_next_route((x, y, z)):
                     route = self.route
                     assert route is not None
-                    self.s, off = route.project(x, y, None)
+                    self.s, off = route.project(x, y, None, z=z)
                     gx, gy, gz = route.goal
                     goal_d = math.hypot(gx - x, gy - y)
                     dest_id = self._intended_goal_id if self._intended_goal_id is not None else self.goal_id
@@ -3853,6 +4739,7 @@ class Navigator:
                 look_d *= warm_k
         lx, ly, lz = route.point_at(self.s + look_d)
         cx_, cy_, cz_ = self._carrot((x, y, z), route)
+        self._door_ahead = self._closed_door_ahead(route, x, y, z)
         if self._ladder is not None:
             ph = self._ladder.get("phase")
             if self.firing and ph in ("approach", "mount") and not self._read_on_ladder():
@@ -3882,6 +4769,12 @@ class Navigator:
             self._hunt_look_hold = None
             self._hunt_look_until = 0.0
 
+        break_target = None
+        if target is not None or self._ladder is not None:
+            self._break_aim = None
+        else:
+            break_target = self._update_break_aim(route, x, y, z, yaw, mem_pitch, now)
+
         hunt_look = None
         rcs_y = rcs_p = 0.0
         if target is not None:
@@ -3893,6 +4786,16 @@ class Navigator:
             pitch_target = max(-60.0, min(60.0, aim_pitch + rcs_p))
             lx, ly = self._target_aim_xyz(target, x, y)[:2]
             look_mode = "aim"
+        elif break_target is not None:
+            self._reset_aim_bone()
+            aim_yaw, aim_pitch = self._aim_angles(x, y, z, break_target)
+            if self._rcs_active():
+                rcs_y, rcs_p = self._rcs_offset(now)
+            look_yaw = aim_yaw + rcs_y
+            pitch_target = max(-60.0, min(60.0, aim_pitch + rcs_p))
+            look_mode = "aim"
+            rate_cap = None
+            gain = None
         else:
             fb = self._look_yaw_f if self._look_yaw_f is not None else yaw
             look_yaw = self._yaw_to_look_point(x, y, lx, ly, fb) + self._wander
@@ -3906,15 +4809,21 @@ class Navigator:
                 look_yaw, pitch_target = self._ladder_look(x, y, z)
                 look_mode = "ladder"
                 self._hunt_look_hold = None
-            elif hunt_look is not None:
-                self._hunt_look_hold = hunt_look
-                self._hunt_look_until = now + 0.3
-                look_yaw, pitch_target = hunt_look
-                pitch_target = max(-25.0, min(30.0, pitch_target))
-                look_mode = "hunt"
             else:
-                self._hunt_look_hold = None
-                look_mode = "route"
+                door_look = self._door_look(x, y, z)
+                if door_look is not None:
+                    look_yaw, pitch_target = door_look
+                    look_mode = "door"
+                    self._hunt_look_hold = None
+                elif hunt_look is not None:
+                    self._hunt_look_hold = hunt_look
+                    self._hunt_look_until = now + 0.3
+                    look_yaw, pitch_target = hunt_look
+                    pitch_target = max(-25.0, min(30.0, pitch_target))
+                    look_mode = "hunt"
+                else:
+                    self._hunt_look_hold = None
+                    look_mode = "route"
             rate_cap = None
             gain = None
         look_yaw = self._filter_look_yaw(look_yaw, look_mode, yaw, now)
@@ -3963,6 +4872,28 @@ class Navigator:
                 yaw_err = shortest_yaw_err(look_yaw, yaw)
                 pitch_err = pitch_target - mem_pitch
             # рука: сначала как на маршруте (та же скорость), затем флик если угол ≥ 30°
+            d_yaw, d_pitch, aim_phase = self._aim_step(
+                now, dt, yaw_err, pitch_err, aim_yaw, aim_pitch, speed, aim_dist
+            )
+            max_px = cfg.aim_max_px_per_tick if aim_phase == "flick" else cfg.max_px_per_tick
+            dx, dy = self._send_mouse(d_yaw, d_pitch, max_px)
+        elif break_target is not None:
+            self._target_visible_now = True
+            self._reset_aim_bone()
+            if self._fire_held and self.weapon.get("auto"):
+                fire_yaw_err, fire_pitch_err = yaw_err, pitch_err
+            else:
+                fire_yaw_err = shortest_yaw_err(aim_yaw, yaw)
+                fire_pitch_err = aim_pitch - mem_pitch
+            tx, ty, tz = self._target_aim_xyz(break_target, x, y)
+            aim_dist = math.hypot(tx - x, ty - y, tz - (z + self._eye_z))
+            if not self._unscoping():
+                self._scope_step(now, fire_yaw_err, fire_pitch_err, aim_dist)
+            shot = self._fire_step(now, break_target, x, y, z, fire_yaw_err, fire_pitch_err)
+            if shot and self._shots_on_target == 1:
+                self.log(f"Огонь по решётке ({self.weapon.get('name') or '?'})")
+            self.firing = cfg.fire_enabled
+            self._update_aim_chase(break_target, x, y, dt, now)
             d_yaw, d_pitch, aim_phase = self._aim_step(
                 now, dt, yaw_err, pitch_err, aim_yaw, aim_pitch, speed, aim_dist
             )
@@ -4022,15 +4953,17 @@ class Navigator:
         if (self._brake or hold) and self._ladder is None:
             keys = set()
 
-        # прыжок по маршруту — только реальная ступенька, не пандус и не шум записи
+        # прыжок по маршруту: 57u обычный, 64u с приседом; выше — не прыгаем, обходим
+        climb = None
         if (
             self._ladder is None
-            and speed > 40.0
+            and speed > 28.0
             and now - self._last_jump_at >= 0.55
-            and math.hypot(cx_ - x, cy_ - y) < 56.0
-            and self._route_needs_jump(x, y, z, cx_, cy_)
+            and math.hypot(cx_ - x, cy_ - y) < 64.0
         ):
-            self._jump()
+            climb = self._climb_needed(x, y, z, cx_, cy_, cz_)
+            if climb:
+                self._do_climb(climb, now)
 
         if self._ladder is None:
             override = self._handle_stuck(now, (x, y, z), speed, keys, rel)
@@ -4041,6 +4974,7 @@ class Navigator:
             self._crouch_until = now + 0.18
         if now < self._crouch_until and self._ladder is None:
             keys.add("ctrl")
+        self._door_use(now, x, y)
 
         if frozenset(keys) == frozenset(self._keys):
             self._same_keys_ticks += 1
@@ -4051,6 +4985,7 @@ class Navigator:
 
         if (self._stuck_level or self._target_bumps) and speed > 120.0 and now >= self._override_until:
             self._stuck_level = 0
+            self._stuck_plan = []
             if not self._near_target(x, y, margin=cfg.target_avoid_dist):
                 self._target_bumps = 0
 
@@ -4081,18 +5016,33 @@ class Navigator:
         )
         return info
 
-    def run(self, duration: float | None = None) -> None:
+    def run(
+        self,
+        duration: float | None = None,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> str:
+        """Крутить тики, пока не кончится время / маршрут, или should_stop() не станет True.
+
+        Возвращает 'limit' | 'done' | 'stop'.
+        """
         duration = duration if duration is not None else self.cfg.duration
         interval = 1.0 / self.cfg.tick_hz
         t0 = time.monotonic()
         n = 0
+        reason = "done"
         try:
             while True:
+                if should_stop is not None and should_stop():
+                    reason = "stop"
+                    break
                 if duration and time.monotonic() - t0 > duration:
                     print(f"Лимит {duration:.0f}s")
+                    reason = "limit"
                     break
                 info = self.tick()
                 if info.get("action") == "done":
+                    reason = "done"
                     break
                 n += 1
                 if self.cfg.verbose_log and n % int(self.cfg.tick_hz / 4) == 0:
@@ -4124,3 +5074,4 @@ class Navigator:
         finally:
             self.release()
             self.input.release_all()
+        return reason

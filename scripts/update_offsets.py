@@ -34,7 +34,11 @@ def dump_live() -> None:
         subprocess.run(["git", "checkout", "linux"], cwd=dumper_dir, check=True)
         subprocess.run(["cargo", "build", "--release"], cwd=dumper_dir, check=True)
     print("Dumping from live CS2...")
-    subprocess.run([str(DUMPER), "-o", str(DATA)], check=True)
+    subprocess.run(
+        [str(DUMPER), "-o", str(DATA), "-f", "json"],
+        cwd=DUMPER.parents[2],
+        check=True,
+    )
     prune_data_dir()
 
 

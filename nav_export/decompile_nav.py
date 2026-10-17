@@ -483,28 +483,29 @@ def main() -> int:
     )
     parser.add_argument(
         "--entry",
-        default="maps/de_cache.nav",
-        help="файл внутри VPK",
+        default=None,
+        help="файл внутри VPK (по умолчанию maps/<имя архива>.nav)",
     )
     parser.add_argument(
         "--out",
-        default=str(Path(__file__).resolve().parent / "out"),
-        help="папка для .nav и json",
+        default=str(root / "data" / "maps"),
+        help="папка для .nav и json (по умолчанию data/maps)",
     )
     args = parser.parse_args()
     vpk_path = Path(args.vpk)
+    entry = args.entry or f"maps/{vpk_path.stem}.nav"
     blob = vpk_path.read_bytes()
     data_start, entries = read_vpk_tree(blob)
-    wanted = next((item for item in entries if item["path"] == args.entry), None)
+    wanted = next((item for item in entries if item["path"] == entry), None)
     if wanted is None:
         navs = [item["path"] for item in entries if item["path"].endswith(".nav")]
-        raise SystemExit(f"{args.entry} нет в архиве. nav-файлы: {navs}")
+        raise SystemExit(f"{entry} нет в архиве. nav-файлы: {navs}")
     nav = extract_entry(blob, data_start, wanted)
     parsed = parse_nav(nav)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    nav_path = out / Path(args.entry).name
-    json_path = out / (Path(args.entry).name + ".json")
+    nav_path = out / Path(entry).name
+    json_path = out / (Path(entry).name + ".json")
     nav_path.write_bytes(nav)
     summary = {key: parsed[key] for key in parsed if not key.endswith("_list")}
     summary["sample_areas"] = parsed["area_list"][:8]
@@ -513,7 +514,7 @@ def main() -> int:
         json.dumps(
             {
                 "source": str(vpk_path),
-                "entry": args.entry,
+                "entry": entry,
                 "bytes": len(nav),
                 **{key: parsed[key] for key in parsed if key != "area_list"},
                 "areas": parsed["area_list"],
@@ -525,7 +526,7 @@ def main() -> int:
     )
     print(f"архив: {vpk_path}")
     print(f"файлов в каталоге: {len(entries)}")
-    print(f"запись: {args.entry} ({len(nav)} байт) -> {nav_path}")
+    print(f"запись: {entry} ({len(nav)} байт) -> {nav_path}")
     print(f"json: {json_path}")
     print(
         f"nav v{parsed['version']}.{parsed['subversion']}, "

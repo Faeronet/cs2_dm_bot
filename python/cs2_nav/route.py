@@ -14,46 +14,65 @@ class Route:
         self.pts: list[XYZ] = list(points)
         self.cum: list[float] = [0.0]
         for a, b in zip(self.pts, self.pts[1:]):
-            self.cum.append(self.cum[-1] + math.hypot(b[0] - a[0], b[1] - a[1]))
+            # 3D: вертикальная лестница иначе имеет длину 0, и морковка перескакивает этаж
+            self.cum.append(
+                self.cum[-1]
+                + math.sqrt(
+                    (b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2 + (b[2] - a[2]) ** 2
+                )
+            )
         self.length = self.cum[-1]
 
     @property
     def goal(self) -> XYZ:
         return self.pts[-1]
 
-    def _seg_project(self, i: int, x: float, y: float) -> tuple[float, float]:
-        """(t ∈ [0,1], расстояние до отрезка i)."""
-        ax, ay, _ = self.pts[i]
-        bx, by, _ = self.pts[i + 1]
+    def _seg_project(self, i: int, x: float, y: float) -> tuple[float, float, float]:
+        """(t ∈ [0,1], расстояние XY до отрезка i, z точки проекции)."""
+        ax, ay, az = self.pts[i]
+        bx, by, bz = self.pts[i + 1]
         dx, dy = bx - ax, by - ay
         seg2 = dx * dx + dy * dy
         if seg2 < 1e-9:
-            return 0.0, math.hypot(x - ax, y - ay)
+            return 0.0, math.hypot(x - ax, y - ay), az
         t = ((x - ax) * dx + (y - ay) * dy) / seg2
         t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
         px, py = ax + dx * t, ay + dy * t
-        return t, math.hypot(x - px, y - py)
+        return t, math.hypot(x - px, y - py), az + (bz - az) * t
 
-    def project(self, x: float, y: float, s_hint: float | None = None, back_window: float = 60.0) -> tuple[float, float]:
+    def project(
+        self,
+        x: float,
+        y: float,
+        s_hint: float | None = None,
+        back_window: float = 60.0,
+        z: float | None = None,
+    ) -> tuple[float, float]:
         """
         Продольная координата s ближайшей точки маршрута и расстояние до неё.
         С s_hint ищем только вперёд (минус небольшое окно назад) — маршрут может
         пересекать сам себя (винтовая лестница), прогресс должен быть монотонным.
+        z, если передан, отличает этажи с одним XY (паласы, Вертиго).
         """
         s_min = -1.0 if s_hint is None else s_hint - back_window
         best_s, best_d = 0.0, float("inf")
         for i in range(len(self.pts) - 1):
             if self.cum[i + 1] < s_min:
                 continue
-            t, d = self._seg_project(i, x, y)
+            t, d_xy, pz = self._seg_project(i, x, y)
             s = self.cum[i] + (self.cum[i + 1] - self.cum[i]) * t
             if s < s_min:
                 continue
+            d = d_xy if z is None else d_xy + abs(pz - z) * 0.85
             # при равных расстояниях предпочитаем более ранний участок (не перескакивать)
             if d < best_d - 0.5:
                 best_d, best_s = d, s
         if best_d == float("inf"):
-            return self.length, math.hypot(x - self.pts[-1][0], y - self.pts[-1][1])
+            end = self.pts[-1]
+            miss = math.hypot(x - end[0], y - end[1])
+            if z is not None:
+                miss += abs(end[2] - z) * 0.85
+            return self.length, miss
         return best_s, best_d
 
     def point_at(self, s: float) -> XYZ:

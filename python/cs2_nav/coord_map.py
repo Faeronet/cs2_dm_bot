@@ -2,7 +2,7 @@
 Координатная карта локации из записи координат — 2.5D occupancy grid («радар»).
 
 Алгоритм универсален: никаких координат конкретной локации, только физика игрока
-(ширина hull 32u, высота ступеньки 18u, прыжок ~48u) и сама запись.
+(ширина hull 32u, ступенька 18u, прыжок 57u, прыжок с приседом 64u) и сама запись.
 
 1. Запись = позиции центра игрока. Соседние точки trail соединяются отрезками,
    каждый отрезок растеризуется «капсулой» радиуса R (половина hull) → дилатация.
@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-RECORDINGS = ROOT / "data" / "recordings"
+MAPS = ROOT / "data" / "maps"
 
 # (dx, dy, horizontal length multiplier) для 8-связности
 _NEIGH8 = (
@@ -43,8 +43,11 @@ _NEIGH8 = (
 class MapConfig:
     cell: float = 8.0
     hull_radius: float = 16.0      # половина ширины игрока (hull 32×32)
-    step_height: float = 18.0      # ступенька, которую можно пройти без прыжка
-    jump_height: float = 48.0      # ступенька с прыжком
+    step_height: float = 18.0      # sv_stepsize: ступенька без прыжка
+    # CS2: sv_gravity=800, sv_jump_impulse=301.993 → h = v²/(2g) ≈ 57u.
+    # С приседом в прыжке (hull 54 вместо 72) забираемся на ящик 64u.
+    jump_height: float = 57.0
+    crouch_jump_height: float = 64.0
     drop_height: float = 120.0     # спрыгнуть вниз без урона
     layer_gap: float = 24.0        # разрыв по z → разные ярусы в одной клетке
     seg_max_len: float = 64.0      # разрыв trail (телепорт / смерть) — не соединять
@@ -361,6 +364,14 @@ class CoordinateMap:
                 best = n
         return best
 
+    def _through_floor(self, node: Node, nb: Node) -> bool:
+        """Стек этажей (Вертиго, паласы): нельзя упасть на нижний ярус сквозь пол.
+
+        Если у соседа есть продолжение нашего яруса — идём по нему, а не «сквозь плиту».
+        Спрыгнуть с ящика на пол соседа можно: у соседа нашего z нет.
+        """
+        return self._passable_layer(nb.cx, nb.cy, node.z, self.cfg.step_height) is not None
+
     def _link_edges(self) -> None:
         c = self.cfg
         for node in self.nodes:
@@ -380,7 +391,11 @@ class CoordinateMap:
                         kind = "walk"
                     elif 0.0 < dz <= c.jump_height:
                         kind = "jump"
+                    elif c.jump_height < dz <= c.crouch_jump_height:
+                        kind = "crouch_jump"
                     elif -c.drop_height <= dz < 0.0:
+                        if self._through_floor(node, nb):
+                            continue
                         kind = "drop"
                     else:
                         continue
@@ -427,12 +442,23 @@ class CoordinateMap:
         cx, cy = self.cell_of(x, y)
         return self._passable_layer(cx, cy, z, dz_max if dz_max is not None else self.cfg.drop_height)
 
+    def higher_layer(self, x: float, y: float, z: float, dz_max: float | None = None) -> Node | None:
+        """Ближайший ярус СТРОГО выше z в этой клетке (ящик / ступенька)."""
+        cap = self.cfg.crouch_jump_height if dz_max is None else dz_max
+        cx, cy = self.cell_of(x, y)
+        best: Node | None = None
+        for n in self.cells.get((cx, cy), ()):
+            dz = n.z - z
+            if 2.0 < dz <= cap and (best is None or n.z < best.z):
+                best = n
+        return best
+
     def is_walkable(self, x: float, y: float, z: float, dz_max: float | None = None) -> bool:
         return self.layer_at(x, y, z, dz_max if dz_max is not None else self.cfg.step_height) is not None
 
     def nearest_node(self, x: float, y: float, z: float, max_radius: float = 96.0) -> Node | None:
         """Ближайшая клетка-ярус (игрок может стоять чуть вне карты)."""
-        node = self.layer_at(x, y, z)
+        node = self.layer_at(x, y, z, dz_max=self.cfg.jump_height)
         if node is not None:
             return node
         cx, cy = self.cell_of(x, y)
@@ -448,7 +474,7 @@ class CoordinateMap:
                         dz = abs(n.z - z)
                         if dz > self.cfg.drop_height:
                             continue
-                        score = n.dist2d(x, y) + dz * 0.5
+                        score = n.dist2d(x, y) + dz * 1.6
                         if score < best_score:
                             best_score, best = score, n
             if best is not None:
@@ -521,7 +547,7 @@ class CoordinateMap:
             n_top = self._node_for_mount(top[0], top[1], top[2])
             if n_bot is None or n_top is None or n_bot.id == n_top.id:
                 continue
-            if abs(n_top.z - n_bot.z) < self.cfg.jump_height + 4.0:
+            if abs(n_top.z - n_bot.z) < self.cfg.crouch_jump_height + 4.0:
                 continue
             hdist = math.hypot(n_top.x - n_bot.x, n_top.y - n_bot.y) + abs(n_top.z - n_bot.z)
             if not any(e[0] == n_top.id and e[2] == "ladder" for e in n_bot.edges):
@@ -577,23 +603,141 @@ class CoordinateMap:
             "clearance_median": round(cl[len(cl) // 2], 1) if cl else 0.0,
             "clearance_max": round(cl[-1], 1) if cl else 0.0,
             "jump_edges": sum(1 for n in self.nodes for e in n.edges if e[2] == "jump") // 2,
+            "crouch_jump_edges": sum(1 for n in self.nodes for e in n.edges if e[2] == "crouch_jump") // 2,
             "ladder_edges": sum(1 for n in self.nodes for e in n.edges if e[2] == "ladder") // 2,
             "z_min": round(min(n.z for n in self.nodes), 1),
             "z_max": round(max(n.z for n in self.nodes), 1),
         }
 
     @classmethod
+    def from_navmesh(cls, path: Path | str, cfg: MapConfig | None = None) -> CoordinateMap:
+        """
+        Принять разобранный .nav (полигоны Valve) как запись для текущего сборщика.
+
+        Каждый полигон режется на короткие отрезки короче seg_max_len / seg_max_dz,
+        иначе длинное ребро навмеша текущий код считает телепортом и выбрасывает.
+        Дальше работает обычный build: капсула, эрозия, ярусы, рёбра по соседним клеткам.
+        """
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        cfg = cfg or MapConfig()
+        step = max(cfg.cell, 16.0)
+        max_len = min(56.0, cfg.seg_max_len - 1.0)
+        max_dz = min(40.0, cfg.seg_max_dz - 1.0)
+        gap = (float("nan"), float("nan"), float("nan"))
+        points: list[tuple[float, float, float]] = []
+        trail: list[tuple[float, float, float]] = []
+        crouch: list[tuple[float, float, float]] = []
+        for area in raw.get("areas") or []:
+            corners = [
+                (float(p[0]), float(p[1]), float(p[2]))
+                for p in (area.get("corners") or [])
+                if p is not None and len(p) >= 3
+            ]
+            if len(corners) < 3:
+                continue
+            is_crouch = "CrouchHeight" in (area.get("flags") or [])
+            samples: list[tuple[float, float, float]] = []
+            for a, b in _polygon_segments(corners, step):
+                samples.extend(_split_segment(a, b, max_len, max_dz))
+            if not samples:
+                samples.extend(corners)
+            for a, b in zip(samples[0::2], samples[1::2]):
+                points.append(a)
+                points.append(b)
+                trail.append(a)
+                trail.append(b)
+                trail.append(gap)
+                if is_crouch:
+                    crouch.append(a)
+                    crouch.append(b)
+        if not points:
+            raise ValueError("в nav-файле нет полигонов")
+        source = str(raw.get("source") or path)
+        map_name = Path(source).name
+        for suffix in (".vpk", ".nav.json", ".json", ".nav"):
+            if map_name.endswith(suffix):
+                map_name = map_name[: -len(suffix)]
+                break
+        cm = cls.build(
+            points,
+            trail,
+            map_name=map_name or "nav",
+            location="navmesh",
+            cfg=cfg,
+        )
+        cm.crouch_points = _dedupe_xyz(crouch)
+        cm._index_crouch()
+        cm.attach_ladders(raw.get("ladder_list") or [])
+        return cm
+
+    @classmethod
     def find_recording(cls, map_name: str, location: str | None = None) -> Path:
-        base = RECORDINGS / map_name
+        base = MAPS
         if location:
-            p = base / f"{location}.json"
+            p = base / f"{map_name}_{location}.json"
             if p.exists():
                 return p
         if base.is_dir():
-            hits = sorted(base.glob("*.json"))
+            hits = sorted(base.glob(f"{map_name}_*.json"))
+            hits = [h for h in hits if not h.name.endswith(".nav.json")]
             if hits:
                 return hits[0]
         raise FileNotFoundError(f"нет записи для {map_name}/{location or '*'}")
+
+
+def _split_segment(
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+    max_len: float,
+    max_dz: float,
+) -> list[tuple[float, float, float]]:
+    """Пары точек (a,b,a,b,...) короче порогов текущего сборщика."""
+    dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+    dist = math.hypot(dx, dy)
+    pieces = max(1, math.ceil(dist / max_len), math.ceil(abs(dz) / max_dz))
+    out: list[tuple[float, float, float]] = []
+    prev = a
+    for i in range(1, pieces + 1):
+        t = i / pieces
+        cur = (a[0] + dx * t, a[1] + dy * t, a[2] + dz * t)
+        out.append(prev)
+        out.append(cur)
+        prev = cur
+    return out
+
+
+def _polygon_segments(
+    corners: list[tuple[float, float, float]],
+    step: float,
+) -> list[tuple[tuple[float, float, float], tuple[float, float, float]]]:
+    """Контур полигона и горизонтальные хорды внутри, шаг step."""
+    segs: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+    n = len(corners)
+    for i in range(n):
+        segs.append((corners[i], corners[(i + 1) % n]))
+    ys = [c[1] for c in corners]
+    y = min(ys) + step * 0.5
+    y1 = max(ys)
+    while y < y1:
+        hits: list[tuple[float, float]] = []
+        for i in range(n):
+            a = corners[i]
+            b = corners[(i + 1) % n]
+            ya, yb = a[1], b[1]
+            if abs(yb - ya) < 1e-6:
+                continue
+            if (ya <= y < yb) or (yb <= y < ya):
+                t = (y - ya) / (yb - ya)
+                hits.append((a[0] + (b[0] - a[0]) * t, a[2] + (b[2] - a[2]) * t))
+        hits.sort()
+        for i in range(0, len(hits) - 1, 2):
+            x0, z0 = hits[i]
+            x1, z1 = hits[i + 1]
+            if abs(x1 - x0) < 1.0:
+                continue
+            segs.append(((x0, y, z0), (x1, y, z1)))
+        y += step
+    return segs
 
 
 def _dedupe_xyz(points: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:

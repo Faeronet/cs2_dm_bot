@@ -59,6 +59,16 @@ class Schema:
     m_b_fake_ladder: int = 0
     m_b_ladder_has_slack: int = 0
     m_n_actual_move_type: int = 0
+    m_e_door_state: int = 0
+    m_b_door_locked: int = 0
+    m_closed_position: int = 0
+    m_closed_angles: int = 0
+    m_b_door_usable: int = 0
+    m_ang_abs_rotation: int = 0
+    m_i_max_health: int = 0
+    m_b_has_break_pieces: int = 0
+    m_model_name: int = 0
+    m_n_solid_type: int = 0
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Schema":
@@ -126,4 +136,14 @@ class Schema:
             m_b_fake_ladder=field("C_FuncLadder", "m_bFakeLadder"),
             m_b_ladder_has_slack=field("C_FuncLadder", "m_bHasSlack"),
             m_n_actual_move_type=field("C_BaseEntity", "m_nActualMoveType"),
+            m_e_door_state=field("C_BasePropDoor", "m_eDoorState"),
+            m_b_door_locked=field("C_BasePropDoor", "m_bLocked"),
+            m_closed_position=field("C_BasePropDoor", "m_closedPosition"),
+            m_closed_angles=field("C_BasePropDoor", "m_closedAngles"),
+            m_b_door_usable=field("C_BaseDoor", "m_bIsUsable"),
+            m_ang_abs_rotation=field("CGameSceneNode", "m_angAbsRotation"),
+            m_i_max_health=field("C_BaseEntity", "m_iMaxHealth"),
+            m_b_has_break_pieces=field("C_BreakableProp", "m_bHasBreakPiecesOrCommands"),
+            m_model_name=field("CModelState", "m_ModelName"),
+            m_n_solid_type=field("CCollisionProperty", "m_nSolidType"),
         )

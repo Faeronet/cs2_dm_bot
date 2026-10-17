@@ -34,7 +34,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Координатная карта из recording JSON → PNG")
     parser.add_argument(
         "--recording", "-r",
-        default="data/recordings/de_inferno/de_inferno.json",
+        default="data/maps/de_inferno_de_inferno.json",
         help="путь(и) через запятую или glob — несколько записей объединяются",
     )
     parser.add_argument("--out", "-o", default=None, help="PNG (по умолчанию data/maps/<map>_<loc>.png)")

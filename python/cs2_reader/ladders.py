@@ -112,7 +112,13 @@ def _collision_bounds(backend, schema, entity: int) -> tuple[Vec3, Vec3] | None:
         mins = backend.read_vec3(col + schema.m_vec_surrounding_mins)
         maxs = backend.read_vec3(col + schema.m_vec_surrounding_maxs)
         if mins and maxs:
-            return Vec3(*mins), Vec3(*maxs)
+            span = max(
+                abs(maxs[0] - mins[0]),
+                abs(maxs[1] - mins[1]),
+                abs(maxs[2] - mins[2]),
+            )
+            if span >= 1.0:
+                return Vec3(*mins), Vec3(*maxs)
     if schema.m_vec_mins and schema.m_vec_maxs:
         mins = backend.read_vec3(col + schema.m_vec_mins)
         maxs = backend.read_vec3(col + schema.m_vec_maxs)

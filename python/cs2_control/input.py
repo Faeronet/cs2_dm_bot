@@ -21,10 +21,28 @@ KEY_MAP = {
     "ctrl": "KEY_LEFTCTRL",
     "shift": "KEY_LEFTSHIFT",
     "r": "KEY_R",
+    "e": "KEY_E",
     "f": "KEY_F",
     "1": "KEY_1",
     "2": "KEY_2",
     "3": "KEY_3",
+    # меню / консоль
+    "escape": "KEY_ESC",
+    "esc": "KEY_ESC",
+    "return": "KEY_ENTER",
+    "enter": "KEY_ENTER",
+    "tab": "KEY_TAB",
+    "backspace": "KEY_BACKSPACE",
+    "grave": "KEY_GRAVE",
+    "i": "KEY_I",
+    "o": "KEY_O",
+    "n": "KEY_N",
+    "c": "KEY_C",
+    "t": "KEY_T",
+    "m": "KEY_M",
+    "p": "KEY_P",
+    "g": "KEY_G",
+    "-": "KEY_MINUS",
 }
 
 MOUSE_BUTTONS = {
@@ -319,6 +337,76 @@ class XdotoolInput(GameInput):
     def close(self) -> None:
         self.release_all()
         self._keys.close()
+
+
+class AbsPointer:
+    """Абсолютный указатель через uinput (планшет-перо).
+
+    На XWayland относительные дельты мыши идут через libinput c ускорением, а
+    xdotool двигает X-указатель, который НЕ совпадает с указателем композитора.
+    Перо планшета libinput/GNOME маппит абсолютно: ABS_X/ABS_Y → пиксель экрана
+    без ускорения, а тап пером = левый клик в этой точке. Детерминированно.
+    """
+
+    def __init__(self, width: int, height: int, *, quiet: bool = False) -> None:
+        from evdev import AbsInfo, UInput, ecodes as e
+
+        self._e = e
+        self.width = int(width)
+        self.height = int(height)
+        cap = {
+            e.EV_KEY: [e.BTN_TOOL_PEN, e.BTN_TOUCH, e.BTN_STYLUS],
+            e.EV_ABS: [
+                (e.ABS_X, AbsInfo(0, 0, self.width, 0, 0, 0)),
+                (e.ABS_Y, AbsInfo(0, 0, self.height, 0, 0, 0)),
+                (e.ABS_PRESSURE, AbsInfo(0, 0, 65535, 0, 0, 0)),
+            ],
+        }
+        self._ui = UInput(cap, name="cs2-abs-pointer", vendor=0x1234, product=0x5678)
+        self._x = 0
+        self._y = 0
+        if not quiet:
+            print(f"Ввод: абсолютное перо uinput ({self.width}x{self.height})")
+
+    def _clamp(self, x: int, y: int) -> tuple[int, int]:
+        x = max(0, min(self.width, int(x)))
+        y = max(0, min(self.height, int(y)))
+        return x, y
+
+    def move(self, x: int, y: int, *, settle: float = 0.08) -> None:
+        """Переместить курсор в абсолютный пиксель (перо в proximity)."""
+        x, y = self._clamp(x, y)
+        self._x, self._y = x, y
+        self._ui.write(self._e.EV_KEY, self._e.BTN_TOOL_PEN, 1)
+        self._ui.write(self._e.EV_ABS, self._e.ABS_X, x)
+        self._ui.write(self._e.EV_ABS, self._e.ABS_Y, y)
+        self._ui.syn()
+        time.sleep(settle)
+
+    def click(self, x: int | None = None, y: int | None = None, *, hold_ms: int = 70) -> None:
+        """Клик в точке (x,y) или в текущей позиции: тап пером."""
+        if x is not None and y is not None:
+            self.move(x, y)
+        self._ui.write(self._e.EV_ABS, self._e.ABS_PRESSURE, 40000)
+        self._ui.write(self._e.EV_KEY, self._e.BTN_TOUCH, 1)
+        self._ui.syn()
+        time.sleep(max(0, hold_ms) / 1000.0)
+        self._ui.write(self._e.EV_ABS, self._e.ABS_PRESSURE, 0)
+        self._ui.write(self._e.EV_KEY, self._e.BTN_TOUCH, 0)
+        self._ui.syn()
+        time.sleep(0.05)
+
+    def lift(self) -> None:
+        """Убрать перо из proximity."""
+        self._ui.write(self._e.EV_KEY, self._e.BTN_TOOL_PEN, 0)
+        self._ui.syn()
+
+    def close(self) -> None:
+        try:
+            self.lift()
+            self._ui.close()
+        except Exception:
+            pass
 
 
 def create_input(*, prefer_xdotool_mouse: bool = False) -> GameInput:

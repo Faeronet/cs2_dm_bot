@@ -1,0 +1,27 @@
+# Бот CS2 (Linux native, GNOME + XWayland). Python 3.10+.
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r python/requirements.txt
+#
+# Системные пакеты (Debian/Ubuntu), один раз от обычного пользователя:
+#   sudo apt install ffmpeg libx11-6 libxcb1 libxau6 libxdmcp6 libbsd0 libmd0 procps
+# xdotool в репозитории уже лежит в tools/xdotool/ (фокус окна CS2).
+# Системный пакет xdotool нужен только как запасной, если своей копии нет:
+#   sudo apt install xdotool libxdo3
+#
+# Ввод мыши и клавиш идёт через /dev/uinput (не от root):
+#   sudo usermod -aG input "$USER"          # перелогиниться
+#   echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' \
+#     | sudo tee /etc/udev/rules.d/99-uinput.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   sudo modprobe uinput
+#
+# Чтение /proc/<pid>/mem того же пользователя. Если Permission denied:
+#   echo 'kernel.yama.ptrace_scope = 0' | sudo tee /etc/sysctl.d/99-ptrace.conf
+#   sudo sysctl --system
+#
+# После патча CS2 оффсеты обновляет scripts/update_offsets.py.
+# Живой дамп (не обязателен для первого запуска, файлы уже в data/):
+#   sudo apt install git rustc cargo
+
+evdev>=1.6.0
+pillow>=10.0.0

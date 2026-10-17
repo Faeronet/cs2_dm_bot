@@ -6,7 +6,7 @@
 файлами, чтобы карта не соединяла конец одной записи с началом другой.
 
   python3 python/tools/merge_recordings.py -l tunels \
-      data/recordings/de_dust2/lower_tunel1.json data/recordings/de_dust2/uper_tunel.json
+      data/maps/de_dust2_lower_tunel1.json data/maps/de_dust2_uper_tunel.json
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-REC_DIR = Path(ROOT) / "data" / "recordings"
+REC_DIR = Path(ROOT) / "data" / "maps"
 
 
 def resolve(specs: list[str]) -> list[Path]:
@@ -90,7 +90,7 @@ def main() -> int:
     parser.add_argument("inputs", nargs="+", help="JSON записи (пути или glob), порядок = приоритет")
     parser.add_argument("-l", "--location", required=True, help="имя объединённой локации (имя файла)")
     parser.add_argument("--radius", type=float, default=8.0, help="точки ближе R юнитов считаются дубликатами")
-    parser.add_argument("--out", default=None, help="куда сохранить (по умолчанию data/recordings/<map>/<location>.json)")
+    parser.add_argument("--out", default=None, help="куда сохранить (по умолчанию data/maps/<map>_<location>.json)")
     args = parser.parse_args()
 
     files = resolve(args.inputs)
@@ -147,7 +147,7 @@ def main() -> int:
         print(f"{f.name}: {len(pts)} точек, убрано дубликатов (в {args.radius:g}u от предыдущих файлов): {d}")
     print(f"Итого {len(kept)} точек")
 
-    out = Path(args.out) if args.out else REC_DIR / str(map_name) / f"{args.location}.json"
+    out = Path(args.out) if args.out else REC_DIR / f"{map_name}_{args.location}.json"
     if not out.is_absolute():
         out = Path(ROOT) / out
     out.parent.mkdir(parents=True, exist_ok=True)
