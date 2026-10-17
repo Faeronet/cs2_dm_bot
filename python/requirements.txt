@@ -19,6 +19,7 @@
 #   echo 'kernel.yama.ptrace_scope = 0' | sudo tee /etc/sysctl.d/99-ptrace.conf
 #   sudo sysctl --system
 #
+# Навмеши карт — data/maps/*.nav.json, они в репозитории.
 # После патча CS2 оффсеты обновляет scripts/update_offsets.py.
 # Живой дамп (не обязателен для первого запуска, файлы уже в data/):
 #   sudo apt install git rustc cargo

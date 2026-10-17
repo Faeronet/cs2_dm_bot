@@ -6,4 +6,3 @@ venv/
 *.dmp
 external/cs2-dumper/target/
 data/sim/
-data/maps/
