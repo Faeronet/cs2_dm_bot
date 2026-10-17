@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import time
 from pathlib import Path
@@ -59,6 +60,20 @@ from cs2_reader.vulnerability import read_pawn_vulnerability
 from cs2_reader.weapons import is_healthshot, weapon_name
 
 MAX_ENTITIES = 8192
+_MAP_ID = re.compile(r"^(?:de|cs|ar|dz|gd)_[a-z0-9_]+$")
+
+
+def _map_id(raw: str) -> str:
+    """de_dust2 из строки памяти. Мусор и меню — пустая строка."""
+    name = (raw or "").strip().replace("\\", "/")
+    if name.startswith("maps/"):
+        name = name[5:]
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    if name.endswith(".vpk"):
+        name = name[: -len(".vpk")]
+    name = name.lower()
+    return name if _MAP_ID.match(name) else ""
 LADDER_CACHE_TTL = 5.0
 DOOR_CACHE_TTL = 1.0
 BREAKABLE_CACHE_TTL = 1.0
@@ -215,15 +230,22 @@ class Reader:
         if not global_vars:
             return ""
 
-        for off in (self._map_name_off, GLOBAL_VARS_MAP_NAME_WINDOWS, 0x180, 0x188, 0x198):
-            name = self.backend.read_cstring_ptr(global_vars + off)
-            if not name:
+        # Несколько оффсетов: первый «непустой» часто мусор (не имя карты).
+        # Берём только id вида de_dust2 и предпочитаем оффсет текущей платформы.
+        found: list[tuple[int, str]] = []
+        seen: set[int] = set()
+        for off in (self._map_name_off, GLOBAL_VARS_MAP_NAME, GLOBAL_VARS_MAP_NAME_WINDOWS, 0x180, 0x188, 0x198):
+            if off in seen:
                 continue
-            if name.startswith("maps/"):
-                name = Path(name).stem
-            if name and name not in ("<empty>", "") and len(name) >= 2:
-                return name
-        return ""
+            seen.add(off)
+            raw = self.backend.read_cstring_ptr(global_vars + off)
+            token = _map_id(raw)
+            if token:
+                found.append((off, token))
+        for off, token in found:
+            if off == self._map_name_off:
+                return token
+        return found[0][1] if found else ""
 
     def view_matrix(self) -> ViewMatrix | None:
         client = self._client_base()

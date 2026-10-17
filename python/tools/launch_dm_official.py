@@ -44,10 +44,6 @@ CLICKS: dict[str, tuple[float, float]] = {
     "auto_select": (0.935, 0.930),     # экран выбора команды: AUTO-SELECT (низ справа)
 }
 
-# «пустые»/мусорные значения карты в меню
-_EMPTY_MAP = {"", "<empty>"}
-
-
 def log(msg: str) -> None:
     print(f"[dm] {msg}", flush=True)
 
@@ -100,21 +96,15 @@ def _signals(reader: Reader) -> dict:
     }
 
 
-def _valid_map(name: str) -> bool:
-    if name in _EMPTY_MAP:
-        return False
-    # имя карты из памяти должно быть печатным ascii вида de_/dm_/ar_/cs_
-    return name.isprintable() and all(32 <= ord(c) < 127 for c in name) and len(name) <= 40
-
-
 def normalize_map(name: str) -> str:
-    """de_dust2 из 'maps/de_dust2.vpk' / мусора."""
-    name = (name or "").strip().lower().replace("\\", "/")
-    if "/" in name:
-        name = name.rsplit("/", 1)[-1]
-    if name.endswith(".vpk"):
-        name = name[: -len(".vpk")]
-    return name
+    """de_dust2 из 'maps/de_dust2.vpk'. Мусор — пустая строка."""
+    from cs2_reader.reader import _map_id
+
+    return _map_id(name)
+
+
+def _valid_map(name: str) -> bool:
+    return bool(normalize_map(name))
 
 
 def launch_until_spawn(

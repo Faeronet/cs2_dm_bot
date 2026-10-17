@@ -126,11 +126,22 @@ def run_bot_until_change(
         fire_enabled=True,
     )
     nav = Navigator(reader, inp, cmap, cfg)
-    pos = reader.local_position()
-    try:
-        route = nav.plan((pos.x, pos.y, pos.z))
-    except Exception as exc:  # noqa: BLE001
-        log(f"маршрут на {map_name} не построился ({exc}) — повтор")
+    route = None
+    plan_deadline = time.monotonic() + 20.0
+    while time.monotonic() < plan_deadline:
+        sig = _signals(reader)
+        live = normalize_map(sig["map"]) if sig["map_loaded"] else ""
+        if live and live != map_name:
+            break
+        pos = reader.local_position()
+        try:
+            route = nav.plan((pos.x, pos.y, pos.z))
+            break
+        except Exception as exc:  # noqa: BLE001
+            log(f"маршрут на {map_name} ещё не строится ({exc})")
+            time.sleep(0.5)
+    if route is None:
+        log(f"маршрут на {map_name} не построился — повтор")
         nav.release()
         inp.release_all()
         return "retry"
@@ -145,6 +156,8 @@ def run_bot_until_change(
     played = [0.0]
     last_tick = [time.monotonic()]
     hit_limit = [False]
+    # (имя, с какого момента оно стабильно отличается от текущей карты)
+    other_since: list[tuple[str, float] | None] = [None]
 
     def should_stop() -> bool:
         now = time.monotonic()
@@ -153,19 +166,25 @@ def run_bot_until_change(
         sig = _signals(reader)
         live = normalize_map(sig["map"]) if sig["map_loaded"] else ""
         if live == map_name:
+            other_since[0] = None
+            empty_since[0] = None
             played[0] += max(0.0, dt)
             if match_time and played[0] >= match_time:
                 hit_limit[0] = True
                 log(f"лимит матча {match_time:.0f}с выработан ({played[0]:.0f}с в бою)")
                 return True
+            return False
         if live and live != map_name:
-            return True
-        if not live:
-            if empty_since[0] is None:
-                empty_since[0] = now
-            return now - empty_since[0] >= 3.0
-        empty_since[0] = None
-        return False
+            # Один кривой кадр имени карты не останавливает бота.
+            prev = other_since[0]
+            if prev is None or prev[0] != live:
+                other_since[0] = (live, now)
+                return False
+            return now - prev[1] >= 2.0
+        other_since[0] = None
+        if empty_since[0] is None:
+            empty_since[0] = now
+        return now - empty_since[0] >= 3.0
 
     reason = nav.run(duration=None, should_stop=should_stop)
     if hit_limit[0]:
@@ -226,9 +245,10 @@ def main() -> int:
                 continue
             cmap = load_coord_map(map_name, cache)
             if cmap is None:
-                log("жду другую карту или возврат в меню…")
-                time.sleep(5.0)
+                log(f"навмеша для {map_name!r} нет — жду карту из data/maps, бот ещё не стартует")
+                time.sleep(2.0)
                 continue
+            log(f"карта {map_name} подгружена — запускаю бота")
             outcome = run_bot_until_change(
                 reader, inp, cmap, map_name,
                 match_time=match_time, hz=args.hz, quiet=args.quiet,
