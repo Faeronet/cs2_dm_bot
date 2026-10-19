@@ -9,6 +9,7 @@
 
   python3 python/tools/run_dm.py --match-time 600
   python3 python/tools/run_dm.py --match-time 0    # без лимита
+  python3 python/tools/run_dm.py --stop            # остановить уже запущенный бот
 
 Лимит считается только пока бот работает в матче (после спавна).
 Меню, очередь и поиск матча в это время не входят. Новый матч — новый отсчёт.
@@ -17,7 +18,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import signal
 import sys
 import time
 
@@ -53,10 +56,173 @@ def _repo_root() -> str:
 
 ROOT = _repo_root()
 MAPS_DIR = os.path.join(ROOT, "data", "maps")
+_SCRIPT = os.path.abspath(__file__)
+
+
+def _pid_path() -> str:
+    """Один pid-файл на этот скрипт и этого пользователя."""
+    digest = hashlib.sha1(_SCRIPT.encode()).hexdigest()[:12]
+    return f"/tmp/cs2-dm-bot-{os.getuid()}-{digest}.pid"
 
 
 def log(msg: str) -> None:
     print(f"[dm+bot] {msg}", flush=True)
+
+
+def _proc_args(pid: int) -> list[str]:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return []
+    parts = raw.split(b"\x00")
+    if parts and parts[-1] == b"":
+        parts = parts[:-1]
+    return [part.decode("utf-8", "replace") for part in parts]
+
+
+def _is_this_bot(pid: int) -> bool:
+    """Процесс запущен этим же run_dm.py и это не команда --stop."""
+    if pid <= 0 or pid == os.getpid():
+        return False
+    args = _proc_args(pid)
+    if not args or "--stop" in args:
+        return False
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = "/"
+    for arg in args:
+        if not arg.endswith("run_dm.py"):
+            continue
+        candidate = arg if os.path.isabs(arg) else os.path.join(cwd, arg)
+        try:
+            if os.path.samefile(candidate, _SCRIPT):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_pidfile() -> int | None:
+    try:
+        pid = int(open(_pid_path(), encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        return None
+    if _pid_alive(pid) and _is_this_bot(pid):
+        return pid
+    return None
+
+
+def _scan_bot_pids() -> list[int]:
+    found: list[int] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if _is_this_bot(pid):
+            found.append(pid)
+    return found
+
+
+def _running_pids() -> list[int]:
+    pids: list[int] = []
+    recorded = _read_pidfile()
+    if recorded:
+        pids.append(recorded)
+    for pid in _scan_bot_pids():
+        if pid not in pids:
+            pids.append(pid)
+    return pids
+
+
+def _write_pidfile() -> None:
+    path = _pid_path()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, str(os.getpid()).encode())
+    finally:
+        os.close(fd)
+
+
+def _clear_pidfile() -> None:
+    path = _pid_path()
+    try:
+        current = int(open(path, encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        return
+    if current != os.getpid():
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _install_stop_signal() -> None:
+    """SIGTERM от --stop и Ctrl+C выходят из любого места и отпускают клавиши в finally."""
+    seen = {"on": False}
+
+    def _handle(signum: int, _frame) -> None:
+        if seen["on"]:
+            return
+        seen["on"] = True
+        log("получен стоп")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGINT, _handle)
+
+
+def stop_running() -> int:
+    """Остановить уже запущенный этот же run_dm.py."""
+    pids = _running_pids()
+    if not pids:
+        try:
+            os.remove(_pid_path())
+        except OSError:
+            pass
+        log("бот не запущен")
+        return 0
+    for pid in pids:
+        log(f"останавливаю бота pid={pid}")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not any(_pid_alive(pid) for pid in pids):
+            break
+        time.sleep(0.1)
+    for pid in pids:
+        if not _pid_alive(pid):
+            continue
+        log(f"бот pid={pid} не вышел — принудительно")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        os.remove(_pid_path())
+    except OSError:
+        pass
+    log("бот остановлен")
+    return 0
 
 
 def nav_path_for(map_name: str) -> str | None:
@@ -258,32 +424,52 @@ def main() -> int:
     parser.add_argument("--hz", type=float, default=40.0)
     parser.add_argument("--shots", action="store_true", help="Скриншоты шагов меню")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Остановить уже запущенный этот же скрипт",
+    )
     args = parser.parse_args()
+
+    if args.stop:
+        return stop_running()
 
     if os.geteuid() == 0:
         print("Не запускай от root", file=sys.stderr)
         return 1
 
-    try:
-        mesh_names = ", ".join(sorted(os.listdir(MAPS_DIR))) or "пусто"
-    except OSError as exc:
-        mesh_names = f"не читается ({exc})"
-    log(f"навмеши: {MAPS_DIR} → {mesh_names}")
-
-    ensure_flat_accel()
-    reader = Reader.from_live()
-    if not reader:
-        log("CS2 не запущен")
+    already = _running_pids()
+    if already:
+        log(
+            f"бот уже запущен (pid={already[0]}). "
+            "Остановить: python3 python/tools/run_dm.py --stop"
+        )
         return 1
 
-    inp = create_input()
-    inp.prepare()
-    menu = MenuController(reader, game_input=inp, log=log)
-    cache: dict[str, CoordinateMap] = {}
-    match_time = args.duration if args.duration is not None else args.match_time
-    match_time = match_time or None
-
+    _install_stop_signal()
+    _write_pidfile()
+    inp = None
+    menu = None
     try:
+        try:
+            mesh_names = ", ".join(sorted(os.listdir(MAPS_DIR))) or "пусто"
+        except OSError as exc:
+            mesh_names = f"не читается ({exc})"
+        log(f"навмеши: {MAPS_DIR} → {mesh_names}")
+
+        ensure_flat_accel()
+        reader = Reader.from_live()
+        if not reader:
+            log("CS2 не запущен")
+            return 1
+
+        inp = create_input()
+        inp.prepare()
+        menu = MenuController(reader, game_input=inp, log=log)
+        cache: dict[str, CoordinateMap] = {}
+        match_time = args.duration if args.duration is not None else args.match_time
+        match_time = match_time or None
+
         while True:
             map_name = ensure_spawned(reader, menu, shots=args.shots)
             if not map_name:
@@ -310,8 +496,13 @@ def main() -> int:
                 time.sleep(2.0)
             # 'menu' или 'map:…' — цикл сам решит: меню или новый навмеш
     finally:
-        menu.close()
-        inp.close()
+        _clear_pidfile()
+        try:
+            if menu is not None:
+                menu.close()
+        finally:
+            if inp is not None:
+                inp.close()
 
 
 if __name__ == "__main__":
