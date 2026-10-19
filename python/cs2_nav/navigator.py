@@ -326,6 +326,11 @@ class NavConfig:
     vuln_fire_delay: tuple[float, float] = (0.0, 0.0)    # защита снята — стреляем в тот же тик
     combat_strafe_chance: float = 0.25       # xxHash: A/D шаги МЕЖДУ выстрелами (первый — всегда с места)
     combat_strafe_dist: tuple[float, float] = (18.0, 44.0)  # u: короткий шаг, каждый раз новый
+    kill_step_chance: float = 0.70           # xxHash: после убийства, перед следующей мишенью
+    kill_step_dist: tuple[float, float] = (56.7, 76.7)        # u: прежняя сотня ÷1.5
+    kill_step_dist_err: tuple[float, float] = (5.3, 12.0)     # u: погрешность тоже ÷1.5
+    kill_step_fire_delay: tuple[float, float] = (0.06, 0.13)  # с: после нажатия контрстрейфа
+    kill_step_fire_delay_err: tuple[float, float] = (0.01, 0.025)
     # --- скоуп снайперок без хипфайр-прицела (AWP/SSG/автоснайпер)
     scope_noscope_chance: float = 0.30       # xxHash: автоснайперы
     scope_noscope_awp: float = 0.003         # xxHash: AWP почти всегда в скоупе
@@ -564,8 +569,9 @@ class Navigator:
         self._scoped_now = False
         self._unscope_left = 0                   # после боя: 20% два клика ПКМ, иначе нож→оружие
         self._unscope_next = 0.0
-        self._combat_strafe: dict | None = None  # 60%: шаги A/D, огонь на контрстрейфе
+        self._combat_strafe: dict | None = None  # шаги A/D; после убийства — отдельный отход
         self._strafe_fire_ok = True
+        self._pend_kill_step = False             # следующая новая мишень после убийства
         self._immune_seen: set[int] = set()      # видели spawn-защиту
         self._vuln_ready_at: dict[int, float] = {}  # index → когда можно стрелять после уязвимости
         self._tick_no = 0
@@ -2018,7 +2024,10 @@ class Navigator:
             else:
                 ex, ey, _ = e["position"]
                 self._sample_scope(e["index"], math.hypot(ex - x, ey - y))
-            if resume and self._combat_strafe and self._combat_strafe.get("index") == e["index"]:
+            if self._pend_kill_step:
+                self._pend_kill_step = False
+                self._begin_kill_sidestep(e["index"])
+            elif resume and self._combat_strafe and self._combat_strafe.get("index") == e["index"]:
                 pass
             else:
                 self._sample_combat_strafe(e["index"])
@@ -2105,6 +2114,7 @@ class Navigator:
 
         if cur is not None and not cur_alive:
             has_next = any(i in by_id for i in self._engage_q if i != cur["index"])
+            self._pend_kill_step = True
             drop("убита", 0.0, unscope_knife=not has_next)
             cur = None
             same = None
@@ -2961,6 +2971,7 @@ class Navigator:
         self._door_ahead = None
         self._break_aim = None
         self._rcs_return = False
+        self._pend_kill_step = False
         self.done = False
         self.release()
         self.log("Умер — клавиши сброшены, ждём респавн")
@@ -2988,6 +2999,7 @@ class Navigator:
         self._target_lost_at = None
         self._target_cooldown.clear()
         self._given_up.clear()
+        self._pend_kill_step = False
         self._hpshot_thr = None
         self._ladder = None
         self._crouch_until = 0.0
@@ -4606,6 +4618,7 @@ class Navigator:
             or not self._target_visible_now
             or self._scope_blocks_fire(now, yaw_err, pitch_err, dist)
             or not self._target_can_fire(now, target)
+            or not self._kill_step_can_fire(now)
             or (not on_oval and not holding_spray)
         )
         if abort:
@@ -4700,6 +4713,38 @@ class Navigator:
         }
         self.log(f"Стрейф A/D при огне ({self._combat_strafe['dist']:.0f}u)")
 
+    def _begin_kill_sidestep(self, index: int) -> None:
+        """После убийства: 70% отойти в сторону перед следующей мишенью. Иначе обычный шаг."""
+        if self._xx_u01() >= self.cfg.kill_step_chance:
+            self._sample_combat_strafe(index)
+            return
+        cfg = self.cfg
+        dist = max(32.0, self._xx_band(cfg.kill_step_dist, cfg.kill_step_dist_err))
+        side = -1 if self._xx_u01() < 0.5 else 1
+        self._combat_strafe = {
+            "index": index,
+            "side": side,
+            "phase": "go",
+            "dist": dist,
+            "ox": None,
+            "oy": None,
+            "t0": self._now(),
+            "fired": False,
+            "next_at": 0.0,
+            "stand": False,
+            "kill_step": True,
+            "fire_at": None,
+        }
+        self._strafe_fire_ok = False
+        self.log(f"После убийства шаг {'A' if side < 0 else 'D'} на {dist:.0f}u")
+
+    def _kill_step_can_fire(self, now: float) -> bool:
+        st = self._combat_strafe
+        if st is None or not st.get("kill_step"):
+            return True
+        ready = st.get("fire_at")
+        return ready is not None and now >= ready
+
     def _on_combat_strafe_shot(self) -> None:
         self._shot_miss = None
         st = self._combat_strafe
@@ -4723,7 +4768,7 @@ class Navigator:
         if st is None or self._unscoping():
             self._strafe_fire_ok = True
             return
-        if self._flick is not None or self._flick_pending:
+        if (self._flick is not None or self._flick_pending) and not st.get("kill_step"):
             self._strafe_fire_ok = False
             return
         if st["phase"] == "wait":
@@ -4738,14 +4783,31 @@ class Navigator:
             self._strafe_fire_ok = speed < 80.0
             return
         if st["phase"] == "go":
+            if st.get("ox") is None:
+                st["ox"], st["oy"] = x, y
+                st["t0"] = now
             traveled = math.hypot(x - st["ox"], y - st["oy"])
-            stuck = speed < 38.0 and now - st["t0"] > 0.18
+            stuck_after = 0.45 if st.get("kill_step") else 0.18
+            stuck = speed < 38.0 and now - st["t0"] > stuck_after
             timeout = now - st["t0"] > st["dist"] / 90.0 + 0.22
             if traveled >= st["dist"] or stuck or timeout:
                 st["phase"] = "stop"
                 st["t0"] = now
                 st["fired"] = False
+                if st.get("kill_step") and st.get("fire_at") is None:
+                    delay = max(0.0, self._xx_band(self.cfg.kill_step_fire_delay, self.cfg.kill_step_fire_delay_err))
+                    st["fire_at"] = now + delay
+                    self.log(f"Контрстрейф, огонь через {delay:.3f}s")
             self._strafe_fire_ok = False
+            return
+        if st.get("kill_step"):
+            ready = st.get("fire_at")
+            if ready is not None and now >= ready:
+                idx = st["index"]
+                self._sample_combat_strafe(idx)
+                self._strafe_fire_ok = True
+            else:
+                self._strafe_fire_ok = False
             return
         # stop: контрстрейф, огонь когда почти остановились
         self._strafe_fire_ok = speed < 70.0
@@ -4758,7 +4820,7 @@ class Navigator:
         st = self._combat_strafe
         if st is None or self._unscoping():
             return None
-        if self._flick is not None or self._flick_pending:
+        if (self._flick is not None or self._flick_pending) and not st.get("kill_step"):
             return self._counter_strafe_keys(vx, vy, speed, yaw_next)
         if st.get("stand") or st["phase"] == "stop":
             return self._counter_strafe_keys(vx, vy, speed, yaw_next)
