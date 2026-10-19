@@ -1022,9 +1022,16 @@ class Navigator:
             i += 1
         return near_bot and near_top
 
+    def _ladder_ends(self, lad: dict) -> tuple[tuple, tuple]:
+        bot, top = lad["bottom"], lad["top"]
+        if top[2] < bot[2]:
+            return top, bot
+        return bot, top
+
     def _ladder_exit_side(self, lad: dict, dest: tuple[float, float], going_up: bool) -> str:
         """Куда уходит маршрут после лестницы: left / right / forward / back."""
-        exit_pt = lad["top"] if going_up else lad["bottom"]
+        bot, top = self._ladder_ends(lad)
+        exit_pt = top if going_up else bot
         fx, fy = self._ladder_facing(lad)
         dx, dy = dest[0] - exit_pt[0], dest[1] - exit_pt[1]
         fwd = dx * fx + dy * fy
@@ -1047,17 +1054,17 @@ class Navigator:
         y: float,
     ) -> None:
         fx, fy = self._ladder_facing(lad)
-        mount = lad["bottom"] if going_up else lad["top"]
+        bot, top = self._ladder_ends(lad)
+        mount = bot if going_up else top
         mx, my = mount[0] + fx * 22.0, mount[1] + fy * 22.0
-        exit_z = lad["top"][2] if going_up else lad["bottom"][2]
+        exit_z = top[2] if going_up else bot[2]
         k = max(idx, route.next_vertex_index(self.s))
         while k + 1 < len(route.pts) and abs(route.pts[k][2] - exit_z) > 28.0:
             k += 1
         dest = route.pts[min(len(route.pts) - 1, k + 1)]
         side = self._ladder_exit_side(lad, (dest[0], dest[1]), going_up)
-        dx, dy = dest[0] - (lad["top"][0] if going_up else lad["bottom"][0]), dest[1] - (
-            lad["top"][1] if going_up else lad["bottom"][1]
-        )
+        exit_pt = top if going_up else bot
+        dx, dy = dest[0] - exit_pt[0], dest[1] - exit_pt[1]
         right = dx * (-fy) + dy * fx
         near_mount = math.hypot(mx - x, my - y) < 28.0
         self._ladder = {
@@ -1082,7 +1089,8 @@ class Navigator:
             st = self._ladder
             lad = st["lad"]
             going_up = bool(st["up"])
-            exit_z = lad["top"][2] if going_up else lad["bottom"][2]
+            bot, top = self._ladder_ends(lad)
+            exit_z = top[2] if going_up else bot[2]
             done_z = (z >= exit_z - 14.0) if going_up else (z <= exit_z + 18.0)
             if st["phase"] == "exit":
                 if math.hypot(st["mx"] - x, st["my"] - y) < 28.0 or now - st.get("exit_t0", st["t0"]) > 1.8:
@@ -1111,7 +1119,7 @@ class Navigator:
                 if st["side"] == "back":
                     fx, fy = self._ladder_facing(lad)
                     sx, sy = (-fy, fx) if st.get("strafe") == "d" else (fy, -fx)
-                    exit_pt = lad["top"] if going_up else lad["bottom"]
+                    exit_pt = top if going_up else bot
                     st["phase"] = "exit"
                     st["mx"] = exit_pt[0] + sx * 56.0 + fx * 14.0
                     st["my"] = exit_pt[1] + sy * 56.0 + fy * 14.0
@@ -1178,7 +1186,8 @@ class Navigator:
         if on:
             st["phase"] = "climb"
             st["seen"] = True
-            exit_z = lad["top"][2] if going_up else lad["bottom"][2]
+            bot, top = self._ladder_ends(lad)
+            exit_z = top[2] if going_up else bot[2]
             near_exit = (exit_z - z < 36.0) if going_up else (z - exit_z < 32.0)
             # на лестнице W + корректный pitch делает подъём/спуск; S даёт обратное.
             if near_exit:
@@ -1206,22 +1215,29 @@ class Navigator:
         lad = st["lad"]
         going_up = bool(st["up"])
         fx, fy = self._ladder_facing(lad)
-        bot, top = lad["bottom"], lad["top"]
+        bot, top = self._ladder_ends(lad)
         phase = st["phase"]
+        pitch_lim = 50.0
         if phase in ("approach", "exit"):
             tx, ty, tz = st["mx"], st["my"], z + 8.0
-        elif phase == "mount":
-            mount = bot if going_up else top
-            tx, ty = mount[0] - fx * 6.0, mount[1] - fy * 6.0
-            tz = mount[2] + (18.0 if going_up else -8.0)
+        elif going_up and phase == "mount":
+            tx, ty = bot[0] - fx * 6.0, bot[1] - fy * 6.0
+            tz = bot[2] + 18.0
         elif going_up:
             tx, ty, tz = top[0] - fx * 8.0, top[1] - fy * 8.0, min(top[2], z + 70.0)
         else:
-            tx, ty, tz = bot[0] - fx * 8.0, bot[1] - fy * 8.0, max(bot[2], z - 40.0)
+            # спуск: смотреть вниз. Горизонтальный взгляд, как на подъёме, почти не двигает W.
+            near_floor = z - bot[2] < 42.0
+            if near_floor:
+                tx, ty, tz = bot[0] - fx * 8.0, bot[1] - fy * 8.0, bot[2] + 12.0
+            else:
+                pitch_lim = 74.0
+                tx, ty = x - fx * 16.0, y - fy * 16.0
+                tz = z + self._eye_z - 120.0
         yaw = yaw_to_target(x, y, tx, ty)
         horiz = math.hypot(tx - x, ty - y)
         pitch = -math.degrees(math.atan2(tz - (z + self._eye_z), max(1.0, horiz)))
-        return yaw, max(-55.0, min(50.0, pitch))
+        return yaw, max(-55.0, min(pitch_lim, pitch))
 
     def _want_crouch(self, x: float, y: float, z: float, route: Route, cx: float, cy: float, cz: float) -> bool:
         if self._ladder is not None:
@@ -5016,7 +5032,16 @@ class Navigator:
             if rcs_back:
                 d_yaw, d_pitch = self._rcs_return_step(yaw_err, pitch_err, dt)
             else:
-                d_yaw, d_pitch = self._camera_step(yaw_err, pitch_err, dt, speed, rate_cap, gain)
+                pitch_rate = None
+                if (
+                    self._ladder is not None
+                    and not self._ladder.get("up")
+                    and self._ladder.get("phase") not in ("approach", "exit")
+                ):
+                    pitch_rate = 360.0
+                d_yaw, d_pitch = self._camera_step(
+                    yaw_err, pitch_err, dt, speed, rate_cap, gain, pitch_rate_max=pitch_rate
+                )
             # только маршрут: иначе потолок 160 px режет новый yaw_rate_max
             nav_px = None if rcs_back else int(cfg.max_px_per_tick * 1.75)
             dx, dy = self._send_mouse(d_yaw, d_pitch, nav_px)
