@@ -406,6 +406,7 @@ class NavSimulator:
             weapon=self._make_weapon(),
         )
         cfg = nav_config or NavConfig(verbose_log=False, habits_enabled=False)
+        cfg.background_workers = False
         self.dt = 1.0 / cfg.tick_hz
         self.time = 0.0
         self.nav = Navigator(self.reader, self.inp, cm, cfg, clock=lambda: self.time)

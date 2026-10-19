@@ -60,6 +60,7 @@ from cs2_reader.weapons import (
     weapon_needs_scope,
 )
 from cs2_reader.recoil import recoil_offset, tap_gap_range
+from cs2_reader.vulnerability import read_pawn_vulnerability
 
 XYZ = tuple[float, float, float]
 
@@ -210,7 +211,8 @@ class NavConfig:
     precal_px: int = 16                      # px за тик, если precal_ticks > 0
     # --- мишени вокруг (LOS по карте + spotted, не конус камеры)
     engage_targets: bool = True              # смотреть на видимую вокруг мишень, продолжая идти по маршруту
-    enemies_poll_hz: float = 40.0            # каждый тик: мишень сзади не ждёт следующий опрос
+    enemies_poll_hz: float = 80.0            # фоновый скан видимости, тик наведения его не ждёт
+    background_workers: bool = True          # скан мишеней, мир и маршрут — в отдельных потоках
     ladders_poll_hz: float = 0.5             # лестницы меняются редко — полный перебор entity list
     doors_poll_hz: float = 2.0               # двери: состояние open/closed меняется чаще
     door_block_margin: float = 20.0          # запас вокруг запертой двери при обходе
@@ -299,7 +301,8 @@ class NavConfig:
     aim_overshoot_s: tuple[float, float] = (0.08, 0.16)  # с: вдвое короче окно перевода
     aim_miss_chance: float = 0.015           # xxHash: редкий промах (было 10%, теперь 1.5%)
     aim_miss_u: tuple[float, float] = (0.8, 2.2)   # u: если и мимо — то едва мимо овала
-    aim_chest_chance: float = 0.35           # xxHash: туловище, если видны и голова, и грудь
+    aim_chest_chance: float = 0.10           # xxHash: туловище, если видны и голова, и грудь
+    aim_chest_chance_awp: float = 0.65       # xxHash: AWP чаще в туловище, чем в голову
     aim_head_radius: tuple[float, float] = (1.1, 2.4)         # u: круг на голове
     aim_head_radius_err: tuple[float, float] = (0.12, 0.40)
     aim_chest_radius: tuple[float, float] = (2.2, 4.6)        # u: круг на туловище
@@ -363,6 +366,8 @@ class NavConfig:
     healthshot_deploy: tuple[float, float] = (0.40, 0.68)  # с: шприц в руке, потом ЛКМ
     healthshot_inject: tuple[float, float] = (2.40, 2.90)  # с: держим до конца анимации, иначе слот её срывает
     healthshot_settle: tuple[float, float] = (0.12, 0.22)  # с: после отпускания, до смены оружия
+    cover_jiggle_dist: tuple[float, float] = (22.0, 36.0)       # u: манс на пару десятков, каждый заход свой
+    cover_jiggle_dist_err: tuple[float, float] = (2.4, 6.0)     # u: погрешность длины захода
     eye_height: float = 64.0                 # z глаз над ногами (стоя)
     target_body_radius: float = 16.0         # мишень — цилиндр, как игрок
     target_avoid_dist: float = 72.0          # начинаем обходить мишень на теле маршрута с этого расстояния
@@ -571,6 +576,7 @@ class Navigator:
         self._unscope_left = 0                   # после боя: 20% два клика ПКМ, иначе нож→оружие
         self._unscope_next = 0.0
         self._combat_strafe: dict | None = None  # шаги A/D; после убийства — отдельный отход
+        self._cover_jiggle: dict | None = None   # A/D пока перезарядка или укол и мишени видны
         self._strafe_fire_ok = True
         self._pend_kill_step = False             # следующая новая мишень после убийства
         self._awp_first_stop = False             # AWP: контрстрейф хода до первого выстрела
@@ -590,7 +596,7 @@ class Navigator:
         self._rcs_rot = 0.0
         self._rcs_lag = 0.10
         self._rcs_under = 0.97
-        self._rcs_pitch_boost = 1.32
+        self._rcs_pitch_boost = 1.0
         self._rcs_arc = 0.0
         self._rcs_rate_var = 0.0
         self._rcs_sampled = False
@@ -641,6 +647,24 @@ class Navigator:
         self._next_goal_id: int | None = None
         self._prefetch_busy = False
         self._prefetch_lock = threading.Lock()
+        self._scan_lock = threading.Lock()
+        self._scan_enemies: list[dict] = []
+        self._scan_visible: list[dict] = []
+        self._scan_published = False
+        self._los_cursor = 0
+        self._scan_stop = threading.Event()
+        self._workers_on = False
+        self._world_lock = threading.Lock()
+        self._world_ladders: list[dict] = []
+        self._world_doors: list[dict] = []
+        self._world_breakables: list[dict] = []
+        self._world_gen = 0
+        self._world_applied = 0
+        self._plan_lock = threading.Lock()
+        self._plan_busy = False
+        self._plan_ready: dict | None = None
+        self._plan_queued: tuple | None = None
+        self._await_route = False
 
     # ------------------------------------------------------------ helpers
 
@@ -667,6 +691,9 @@ class Navigator:
         """
         if e.get("dormant"):
             return False
+        if e.get("_scanned"):
+            self._sync_visible_from_bones(e)
+            return bool(e.get("visible"))
         if "visible" not in e or e.get("_vis_pos") != (round(x), round(y), round(z)):
             self._apply_los_visibility(e, x, y, z)
             e["_vis_pos"] = (round(x), round(y), round(z))
@@ -691,13 +718,18 @@ class Navigator:
     def _visible_parts(self, e: dict, x: float, y: float, z: float) -> dict[str, tuple[float, float, float] | None]:
         """Какие кости видны из глаз бота (LOS по 2.5D-карте).
         Ключи — 'head' / 'chest' / 'left_shoulder' / 'right_shoulder'."""
+        out: dict[str, tuple[float, float, float] | None] = {}
+        if e.get("_scanned"):
+            for part, key in _AIM_PART_KEYS.items():
+                pos = e.get(key)
+                out[part] = pos if e.get(f"{part}_visible") and pos is not None else None
+            return out
         parts_vis = visible_bone_parts(
             e, self.map, x, y, z,
             eye_z=self._eye_z,
             hull_radius=self.map.cfg.hull_radius,
             target_body_radius=self.cfg.target_body_radius,
         )
-        out: dict[str, tuple[float, float, float] | None] = {}
         for part, key in _AIM_PART_KEYS.items():
             pos = e.get(key)
             out[part] = pos if parts_vis.get(part) and pos is not None else None
@@ -1405,8 +1437,7 @@ class Navigator:
         self._rcs_rot = (self._xx_u01() - 0.5) * 0.35
         self._rcs_lag = 0.006 + self._xx_u01() * 0.012       # рука почти сразу за паттерном
         self._rcs_under = 0.996 + self._xx_u01() * 0.008     # 0.996..1.004, не систематический недовод
-        # пули уходят над головой: вертикаль чуть сильнее линии, цифра каждый спрей своя
-        self._rcs_pitch_boost = max(1.20, self._xx_band((1.28, 1.42), (0.02, 0.05)))
+        self._rcs_pitch_boost = 1.0
         self._rcs_arc = (self._xx_u01() - 0.5) * 0.04
         self._rcs_rate_var = (self._xx_u01() - 0.5) * self.cfg.rcs_rate_jitter
         self._rcs_cluster = max(0.06, self._xx_band(self.cfg.rcs_cluster, self.cfg.rcs_cluster_err))
@@ -1847,8 +1878,6 @@ class Navigator:
         t = now - self._rcs_lag
         dt_shot = max(0.0, t - (self._rcs_shot_t - self._rcs_lag))
         frac = min(1.0, dt_shot / max(0.05, cycle)) if t >= self._rcs_shot_t - self._rcs_lag else 0.0
-        # текущая пуля уже в паттерне, небольшой заход к следующей — очередь не остаётся сверху
-        frac = max(frac, 0.25)
         y, p = recoil_offset(wid, wname, n, frac)
         rad = math.radians(self._rcs_rot)
         c, s = math.cos(rad), math.sin(rad)
@@ -1890,12 +1919,13 @@ class Navigator:
         self._rcs_rate_var = self._rcs_rate_var * decay + (self._xx_u01() * 2.0 - 1.0) * kick
         self._rcs_rate_var = max(-j, min(j, self._rcs_rate_var))
         rate = cfg.rcs_rate * (1.0 + self._rcs_rate_var)
-        rate_p = rate * 1.35
+        # вертикаль чуть быстрее yaw: иначе рука отстаёт от подъёма ствола и пули идут выше
+        rate_p = rate * 1.12
         db = 0.04
         soft = abs(yaw_err) / (abs(yaw_err) + db)
         soft_p = abs(pitch_err) / (abs(pitch_err) + db)
         des_y = max(-rate, min(rate, cfg.rcs_gain * yaw_err * soft))
-        des_p = max(-rate_p, min(rate_p, cfg.rcs_gain * 1.45 * pitch_err * soft_p))
+        des_p = max(-rate_p, min(rate_p, cfg.rcs_gain * 1.12 * pitch_err * soft_p))
         acc = cfg.yaw_accel_max
         jerk = cfg.yaw_jerk_max
         self._yaw_rate, self._yaw_acc = self._track_rate(
@@ -1980,6 +2010,8 @@ class Navigator:
         Видимость — вокруг бота, не конус камеры. Если несколько появились сразу,
         список один раз сортируется по углу к прицелу. Пока текущая видна, прицел
         на других не переводим. Пропала, а следующая уже видна — берём её сразу.
+        Неуязвимый в DM остаётся на своём месте в списке, но пока защита висит
+        стреляем следующих. Вышел из защиты выше текущей — сначала добиваем текущую.
         """
         cfg = self.cfg
         if not cfg.engage_targets:
@@ -2084,16 +2116,23 @@ class Navigator:
             if not resume:
                 self._sample_aim_bone(e, x, y, z)
 
-        def drop(reason: str, cooldown: float | None = None, *, unscope_knife: bool = True) -> None:
+        def drop(
+            reason: str,
+            cooldown: float | None = None,
+            *,
+            unscope_knife: bool = True,
+            keep_in_queue: bool = False,
+        ) -> None:
             if self._target is not None:
                 self._recent_aim_index = self._target["index"]
                 self._recent_aim_drop = now
                 wait = cfg.target_cooldown if cooldown is None else max(0.0, cooldown)
                 lost = self._target["index"]
-                self._target_cooldown[lost] = now + wait
-                self._engage_q = [i for i in self._engage_q if i != lost]
-                if cooldown is not None and cooldown >= cfg.target_done_cooldown:
-                    self._given_up[self._target["index"]] = now + cooldown
+                if not keep_in_queue:
+                    self._target_cooldown[lost] = now + wait
+                    self._engage_q = [i for i in self._engage_q if i != lost]
+                    if cooldown is not None and cooldown >= cfg.target_done_cooldown:
+                        self._given_up[self._target["index"]] = now + cooldown
                 if self._shots_on_target:
                     self.targets_shot += 1
                     reason += f", {self._shots_on_target} выстр."
@@ -2152,6 +2191,17 @@ class Navigator:
             for e in fresh:
                 self._engage_q.append(e["index"])
 
+        def shootable(e: dict) -> bool:
+            return bool(e.get("vulnerable", True))
+
+        def next_shootable() -> dict | None:
+            """Первый в списке, кого уже можно убить. Неуязвимые место не теряют."""
+            for i in self._engage_q:
+                e = by_id.get(i)
+                if e is not None and shootable(e):
+                    return e
+            return None
+
         def acquire(e: dict, fast: bool) -> None:
             if self._target is not None and self._target["index"] == e["index"]:
                 self._target = dict(e)
@@ -2165,7 +2215,9 @@ class Navigator:
         self._target_visible_now = same is not None
 
         if cur is not None and not cur_alive:
-            has_next = any(i in by_id for i in self._engage_q if i != cur["index"])
+            has_next = any(
+                shootable(by_id[i]) for i in self._engage_q if i != cur["index"] and i in by_id
+            )
             self._pend_kill_step = True
             drop("убита", 0.0, unscope_knife=not has_next)
             cur = None
@@ -2177,14 +2229,27 @@ class Navigator:
                 self._engage_q.insert(0, same["index"])
             enqueue_new()
             self._engage_q = [i for i in self._engage_q if i == same["index"] or i in by_id]
-            self._target = dict(same)
-            self._target_last_seen = now
+            if shootable(same):
+                # выше по списку кто-то вышел из защиты — сначала добиваем текущую
+                self._target = dict(same)
+                self._target_last_seen = now
+            else:
+                nxt = next_shootable()
+                if nxt is not None:
+                    drop("неуязвима, дальше по списку", 0.0, unscope_knife=False, keep_in_queue=True)
+                    acquire(nxt, True)
+                    self._target_visible_now = True
+                else:
+                    drop("неуязвима", 0.0, unscope_knife=True, keep_in_queue=True)
         elif cur is not None:
             if self._target_lost_at is None:
                 self._target_lost_at = now
             enqueue_new()
             self._engage_q = [i for i in self._engage_q if i == cur["index"] or i in by_id]
-            others = [i for i in self._engage_q if i != cur["index"] and i in by_id]
+            others = [
+                i for i in self._engage_q
+                if i != cur["index"] and i in by_id and shootable(by_id[i])
+            ]
             # Рядом с прошлой точкой — один пропуск опроса не считается.
             # Другая уже видна и далеко от прицела (часто сзади) — берём её в этот же тик.
             if others:
@@ -2197,10 +2262,10 @@ class Navigator:
             else:
                 lost = cur["index"]
                 self._engage_q = [i for i in self._engage_q if i != lost and i in by_id]
-                has_next = bool(self._engage_q)
-                drop("пропала из виду", 0.0, unscope_knife=not has_next)
-                if self._engage_q:
-                    acquire(by_id[self._engage_q[0]], True)
+                nxt = next_shootable()
+                drop("пропала из виду", 0.0, unscope_knife=nxt is None)
+                if nxt is not None:
+                    acquire(nxt, True)
                     self._target_visible_now = True
         elif cand:
             self._target_lost_at = None
@@ -2209,8 +2274,9 @@ class Navigator:
             else:
                 self._engage_q = [i for i in self._engage_q if i in by_id]
                 enqueue_new()
-            if self._engage_q:
-                acquire(by_id[self._engage_q[0]], False)
+            nxt = next_shootable()
+            if nxt is not None:
+                acquire(nxt, False)
                 self._target_visible_now = True
         else:
             self._engage_q = []
@@ -2274,8 +2340,8 @@ class Navigator:
         return rho * math.cos(ang), 0.0, rho * math.sin(ang)
 
     def _sample_aim_bone(self, target: dict, x: float, y: float, z: float) -> None:
-        """Голова, либо 35% туловище, если видны обе. Видна только одна — только она.
-        Плечо — когда головы и туловища нет. Точка каждый раз новая, внутри радиуса кости."""
+        """Голова, либо 10% туловище, если видны обе. У AWP туловище чаще головы.
+        Видна только одна — только она. Плечо — когда головы и туловища нет."""
         cfg = self.cfg
         parts = self._visible_parts(target, x, y, z)
         allow: dict[str, bool] = {}
@@ -2283,8 +2349,9 @@ class Navigator:
             allow[part] = bool(target.get(f"{part}_visible")) or parts.get(part) is not None
 
         shoulders = [p for p in ("left_shoulder", "right_shoulder") if allow.get(p)]
+        chest_p = cfg.aim_chest_chance_awp if self._sniper_kind() == "awp" else cfg.aim_chest_chance
         if allow.get("head") and allow.get("chest"):
-            pick = "chest" if self._xx_u01() < cfg.aim_chest_chance else "head"
+            pick = "chest" if self._xx_u01() < chest_p else "head"
         elif allow.get("head"):
             pick = "head"
         elif allow.get("chest"):
@@ -2815,24 +2882,415 @@ class Navigator:
             if e.get("visible")
         )
 
-    def plan(self, pos: XYZ, goal_id: int | None = None) -> Route:
-        blocked = self._blocked_nodes()
+    def _ensure_workers(self) -> None:
+        """Скан мишеней и мир живут вне тика наведения, чтобы выход на мишень не стопорил мышь."""
+        if self._workers_on or not self.cfg.background_workers:
+            return
+        self._workers_on = True
+        self._scan_stop.clear()
+        threading.Thread(target=self._scan_loop, name="nav-scan", daemon=True).start()
+        threading.Thread(target=self._world_loop, name="nav-world", daemon=True).start()
+
+    def _stop_workers(self) -> None:
+        self._scan_stop.set()
+        self._workers_on = False
+
+    def _scan_loop(self) -> None:
+        interval = 1.0 / max(1.0, self.cfg.enemies_poll_hz)
+        while not self._scan_stop.is_set():
+            t0 = time.monotonic()
+            self._scan_positions()
+            self._scan_los_budget(0.004)
+            wait = interval - (time.monotonic() - t0)
+            if wait > 0 and self._scan_stop.wait(wait):
+                return
+
+    def _read_enemy_snap(self) -> list[dict] | None:
+        fn = getattr(self.reader, "enemies", None)
+        if not callable(fn):
+            fn = getattr(self.reader, "visible_enemies", None)
+        if not callable(fn):
+            return None
+        return [self._enemy_from_reader(ent) for ent in fn()]
+
+    def _scan_positions(self) -> None:
+        """Координаты публикуются сразу. Видимость костей догоняет отдельно и не старит точку прицела."""
+        try:
+            enemies = self._read_enemy_snap()
+        except Exception:
+            return
+        if enemies is None:
+            return
+        with self._scan_lock:
+            prev = {e["index"]: e for e in self._scan_enemies}
+        parts = ("head", "chest", "left_shoulder", "right_shoulder")
+        for e in enemies:
+            old = prev.get(e["index"])
+            if old is not None:
+                for part in parts:
+                    e[f"{part}_visible"] = bool(old.get(f"{part}_visible"))
+                e["visible"] = bool(old.get("visible"))
+            self._sync_visible_from_bones(e)
+            e["_scanned"] = True
+        with self._scan_lock:
+            self._scan_enemies = enemies
+            self._scan_visible = [e for e in enemies if e.get("visible") or e.get("spotted")]
+            self._scan_published = True
+
+    def _scan_los_budget(self, budget_s: float) -> None:
+        """Несколько костей за проход. Полный обход всех мишеней не блокирует новые координаты."""
+        try:
+            p = self.reader.local_position()
+        except Exception:
+            return
+        x, y, z = float(p.x), float(p.y), float(p.z)
+        eye = self._eye_z
+        vo = getattr(self.reader, "local_view_offset_z", None)
+        if callable(vo):
+            try:
+                eye = float(vo()) or eye
+            except Exception:
+                pass
+        with self._scan_lock:
+            enemies = list(self._scan_enemies)
+        if not enemies:
+            return
+        deadline = time.monotonic() + budget_s
+        n = len(enemies)
+        steps = 0
+        while time.monotonic() < deadline and steps < n:
+            e = enemies[self._los_cursor % n]
+            self._los_cursor += 1
+            steps += 1
+            apply_los_visibility(
+                e, self.map, x, y, z,
+                eye_z=eye,
+                hull_radius=self.map.cfg.hull_radius,
+                target_body_radius=self.cfg.target_body_radius,
+            )
+            self._sync_visible_from_bones(e)
+            e["_scanned"] = True
+            e["_vis_pos"] = (round(x), round(y), round(z))
+        with self._scan_lock:
+            self._scan_visible = [e for e in self._scan_enemies if e.get("visible") or e.get("spotted")]
+
+    def _scan_once(self) -> None:
+        """Полный проход: спавн и первый тик, когда фоновый список ещё пуст."""
+        self._scan_positions()
+        try:
+            p = self.reader.local_position()
+        except Exception:
+            return
+        x, y, z = float(p.x), float(p.y), float(p.z)
+        eye = self._eye_z
+        with self._scan_lock:
+            enemies = list(self._scan_enemies)
+        for e in enemies:
+            apply_los_visibility(
+                e, self.map, x, y, z,
+                eye_z=eye,
+                hull_radius=self.map.cfg.hull_radius,
+                target_body_radius=self.cfg.target_body_radius,
+            )
+            self._sync_visible_from_bones(e)
+            e["_scanned"] = True
+            e["_vis_pos"] = (round(x), round(y), round(z))
+        with self._scan_lock:
+            self._scan_visible = [e for e in self._scan_enemies if e.get("visible") or e.get("spotted")]
+
+    def _refresh_enemy_poses(self, enemies: list[dict]) -> None:
+        """Кости текущего кадра из памяти. Список скана может отставать на весь просчёт видимости."""
+        reader = self.reader
+        get = getattr(reader, "entity_by_index", None)
+        pawn_of = getattr(reader, "pawn_from_controller", None)
+        head_fn = getattr(reader, "pawn_head_position", None)
+        chest_fn = getattr(reader, "pawn_chest_position", None)
+        shoulder_fn = getattr(reader, "pawn_shoulder_positions", None)
+        backend = getattr(reader, "backend", None)
+        schema = getattr(reader, "schema", None)
+        if not all(callable(fn) for fn in (get, pawn_of, head_fn, chest_fn, shoulder_fn)):
+            return
+        if backend is None or schema is None:
+            return
+        for e in enemies:
+            if e.get("dormant"):
+                continue
+            try:
+                ctrl = get(int(e["index"]))
+                if not ctrl:
+                    continue
+                pawn = pawn_of(ctrl)
+                if not pawn:
+                    continue
+                origin = backend.read_vec3(pawn + schema.m_v_old_origin)
+                if not origin:
+                    continue
+                feet = Vec3(*origin)
+                head = head_fn(pawn, feet)
+                chest = chest_fn(pawn, feet, head)
+                left, right = shoulder_fn(pawn, feet, chest, head)
+                health = backend.read_i32(pawn + schema.m_i_health)
+                vel = backend.read_vec3(pawn + schema.m_vec_velocity)
+            except Exception:
+                continue
+            if head is not None and head_plausible(feet, head):
+                aim, ground = head, feet
+            else:
+                aim = head if head is not None else feet
+                ground = feet
+                if abs(aim.z - feet.z) < 24.0:
+                    aim = feet
+            e["position"] = (aim.x, aim.y, aim.z)
+            e["head_position"] = (aim.x, aim.y, aim.z)
+            e["feet"] = (ground.x, ground.y, ground.z)
+            if chest is not None and chest_plausible(feet, chest, head):
+                e["chest_position"] = (chest.x, chest.y, chest.z)
+            else:
+                e["chest_position"] = None
+
+            def _sh(sh) -> tuple[float, float, float] | None:
+                if sh is None or not shoulder_plausible(feet, sh, chest, head):
+                    return None
+                if abs(sh.x) < 1.0 and abs(sh.y) < 1.0 and abs(sh.z) < 1.0:
+                    return None
+                return (sh.x, sh.y, sh.z)
+
+            e["left_shoulder_position"] = _sh(left)
+            e["right_shoulder_position"] = _sh(right)
+            if health is not None:
+                e["health"] = int(health)
+            if vel is not None:
+                e["velocity"] = (float(vel[0]), float(vel[1]), float(vel[2]))
+            vuln = read_pawn_vulnerability(backend, schema, pawn)
+            e["vulnerable"] = vuln.vulnerable
+            e["spawn_immunity"] = vuln.spawn_immunity
+
+    def _consume_scan(self, now: float, pos: XYZ | None = None) -> None:
+        with self._scan_lock:
+            if not self._scan_published:
+                return
+            enemies = [dict(e) for e in self._scan_enemies]
+        self.all_enemies = enemies
+        self._refresh_enemy_poses(self.all_enemies)
+        self.visible_enemies = [e for e in enemies if e.get("visible") or e.get("spotted")]
+        alive_ids = {e["index"] for e in enemies}
+        for e in enemies:
+            idx = e["index"]
+            self._note_vulnerability(e, now)
+            if e.get("visible"):
+                self._known[idx] = {**e, "seen": now, "last_visible": now}
+            elif idx in self._known:
+                prev = self._known[idx]
+                self._known[idx] = {
+                    **e,
+                    "seen": prev.get("seen", now),
+                    "last_visible": prev.get("last_visible", 0.0),
+                }
+        forgotten: list[dict] = []
+        for idx in list(self._known):
+            if idx in alive_ids:
+                continue
+            forgotten.append(self._known.pop(idx))
+            self._immune_seen.discard(idx)
+            self._vuln_ready_at.pop(idx, None)
+        if forgotten:
+            for e in forgotten:
+                self.log(f"Мишень {e.get('name') or e['index']} пропала — забыли, продолжаем исходную цель")
+            if self._hunt and self._hunt["index"] in {e["index"] for e in forgotten}:
+                self._hunt = None
+                self._hunt_routed = None
+            if pos is not None and self.route is not None and not self._await_route and (
+                self._blockers_key() != self._route_blockers or self._standoff is not None
+            ):
+                self._replan(pos, "мишень пропала, продолжаем маршрут")
+        self.known_targets = list(self._known.values())
+
+    def _world_loop(self) -> None:
+        while not self._scan_stop.is_set():
+            t0 = time.monotonic()
+            try:
+                ladders = self._read_ladders()
+                doors = self._read_doors()
+                breaks = self._read_breakables()
+            except Exception:
+                ladders, doors, breaks = [], [], []
+            with self._world_lock:
+                if ladders:
+                    self._world_ladders = ladders
+                self._world_doors = doors
+                self._world_breakables = breaks
+                self._world_gen += 1
+            wait = 0.05 - (time.monotonic() - t0)
+            if wait > 0 and self._scan_stop.wait(wait):
+                return
+
+    def _apply_world(self, now: float, pos: XYZ, combat: bool) -> None:
+        with self._world_lock:
+            if self._world_gen == self._world_applied:
+                return
+            self._world_applied = self._world_gen
+            ladders = list(self._world_ladders)
+            doors = list(self._world_doors)
+            breaks = list(self._world_breakables)
+        if ladders and not self._ladders_linked:
+            self.ladders = ladders
+            n = self.map.attach_ladders(self.ladders)
+            if n and not self._ladders_linked:
+                self._ladders_linked = True
+                self.log(f"Лестницы: {len(self.ladders)} шт., {n} связей на карте")
+                if self.route is not None and not combat and not self._await_route:
+                    self._replan(pos, "лестницы подключены")
+        prev_blocked = self._doors_blocked
+        self.doors = doors
+        blocked = sum(1 for d in self.doors if self._door_blocks_route(d))
+        self._doors_blocked = blocked
+        if self.doors and blocked != prev_blocked and self.route is not None and not combat and not self._await_route:
+            self._replan(pos, "запертая дверь")
+        self.breakables = breaks
+        self._breakables_blocked = sum(
+            1 for br in self.breakables if not br.get("passable") and not br.get("broken")
+        )
+        if self.cfg.verbose_log and self.breakables and not self._breakables_logged:
+            self._breakables_logged = True
+            blocking = [br for br in self.breakables if not br.get("passable") and not br.get("broken")]
+            self.log(f"Решётки/окна: {len(self.breakables)} шт., {len(blocking)} на прострел")
+
+    def _request_plan(self, pos: XYZ, goal_id: int | None = None, *, new_goal: bool = False) -> None:
+        """A* не в тике наведения: пока маршрут считается, бот уже стреляет по видимым."""
+        with self._plan_lock:
+            if self._plan_busy:
+                self._plan_queued = (pos, goal_id, new_goal)
+                return
+            self._plan_busy = True
+        try:
+            blocked = self._blocked_nodes()
+            known = [dict(e) for e in self.known_targets]
+            given_up = dict(self._given_up)
+            now = self._now()
+            gen = self._route_gen
+            seed = int(self._xx_u01() * 4294967296.0) & 0xFFFFFFFF
+            intended = None if new_goal else self._intended_goal_id
+            current_goal = None if new_goal else (goal_id if goal_id is not None else self.goal_id)
+            exclude = set() if new_goal or self.goal_id is None else {self.goal_id}
+        except Exception:
+            with self._plan_lock:
+                self._plan_busy = False
+            raise
+
+        def work() -> None:
+            try:
+                result = self._plan_compute(
+                    pos, current_goal, blocked, known, given_up, now, seed, exclude, intended,
+                )
+                result["gen"] = gen
+            except Exception as exc:
+                result = {"gen": gen, "error": str(exc)}
+            with self._plan_lock:
+                if gen == self._route_gen:
+                    self._plan_ready = result
+                self._plan_busy = False
+
+        threading.Thread(target=work, name="nav-plan", daemon=True).start()
+
+    def _request_peek(self, pos: XYZ, peek_id: int) -> None:
+        """Путь до угла, откуда мишень видна. Считается отдельно, тик наведения не ждёт."""
+        with self._plan_lock:
+            if self._plan_busy:
+                return
+            self._plan_busy = True
+        gen = self._route_gen
+        blocked = set(self._blocked)
+        route_cfg = self.cfg.route
+
+        def work() -> None:
+            try:
+                pts = plan_route(self.map, pos, peek_id, route_cfg, blocked)
+                result: dict = {"gen": gen, "peek": True, "route": Route(pts), "peek_id": peek_id}
+            except Exception as exc:
+                result = {"gen": gen, "peek": True, "error": str(exc)}
+            with self._plan_lock:
+                if gen == self._route_gen:
+                    self._plan_ready = result
+                self._plan_busy = False
+
+        threading.Thread(target=work, name="nav-peek", daemon=True).start()
+
+    def _apply_ready_plan(self) -> None:
+        with self._plan_lock:
+            ready = self._plan_ready
+            self._plan_ready = None
+            queued = self._plan_queued
+            self._plan_queued = None
+            busy = self._plan_busy
+        if ready is not None and ready.get("gen") == self._route_gen:
+            if ready.get("peek"):
+                if ready.get("route") is not None:
+                    self.route = ready["route"]
+                    self.s = 0.0
+                    self._hunt_routed = ready.get("peek_id")
+                    self._await_route = False
+                elif ready.get("error"):
+                    self._hunt_routed = None
+                    self.log(f"  не удалось: {ready['error']}")
+            elif ready.get("error"):
+                self.log(f"  не удалось: {ready['error']}")
+            elif ready.get("route") is not None:
+                self._install_plan(ready)
+        if queued is not None and not busy:
+            pos, goal_id, new_goal = queued
+            self._request_plan(pos, goal_id, new_goal=new_goal)
+        elif queued is not None:
+            with self._plan_lock:
+                if self._plan_queued is None:
+                    self._plan_queued = queued
+
+    def _install_plan(self, result: dict) -> None:
+        self._intended_goal_id = result["intended"]
+        self.goal_id = result["goal_id"]
+        self._standoff = result["standoff"]
+        self._standoff_since = None
+        self.route = result["route"]
+        self.s = 0.0
+        self._stuck_level = 0
+        self._progress_s = 0.0
+        self._progress_at = self._now()
+        self._face_turn_since = None
+        self._route_blockers = self._blockers_key()
+        self._blocked = result["blocked"]
+        self._await_route = False
+        for msg in result.get("logs") or []:
+            self.log(msg)
+        if self.cfg.loop:
+            self._kick_prefetch()
+
+    def _plan_compute(
+        self,
+        pos: XYZ,
+        goal_id: int | None,
+        blocked: set[int],
+        known: list[dict],
+        given_up: dict,
+        now: float,
+        seed: int,
+        exclude: set[int],
+        intended: int | None,
+    ) -> dict:
+        rng = random.Random(seed)
+        logs: list[str] = []
         picking_new = goal_id is None
         if picking_new:
-            given_up_now = {e["index"] for e in self.known_targets if self._given_up.get(e["index"], 0.0) > self._now()}
+            given_up_now = {e["index"] for e in known if given_up.get(e["index"], 0.0) > now}
             use_blocked = blocked if given_up_now else set()
             if self.cfg.random_goals:
-                excl = {self.goal_id} if self.goal_id is not None else set()
-                goal_id = pick_random_goal(self.map, pos, self.cfg.route, use_blocked, self.rng, excl)
+                goal_id = pick_random_goal(self.map, pos, self.cfg.route, use_blocked, rng, exclude)
             else:
                 goal_id = pick_farthest_goal(self.map, pos, self.cfg.route, use_blocked)
-            self._intended_goal_id = goal_id
+            intended = goal_id
         else:
-            if self._intended_goal_id is None:
-                self._intended_goal_id = goal_id
-            goal_id = self._intended_goal_id
-        self._standoff = None
-        self._standoff_since = None
+            if intended is None:
+                intended = goal_id
+            goal_id = intended
+        standoff_id = None
 
         def try_route(blk: set[int]) -> list[XYZ] | None:
             try:
@@ -2842,14 +3300,13 @@ class Navigator:
 
         pts_clear = try_route(set())
         pts_blocked = try_route(blocked) if blocked else pts_clear
-        standoff = self._standoff_route(pos, goal_id) if blocked else None
-
+        standoff = self._standoff_route(pos, goal_id, known, given_up, now) if blocked else None
         extra = ""
         if blocked and self._prefer_standoff(pos, pts_clear, pts_blocked, standoff):
             pts, blocker = standoff  # type: ignore[misc]
-            self._standoff = blocker["index"]
+            standoff_id = blocker["index"]
             extra = f" → стоим перед {blocker.get('name') or blocker['index']}"
-            self.log(
+            logs.append(
                 f"Проход перекрыт мишенью {blocker.get('name') or blocker['index']} "
                 f"→ подходим на дистанцию выстрела, цель та же"
             )
@@ -2857,7 +3314,7 @@ class Navigator:
             if (
                 pts_clear is not None
                 and blocked
-                and self._hidden_blocks_reverse(pos, pts_clear, pts_blocked)
+                and self._hidden_blocks_reverse(pos, pts_clear, pts_blocked, known, given_up, now)
             ):
                 pts = pts_clear
                 extra = " → к скрытой по прямому пути"
@@ -2865,9 +3322,9 @@ class Navigator:
                 pts = pts_blocked
         elif standoff is not None:
             pts, blocker = standoff
-            self._standoff = blocker["index"]
+            standoff_id = blocker["index"]
             extra = f" → стоим перед {blocker.get('name') or blocker['index']}"
-            self.log(
+            logs.append(
                 f"Проход перекрыт мишенью {blocker.get('name') or blocker['index']} "
                 f"→ подходим на дистанцию выстрела, цель та же"
             )
@@ -2875,32 +3332,48 @@ class Navigator:
             pts = pts_clear
         else:
             alt = (
-                pick_random_goal(self.map, pos, self.cfg.route, blocked, self.rng)
+                pick_random_goal(self.map, pos, self.cfg.route, blocked, rng)
                 if self.cfg.random_goals
                 else pick_farthest_goal(self.map, pos, self.cfg.route, blocked)
             )
             pts = plan_route(self.map, pos, alt, self.cfg.route, blocked)
-            self.log("Цель недостижима → другая точка")
-            self._intended_goal_id = alt
+            logs.append("Цель недостижима → другая точка")
+            intended = alt
             goal_id = alt
-        self.goal_id = goal_id
-        self.route = Route(pts)
-        self.s = 0.0
-        self._stuck_level = 0
-        self._progress_s = 0.0
-        self._progress_at = self._now()
-        self._face_turn_since = None
-        self._route_blockers = self._blockers_key()
-        self._blocked = blocked
+        route = Route(pts)
         g = self.map.nodes[goal_id]
-        self.log(
-            f"Маршрут: {len(pts)} вершин, {self.route.length:.0f}u → цель "
+        logs.append(
+            f"Маршрут: {len(pts)} вершин, {route.length:.0f}u → цель "
             f"({g.x:.0f},{g.y:.0f},{g.z:.0f}) clearance={g.clearance:.0f}"
             + (f", обход мишеней: {len(blocked)} клеток" if blocked else "")
-            +             extra
+            + extra
         )
-        if self.cfg.loop:
-            self._kick_prefetch()
+        return {
+            "route": route,
+            "goal_id": goal_id,
+            "intended": intended,
+            "standoff": standoff_id,
+            "blocked": blocked,
+            "logs": logs,
+        }
+
+    def plan(self, pos: XYZ, goal_id: int | None = None) -> Route:
+        """Синхронная сборка — для вызовов вне тика. В бою маршрут считается в nav-plan."""
+        seed = int(self._xx_u01() * 4294967296.0) & 0xFFFFFFFF
+        exclude = {self.goal_id} if self.goal_id is not None else set()
+        result = self._plan_compute(
+            pos,
+            goal_id,
+            self._blocked_nodes(),
+            [dict(e) for e in self.known_targets],
+            dict(self._given_up),
+            self._now(),
+            seed,
+            exclude,
+            self._intended_goal_id,
+        )
+        self._install_plan(result)
+        assert self.route is not None
         return self.route
 
     def _path_bearing(self, pos: XYZ, pts: list[XYZ], ahead: float = 80.0) -> float | None:
@@ -2935,7 +3408,13 @@ class Navigator:
         return False
 
     def _hidden_blocks_reverse(
-        self, pos: XYZ, pts_clear: list[XYZ], pts_blocked: list[XYZ]
+        self,
+        pos: XYZ,
+        pts_clear: list[XYZ],
+        pts_blocked: list[XYZ],
+        known: list[dict] | None = None,
+        given_up: dict | None = None,
+        now: float | None = None,
     ) -> bool:
         """Скрытая мишень на прямом пути, а обход разворачивает назад — идём к углу, не к старту."""
         bc = self._path_bearing(pos, pts_clear)
@@ -2947,9 +3426,20 @@ class Navigator:
         ) or Route(pts_blocked).length > Route(pts_clear).length * 1.25 + 80.0
         if not reverse:
             return False
-        now = self._now()
+        now = self._now() if now is None else now
         route = Route(pts_clear)
-        for e in self._hidden_enemies(now):
+        if known is None:
+            hidden = self._hidden_enemies(now)
+        else:
+            gave = self._given_up if given_up is None else given_up
+            hidden = [
+                e for e in known
+                if not e.get("visible")
+                and not e.get("dormant")
+                and e.get("last_visible", 0.0) > 0.0
+                and gave.get(e["index"], 0.0) <= now
+            ]
+        for e in hidden:
             fx, fy, _ = self._enemy_feet(e)
             d = 0.0
             while d <= min(route.length, 480.0):
@@ -2959,16 +3449,25 @@ class Navigator:
                 d += 16.0
         return False
 
-    def _standoff_route(self, pos: XYZ, goal_id: int) -> tuple[list[XYZ], dict] | None:
+    def _standoff_route(
+        self,
+        pos: XYZ,
+        goal_id: int,
+        known: list[dict] | None = None,
+        given_up: dict | None = None,
+        now: float | None = None,
+    ) -> tuple[list[XYZ], dict] | None:
         """Маршрут к цели без учёта мишеней, обрезанный за standoff_dist до первой мишени на нём.
         None — если стрельба выключена, по мишени уже отстрелялись (не уходит) или обрезать нечего."""
         cfg = self.cfg
-        if not cfg.fire_enabled or not self.known_targets:
+        known = self.known_targets if known is None else known
+        gave = self._given_up if given_up is None else given_up
+        if not cfg.fire_enabled or not known:
             return None
-        now = self._now()
+        now = self._now() if now is None else now
         live = [
-            e for e in self.known_targets
-            if self._given_up.get(e["index"], 0.0) <= now and e.get("visible")
+            e for e in known
+            if gave.get(e["index"], 0.0) <= now and e.get("visible")
         ]
         if not live:
             return None
@@ -3003,9 +3502,14 @@ class Navigator:
     def _replan(self, pos: XYZ, reason: str, new_goal: bool = False) -> None:
         self.replans += 1
         self.log(f"Перестроение маршрута ({reason})")
+        if new_goal:
+            self._intended_goal_id = None
+        if self.cfg.background_workers:
+            self._request_plan(
+                pos, None if new_goal else (self._intended_goal_id or self.goal_id), new_goal=new_goal,
+            )
+            return
         try:
-            if new_goal:
-                self._intended_goal_id = None
             self.plan(pos, None if new_goal else (self._intended_goal_id or self.goal_id))
         except RuntimeError as exc:
             self.log(f"  не удалось: {exc}")
@@ -3041,6 +3545,7 @@ class Navigator:
         self._flick = None
         self._flick_pending = False
         self._habit = None
+        self._cover_jiggle = None
         self._brake = False
         self._pause_until = 0.0
         self._ladder = None
@@ -3081,11 +3586,16 @@ class Navigator:
         self._hpshot_thr = None
         self._ladder = None
         self._crouch_until = 0.0
-        try:
-            self.plan(pos)
-            self.log("Респавн — новый случайный маршрут")
-        except RuntimeError as exc:
-            self.log(f"Респавн: маршрут не построен ({exc})")
+        if self.cfg.background_workers:
+            self._await_route = True
+            self._request_plan(pos)
+            self.log("Респавн — маршрут считается отдельно, видимые берём сразу")
+        else:
+            try:
+                self.plan(pos)
+                self.log("Респавн — новый случайный маршрут")
+            except RuntimeError as exc:
+                self.log(f"Респавн: маршрут не построен ({exc})")
 
     def _kick_prefetch(self) -> None:
         """Пока идём — в фоне A* до следующей случайной точки (карта не пересобирается)."""
@@ -3152,6 +3662,9 @@ class Navigator:
             )
             self._kick_prefetch()
             return True
+        if self.cfg.background_workers:
+            self._request_plan(pos)
+            return False
         try:
             self.plan(pos)
             return self.route is not None
@@ -4958,6 +5471,60 @@ class Navigator:
             return {"a"} if st["side"] < 0 else {"d"}
         return self._counter_strafe_keys(vx, vy, speed, yaw_next)
 
+    def _cover_cant_fight(self) -> bool:
+        """Перезарядка или медшприц: стрелять ещё нельзя."""
+        if self._weapon_ready():
+            return False
+        h = self._habit
+        kind = h.get("kind") if h else None
+        if kind in {"reload", "healthshot"}:
+            return True
+        return bool(self.weapon.get("in_reload"))
+
+    def _cover_targets_visible(self) -> bool:
+        for e in self.all_enemies:
+            if e.get("dormant"):
+                continue
+            if int(e.get("health") or 0) <= 0:
+                continue
+            if e.get("visible"):
+                return True
+        return False
+
+    def _sample_cover_dist(self) -> float:
+        return max(16.0, self._xx_band(self.cfg.cover_jiggle_dist, self.cfg.cover_jiggle_dist_err))
+
+    def _cover_jiggle_tick(self, now: float, x: float, y: float, speed: float) -> None:
+        """Влево-вправо, пока нельзя стрелять и кто-то виден. Каждый заход — свой xxHash."""
+        if not self._cover_cant_fight() or not self._cover_targets_visible():
+            self._cover_jiggle = None
+            return
+        st = self._cover_jiggle
+        if st is None:
+            side = -1 if self._xx_u01() < 0.5 else 1
+            dist = self._sample_cover_dist()
+            self._cover_jiggle = {"side": side, "dist": dist, "ox": x, "oy": y, "t0": now}
+            self.log(f"Манс {'A' if side < 0 else 'D'} на {dist:.0f}u")
+            return
+        traveled = math.hypot(x - float(st["ox"]), y - float(st["oy"]))
+        stuck = speed < 38.0 and now - float(st["t0"]) > 0.28
+        timeout = now - float(st["t0"]) > float(st["dist"]) / 90.0 + 0.28
+        if traveled < float(st["dist"]) and not stuck and not timeout:
+            return
+        side = -int(st["side"])
+        dist = self._sample_cover_dist()
+        st["side"] = side
+        st["dist"] = dist
+        st["ox"], st["oy"] = x, y
+        st["t0"] = now
+        self.log(f"Манс {'A' if side < 0 else 'D'} на {dist:.0f}u")
+
+    def _cover_jiggle_keys(self) -> set[str] | None:
+        st = self._cover_jiggle
+        if st is None:
+            return None
+        return {"a"} if int(st["side"]) < 0 else {"d"}
+
     def _counter_strafe_keys(
         self, vx: float, vy: float, speed: float, yaw_next: float, min_speed: float = 60.0
     ) -> set[str]:
@@ -4977,6 +5544,7 @@ class Navigator:
         dt = 1.0 / cfg.tick_hz if self._last_t is None else max(0.005, min(0.1, now - self._last_t))
         self._last_t = now
         self._tick_no += 1
+        self._ensure_workers()
         self._release_fire_if_due()
         self._release_scope_if_due()
 
@@ -4998,7 +5566,11 @@ class Navigator:
         self.life = self._read_life()
         self._mem_shots = self._read_shots_fired()
         self._scoped_now = self._read_scoped()
-        if now >= self._enemies_next_poll:
+        if self.cfg.background_workers:
+            if not self._scan_published:
+                self._scan_once()
+            self._consume_scan(now, (x, y, z))
+        elif now >= self._enemies_next_poll:
             self._enemies_next_poll = now + 1.0 / max(1.0, cfg.enemies_poll_hz)
             self.all_enemies = self._read_enemies()
             for e in self.all_enemies:
@@ -5047,9 +5619,12 @@ class Navigator:
             or self._flick_pending
             or (self._target is not None)
         )
-        self._sync_ladders(now, (x, y, z), combat)
-        self._sync_doors(now, (x, y, z), combat)
-        self._sync_breakables(now, (x, y, z), combat)
+        if self.cfg.background_workers:
+            self._apply_world(now, (x, y, z), combat)
+        else:
+            self._sync_ladders(now, (x, y, z), combat)
+            self._sync_doors(now, (x, y, z), combat)
+            self._sync_breakables(now, (x, y, z), combat)
         if combat:
             if not self._cal_frozen:
                 self._cal_win.clear()
@@ -5093,6 +5668,9 @@ class Navigator:
             return info
         if self._dead or respawned:
             self._on_respawn((x, y, z))
+            if self.cfg.background_workers:
+                self._scan_once()
+                self._consume_scan(now)
 
         if self.done:
             self.release()
@@ -5108,6 +5686,8 @@ class Navigator:
 
         # мягкое «покачивание» мышью (синус вправо-влево, суммарно ноль): узнаём реальную
         # чувствительность и знак до того, как начнём крутить камеру всерьёз — без рывка на старте
+        if self.visible_enemies and self._precal_left > 0:
+            self._precal_left = 0
         if self._precal_left > 0 and cfg.calibrate_online:
             i = cfg.precal_ticks - self._precal_left
             self._precal_left -= 1
@@ -5127,8 +5707,15 @@ class Navigator:
             info["action"] = "precal"
             return info
 
+        if self.cfg.background_workers:
+            self._apply_ready_plan()
         if self.route is None:
-            self.plan((x, y, z))
+            if self.cfg.background_workers:
+                self._request_plan((x, y, z))
+                self.route = Route([(x, y, z), (x, y, z)])
+                self._await_route = True
+            else:
+                self.plan((x, y, z))
         route = self.route
         assert route is not None
 
@@ -5136,7 +5723,7 @@ class Navigator:
         self.s, off = route.project(x, y, self.s, z=z)
         gx, gy, gz = route.goal
         goal_d = math.hypot(gx - x, gy - y)
-        if off > cfg.off_route_replan and self._ladder is None:
+        if off > cfg.off_route_replan and self._ladder is None and not self._await_route:
             self._replan((x, y, z), f"ушли с маршрута на {off:.0f}u")
             route = self.route
             assert route is not None
@@ -5149,6 +5736,7 @@ class Navigator:
             self._noprog_replans = 0
         elif (
             self._ladder is None
+            and not self._await_route
             and now - self._progress_at > 2.5
             and goal_d > cfg.arrive_radius + 24.0
         ):
@@ -5193,23 +5781,27 @@ class Navigator:
                 and hunt.get("via")
                 and hunt.get("peek_id") is not None
                 and hunt.get("peek_id") != self._hunt_routed
+                and not self._plan_busy
             ):
-                try:
-                    pts = plan_route(
-                        self.map, (x, y, z), hunt["peek_id"], cfg.route, self._blocked
-                    )
-                    self.route = Route(pts)
-                    self.s = 0.0
-                    self._hunt_routed = hunt["peek_id"]
-                    route = self.route
-                    self.s, off = route.project(x, y, None, z=z)
-                    pk = hunt["peek"]
-                    self.log(
-                        f"Заход на позицию для выстрела @ ({pk[0]:.0f},{pk[1]:.0f}) "
-                        f"по {hunt['index']}, цель маршрута та же"
-                    )
-                except RuntimeError:
-                    self._hunt_routed = None
+                pk = hunt["peek"]
+                self.log(
+                    f"Заход на позицию для выстрела @ ({pk[0]:.0f},{pk[1]:.0f}) "
+                    f"по {hunt['index']}, цель маршрута та же"
+                )
+                if self.cfg.background_workers:
+                    self._request_peek((x, y, z), int(hunt["peek_id"]))
+                else:
+                    try:
+                        pts = plan_route(
+                            self.map, (x, y, z), hunt["peek_id"], cfg.route, self._blocked
+                        )
+                        self.route = Route(pts)
+                        self.s = 0.0
+                        self._hunt_routed = hunt["peek_id"]
+                        route = self.route
+                        self.s, off = route.project(x, y, None, z=z)
+                    except RuntimeError:
+                        self._hunt_routed = None
             elif prev_via and prev_via[0] and (hunt is None or not hunt.get("via")):
                 self._hunt_routed = None
                 still = next((t for t in self.known_targets if t["index"] == prev_via[2]), None)
@@ -5223,8 +5815,8 @@ class Navigator:
                     assert route is not None
                     self.s, off = route.project(x, y, None, z=z)
 
-        hold = False
-        if self._standoff is not None and goal_d <= cfg.arrive_radius + 16.0:
+        hold = bool(self._await_route)
+        if self._standoff is not None and goal_d <= cfg.arrive_radius + 16.0 and not self._await_route:
             # дошли до дистанции выстрела: стоим и ждём, пока мишень пропадёт. Не считаем это финишем.
             if self._standoff_since is None:
                 self._standoff_since = now
@@ -5298,6 +5890,7 @@ class Navigator:
 
         if (
             not hold
+            and not self._plan_busy
             and self._standoff is None
             and self._ladder is None
             and dest_d <= cfg.arrive_radius
@@ -5553,6 +6146,8 @@ class Navigator:
 
         self._unscope_tick(now)
 
+        self._cover_jiggle_tick(now, x, y, speed)
+
         # клавиши считаем относительно yaw, каким он будет после этого шага мыши
         yaw_next = yaw + d_yaw
         move_bearing = self._steer_bearing(x, y, v.x, v.y, cx_, cy_)
@@ -5560,8 +6155,11 @@ class Navigator:
         climbing = self._ladder is not None and (
             self._read_on_ladder() or self._ladder.get("phase") in ("climb", "mount", "exit")
         )
+        jiggling = self._cover_jiggle is not None
         if self._ladder is not None and (not self.firing or climbing):
             keys = self._ladder_keys(x, y, z, yaw_next, speed)
+        elif jiggling:
+            keys = self._cover_jiggle_keys() or set()
         elif self.firing:
             st = self._combat_strafe
             sidestep_go = bool(st and st.get("kill_step") and st.get("phase") == "go")
@@ -5593,7 +6191,7 @@ class Navigator:
         if goal_d < brake_d and speed > 60.0 and not cfg.loop:
             self._brake = True
         awp_stopping = self._awp_first_stop and self._sniper_kind() == "awp" and speed > 8.0
-        if (self._brake or hold) and self._ladder is None and not awp_stopping:
+        if (self._brake or hold) and self._ladder is None and not awp_stopping and not jiggling:
             keys = set()
 
         # прыжок по маршруту: 57u обычный, 64u с приседом; выше — не прыгаем, обходим
@@ -5601,6 +6199,7 @@ class Navigator:
         if (
             self._ladder is None
             and not awp_stopping
+            and not jiggling
             and speed > 28.0
             and now - self._last_jump_at >= 0.55
             and math.hypot(cx_ - x, cy_ - y) < 64.0
@@ -5609,7 +6208,7 @@ class Navigator:
             if climb:
                 self._do_climb(climb, now)
 
-        if self._ladder is None and not awp_stopping:
+        if self._ladder is None and not awp_stopping and not jiggling:
             override = self._handle_stuck(now, (x, y, z), speed, keys, rel)
             if override is not None:
                 keys = override
@@ -5716,6 +6315,7 @@ class Navigator:
                 if sleep > 0:
                     time.sleep(sleep)
         finally:
+            self._stop_workers()
             self.release()
             self.input.release_all()
         return reason
