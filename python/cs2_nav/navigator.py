@@ -42,6 +42,7 @@ from cs2_nav.pathfinder import (
 from cs2_nav.route import Route
 from cs2_reader.aim import (
     chest_plausible,
+    clamp_pitch,
     forward_from_angles,
     head_plausible,
     shoulder_plausible,
@@ -463,6 +464,8 @@ class Navigator:
         self._lat_sign = 0
         self._tgt_lat = 0.0
         self._tgt_aim_dist = 400.0
+        self._aim_omega = (0.0, 0.0)          # °/с точки на кости между тиками
+        self._aim_omega_ang: tuple[float, float] | None = None
         self._track_aim = [0.0, 0.0]
         self._aim_steady: tuple[float, float] | None = None
         self._aim_steady_d = (0.0, 0.0)
@@ -2085,6 +2088,8 @@ class Navigator:
             self._target_seen_at = now
             self._target_last_seen = now
             h = self._hunt
+            self._aim_omega = (0.0, 0.0)
+            self._aim_omega_ang = None
             peeking = h is not None and h.get("index") == e["index"]
             style = h.get("style") if peeking else None
             lo, hi = cfg.target_reaction
@@ -2207,6 +2212,8 @@ class Navigator:
             self._track_aim = [0.0, 0.0]
             self._aim_steady = None
             self._aim_steady_d = (0.0, 0.0)
+            self._aim_omega = (0.0, 0.0)
+            self._aim_omega_ang = None
             self._begin_unscope(use_knife=unscope_knife)
             self._scope_plan = None
             self._scope_committed = False
@@ -4610,6 +4617,32 @@ class Navigator:
             yaw_err = self._turn_commit * abs(yaw_err)
         return yaw_err, pitch_err
 
+    def _note_aim_omega(self, aim_yaw: float, aim_pitch: float, dt: float) -> None:
+        """Скорость самой точки, не камеры. Скачок на новую мишень — не скорость."""
+        prev = self._aim_omega_ang
+        self._aim_omega_ang = (aim_yaw, aim_pitch)
+        if prev is None or dt < 1e-4 or dt > 0.08:
+            self._aim_omega = (0.0, 0.0)
+            return
+        dy = shortest_yaw_err(aim_yaw, prev[0])
+        dp = aim_pitch - prev[1]
+        if math.hypot(dy, dp) > 45.0:
+            self._aim_omega = (0.0, 0.0)
+            return
+        self._aim_omega = (dy / dt, dp / dt)
+
+    def _close_omega(self) -> tuple[float, float]:
+        """В упор точка уходит на сотни °/с. Дальше прежний тормоз, как будто она стоит."""
+        dist = self._tgt_aim_dist
+        near = self.cfg.aim_close_dist
+        far = near * 2.0
+        if dist >= far:
+            return 0.0, 0.0
+        t = 1.0 if dist <= near else (far - dist) / max(1.0, far - near)
+        wy, wp = self._aim_omega
+        cap = 3200.0
+        return max(-cap, min(cap, wy * t)), max(-cap, min(cap, wp * t))
+
     def _aim_ramp(
         self,
         yaw_err: float,
@@ -4628,19 +4661,27 @@ class Navigator:
         if mag < 1e-4 or dt <= 0.0:
             return 0.0, 0.0
         ux, uy = yaw_err / mag, pitch_err / mag
+        oy, op = self._close_omega()
         v_along = self._yaw_rate * ux + self._pitch_rate * uy
+        w_along = oy * ux + op * uy
+        rel = v_along - w_along
         v_kin = math.sqrt(max(0.0, 2.0 * acc * mag))
-        # запас на остановку остаётся, но потолок не сбрасывается почти в ноль:
-        # иначе прицел замирает рядом с точкой и выстрел уходит мимо
-        if v_along > v_kin * 0.95:
-            cap = max(0.0, v_kin * 0.62)
+        # тормозим только лишнюю скорость сверх движения точки.
+        # иначе в упор потолок — скорость остановки на стоячей точке, и прицел ползёт
+        if rel > v_kin * 0.95:
+            catch = max(0.0, v_kin * 0.62)
         else:
-            cap = min(final_rate, v_kin * 0.95)
-        if mag < 4.0 and v_along <= v_kin * 0.95:
+            catch = min(final_rate, v_kin * 0.95)
+        if mag < 4.0 and rel <= v_kin * 0.95:
             close_v = min(final_rate, mag / max(dt, 1e-4))
-            cap = max(cap, min(close_v, v_kin * 0.95))
-        des_y = ux * cap
-        des_p = uy * cap
+            catch = max(catch, min(close_v, v_kin * 0.95))
+        des_y = oy + ux * catch
+        des_p = op + uy * catch
+        des_mag = math.hypot(des_y, des_p)
+        if des_mag > final_rate and des_mag > 1e-6:
+            scale = final_rate / des_mag
+            des_y *= scale
+            des_p *= scale
         self._yaw_rate, self._yaw_acc = self._track_rate(
             self._yaw_rate, self._yaw_acc, des_y, dt, acc, jerk
         )
@@ -4654,11 +4695,11 @@ class Navigator:
         d_pitch += wp
         if abs(d_yaw) > abs(yaw_err):
             d_yaw = yaw_err
-            self._yaw_rate = 0.0
+            self._yaw_rate = max(-final_rate, min(final_rate, oy))
             self._yaw_acc = 0.0
         if abs(d_pitch) > abs(pitch_err):
             d_pitch = pitch_err
-            self._pitch_rate = 0.0
+            self._pitch_rate = max(-final_rate, min(final_rate, op))
             self._pitch_acc = 0.0
         if mag < 2.5:
             d_yaw = self._deg_not_past(d_yaw, yaw_err, self._axis_k(True), yaw=True)
@@ -4708,6 +4749,7 @@ class Navigator:
             jerk = self._turn_jerk
         g = cfg.aim_lock_gain
         close = math.hypot(yaw_err, pitch_err) < 1.5
+        wy, wp = self._close_omega()
         scoped = self._scoped_now and not self._chase_on
         if close:
             # До точки быстро. Внутри полпикселя стоим: лишний пиксель перебрасывает прицел.
@@ -4720,10 +4762,12 @@ class Navigator:
                 g = 480.0 if self._chase_on else 320.0
                 r = min(r, 720.0 if self._chase_on else 420.0)
                 acc = min(acc, 2800.0)
+                phase = self._chase_rate if self._chase_on else self._aim_rate
+                r = min(phase, max(r, abs(wy), abs(wp)))
             jerk = min(jerk, cfg.yaw_jerk_max)
         lag = dt
-        ey = yaw_err - self._yaw_rate * lag
-        ep = pitch_err - self._pitch_rate * lag
+        ey = yaw_err - (self._yaw_rate - wy) * lag
+        ep = pitch_err - (self._pitch_rate - wp) * lag
         hold = self._half_px_deg()
         if scoped:
             hold = max(hold, cfg.fire_tolerance_deg * 0.6)
@@ -4732,8 +4776,10 @@ class Navigator:
             ep = 0.0
         vmax_y = math.sqrt(2.0 * 0.7 * acc * abs(ey)) if ey else 0.0
         vmax_p = math.sqrt(2.0 * 0.7 * acc * abs(ep)) if ep else 0.0
-        des_y = max(-min(r, vmax_y), min(min(r, vmax_y), g * ey))
-        des_p = max(-min(r, vmax_p), min(min(r, vmax_p), g * ep))
+        catch_y = max(-min(r, vmax_y), min(min(r, vmax_y), g * ey))
+        catch_p = max(-min(r, vmax_p), min(min(r, vmax_p), g * ep))
+        des_y = max(-r, min(r, wy + catch_y))
+        des_p = max(-r, min(r, wp + catch_p))
         self._yaw_rate, self._yaw_acc = self._track_rate(self._yaw_rate, self._yaw_acc, des_y, dt, acc, jerk)
         self._pitch_rate, self._pitch_acc = self._track_rate(self._pitch_rate, self._pitch_acc, des_p, dt, acc, jerk)
         d_yaw = self._yaw_rate * dt
@@ -4744,9 +4790,9 @@ class Navigator:
             d_pitch += wp
         # лишний шаг за точку забираем. Скорость после посадки — угловая скорость мишени:
         # 0, если она стоит, иначе прицел не отстаёт от овала и выстрел не пропадает.
-        carry = 0.0
-        if self._chase_on:
-            # atan, не «радианы = единицы/дистанция»: иначе посадка ставит сотни °/с и прицел срывается
+        carry = wy
+        if abs(wy) < 1.0 and self._chase_on:
+            # далеко угловая скорость маленькая; atan не разгоняет посадку до сотен °/с
             carry = math.degrees(math.atan2(self._tgt_lat, max(80.0, self._tgt_aim_dist)))
             carry = max(-90.0, min(90.0, carry))
         if abs(d_yaw) > abs(yaw_err) and abs(yaw_err) < 1.5:
@@ -4755,13 +4801,13 @@ class Navigator:
             self._yaw_acc = 0.0
         if abs(d_pitch) > abs(pitch_err) and abs(pitch_err) < 1.5:
             d_pitch = pitch_err
-            self._pitch_rate = 0.0
+            self._pitch_rate = max(-r, min(r, wp))
             self._pitch_acc = 0.0
         # у точки не нести скорость дальше: иначе прицел рисует кружок вокруг мишени
         quiet = 1.15 if self._scoped_now else 0.55
         if math.hypot(yaw_err, pitch_err) < quiet and not self._chase_on:
-            self._yaw_rate *= 0.2
-            self._pitch_rate *= 0.2
+            self._yaw_rate = wy + (self._yaw_rate - wy) * 0.2
+            self._pitch_rate = wp + (self._pitch_rate - wp) * 0.2
             self._yaw_acc = 0.0
             self._pitch_acc = 0.0
         d_yaw = self._deg_not_past(d_yaw, yaw_err, self._axis_k(True), yaw=True)
@@ -6051,7 +6097,7 @@ class Navigator:
             if self._rcs_active():
                 rcs_y, rcs_p = self._rcs_offset(now)
             look_yaw = aim_yaw + rcs_y
-            pitch_target = max(-60.0, min(60.0, aim_pitch + rcs_p))
+            pitch_target = clamp_pitch(aim_pitch + rcs_p)
             lx, ly = self._target_aim_xyz(target, x, y)[:2]
             look_mode = "aim"
         elif break_target is not None:
@@ -6142,10 +6188,11 @@ class Navigator:
             self._update_aim_chase(target, x, y, dt, now)
             if self._rcs_return:
                 look_yaw = aim_yaw
-                pitch_target = max(-60.0, min(60.0, aim_pitch))
+                pitch_target = clamp_pitch(aim_pitch)
                 yaw_err = shortest_yaw_err(look_yaw, yaw)
                 pitch_err = pitch_target - mem_pitch
             # рука: сначала как на маршруте (та же скорость), затем флик если угол ≥ 30°
+            self._note_aim_omega(aim_yaw, aim_pitch, dt)
             d_yaw, d_pitch, aim_phase = self._aim_step(
                 now, dt, yaw_err, pitch_err, aim_yaw, aim_pitch, speed, aim_dist
             )
@@ -6173,6 +6220,7 @@ class Navigator:
                 self.log(f"Огонь по решётке ({self.weapon.get('name') or '?'})")
             self.firing = cfg.fire_enabled
             self._update_aim_chase(break_target, x, y, dt, now)
+            self._note_aim_omega(aim_yaw, aim_pitch, dt)
             d_yaw, d_pitch, aim_phase = self._aim_step(
                 now, dt, yaw_err, pitch_err, aim_yaw, aim_pitch, speed, aim_dist
             )
