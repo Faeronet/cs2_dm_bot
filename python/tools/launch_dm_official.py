@@ -128,8 +128,8 @@ def launch_until_spawn(
                      log=log_fn)
 
     def step(name: str, *, settle: float = 1.1) -> None:
-        fx, fy = CLICKS[name]
-        ok = clicker.click_frac(fx, fy, settle=settle)
+        # Точка заново с кадра: другое окно, пропорция и полный экран не сдвигают её.
+        ok = clicker.click_live(name, settle=settle)
         log_fn(f"click {name} -> {'ok' if ok else 'FAIL (нет окна CS2)'}")
         if shots:
             root_shot(env, f"/tmp/dmof_{name}.png")
@@ -210,11 +210,10 @@ def wait_spawn(
                 log_fn("  [shot] экран выбора команды → /tmp/dmof_teamselect.png")
             shot_team = True
             if team_clicks < 6 and now - last_action > 3:
-                fx, fy = CLICKS["auto_select"]
-                clicker.click_frac(fx, fy, settle=0.8)
+                ok = clicker.click_live("auto_select", settle=0.8)
                 team_clicks += 1
                 last_action = now
-                log_fn(f"  выбор команды: клик AUTO-SELECT @({fx},{fy}) "
+                log_fn(f"  выбор команды: клик AUTO-SELECT -> {'ok' if ok else 'FAIL'} "
                        f"(попытка {team_clicks}/6)")
         time.sleep(0.25)
 

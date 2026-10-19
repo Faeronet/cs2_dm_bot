@@ -37,14 +37,14 @@ def root_shot(env: dict, out: str, *, size: tuple[int, int] = (SCREEN_W, SCREEN_
     disp = env.get("DISPLAY", ":1")
     w, h = size
     try:
-        subprocess.run(
+        proc = subprocess.run(
             ["ffmpeg", "-y", "-f", "x11grab", "-video_size", f"{w}x{h}",
              "-i", f"{disp}+0,0", "-frames:v", "1", "-update", "1", out],
             env=env, capture_output=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return Path(out).exists()
+    return proc.returncode == 0 and Path(out).exists()
 
 
 def detect_content_offset(shot_path: str, win: tuple[int, int, int, int]) -> int | None:
@@ -183,6 +183,51 @@ class ScreenClicker:
             return None
         x, y, w, h = rect
         return int(round(x + fx * w)), int(round(y + fy * h))
+
+    def capture_client(self):
+        """Кадр окна и игровое поле внутри рамки. None, если окна нет."""
+        from PIL import Image
+
+        from cs2_menu.live_ui import Frame, detect_client
+
+        rect = self.window_rect()
+        if not rect or self._env is None:
+            return None
+        shot = "/tmp/_menu_client.png"
+        if not root_shot(self._env, shot):
+            return None
+        x, y, w, h = rect
+        full = Image.open(shot).convert("RGB")
+        im = full.crop((
+            max(0, x), max(0, y),
+            min(full.size[0], x + w), min(full.size[1], y + h),
+        ))
+        return Frame(im, (x, y), detect_client(im))
+
+    def act_client(self, fx: float, fy: float, *, hover: bool = False, hold_ms: int = 70, settle: float = 0.9) -> bool:
+        """Клик или наведение по доле игрового поля, не рамки окна."""
+        fr = self.capture_client()
+        if fr is None:
+            return False
+        sx, sy = fr.screen(fx, fy)
+        if hover:
+            return self.hover_screen(sx, sy, settle=min(settle, 0.4))
+        return self.click_screen(sx, sy, hold_ms=hold_ms, settle=settle)
+
+    def click_live(self, name: str, *, hover: bool = False, hold_ms: int = 70, settle: float = 0.9) -> bool:
+        """Клик или наведение по имени. Точка ищется на кадре, иначе — снятая доля поля."""
+        from cs2_menu.live_ui import FALLBACK, resolve_point
+
+        fr = self.capture_client()
+        if fr is None:
+            return False
+        pt = resolve_point(fr.image, fr.client, name) or FALLBACK.get(name)
+        if pt is None:
+            return False
+        sx, sy = fr.screen(*pt)
+        if hover:
+            return self.hover_screen(sx, sy, settle=min(settle, 0.4))
+        return self.click_screen(sx, sy, hold_ms=hold_ms, settle=settle)
 
     def click_frac(self, fx: float, fy: float, *, hold_ms: int = 70, settle: float = 0.9) -> bool:
         pt = self.frac_to_screen(fx, fy)

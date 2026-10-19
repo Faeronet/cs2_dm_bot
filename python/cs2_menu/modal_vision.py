@@ -103,16 +103,15 @@ def _find_panel(gray: Image.Image, ring_mean: float) -> tuple[int, int, int, int
     return x0, y0, x1, y1
 
 
-# БЕЗОПАСНЫЕ позиции кнопок закрытия (доли окна CS2). Только мид-скрин OK/YES и
-# правый-нижний CLOSE промо-модалки. Сознательно НЕ трогаем левый-нижний угол,
-# где у промо-окон кнопка покупки (BUY PRIME) — чтобы случайно её не нажать.
-# Порядок: сначала самые частые/безопасные; на ошибке первая же закрывает окно.
-# Доли КОНТЕНТА окна CS2 (без титульной полосы) — согласованы с ScreenClicker.content_rect.
+# Запасные точки закрытия — доли ИГРОВОГО ПОЛЯ (то, что внутри рамки окна).
+# Пересчитаны со старых долей контента на снятом окне, без повторного открытия окон.
+# Левый нижний угол промо (BUY PRIME) сюда не входит. Зелёную кнопку (CLAIM / GO)
+# эти точки не должны накрывать; перед кликом она всё равно отбрасывается.
 BUTTON_GRID: list[tuple[float, float]] = [
-    (0.662, 0.549),  # OK одиночной ошибки (Matchmaking Failed/update)
-    (0.500, 0.549),  # центр OK
-    (0.579, 0.549),  # YES (Leave Match)
-    (0.715, 0.912),  # CLOSE промо-модалки (Prime) — правее кнопки BUY
+    (0.666, 0.561),  # OK одиночной ошибки
+    (0.500, 0.561),  # центр OK
+    (0.581, 0.561),  # YES
+    (0.720, 0.933),  # CLOSE промо — правее BUY
 ]
 
 
@@ -135,77 +134,140 @@ def detect_modal(img: Image.Image) -> ModalInfo:
     return ModalInfo(present, ring, panel)
 
 
-def dismiss_candidates(win: tuple[int, int, int, int],
-                       panel: tuple[int, int, int, int] | None) -> list[tuple[int, int]]:
-    """Экранные точки-кандидаты для закрытия окна.
+def _not_green(img: Image.Image, x: int, y: int) -> bool:
+    """Зелёная кнопка — это GO или «получить». Её при закрытии окна не трогаем."""
+    w, h = img.size
+    if not (0 <= x < w and 0 <= y < h):
+        return False
+    r, g, b = img.getpixel((x, y))[:3]
+    return not (g > 130 and r < 100 and b < 110 and g > r + 40)
 
-    Если удалось надёжно найти панель — кнопка OK в её правом-нижнем углу (и центр).
-    Иначе (или в дополнение) — типовая сетка позиций кнопок. Безопасно: модалка
-    поглощает клики мимо кнопок, поэтому лишние точки ничего не ломают.
+
+def _panel_dismiss(crop: Image.Image, panel: tuple[int, int, int, int]) -> tuple[int, int] | None:
+    """Кнопка закрытия на самой панели: справа, не зелёная, не BUY слева.
+
+    Координаты — пиксели кадра панели (crop). Размер окна сюда не зашит:
+    угол панели находится по картинке.
     """
-    wx, wy, ww, wh = win
-    pts: list[tuple[int, int]] = []
-    if panel:
-        x0, y0, x1, y1 = panel
-        pw, ph = x1 - x0, y1 - y0
-        pts.append((wx + int(x0 + 0.88 * pw), wy + int(y0 + 0.82 * ph)))  # OK справа-внизу
-        pts.append((wx + int(x0 + 0.5 * pw), wy + int(y0 + 0.82 * ph)))   # центр-внизу
-    for fx, fy in BUTTON_GRID:
-        pt = (wx + int(fx * ww), wy + int(fy * wh))
-        if pt not in pts:
-            pts.append(pt)
-    return pts
+    x0, y0, x1, y1 = panel
+    pw, ph = x1 - x0, y1 - y0
+    if pw < 40 or ph < 30:
+        return None
+    px = crop.load()
+    xa = x0 + int(pw * 0.42)
+    xb = x0 + int(pw * 0.96)
+    ya = y0 + int(ph * 0.62)
+    yb = y0 + int(ph * 0.94)
+    cols: list[int] = []
+    ink_y = 0
+    ink_n = 0
+    for x in range(xa, xb):
+        hit = None
+        for y in range(ya, yb):
+            r, g, b = px[x, y][:3]
+            if g > 130 and r < 100 and g > r + 40:
+                continue
+            if min(r, g, b) > 170 and max(r, g, b) - min(r, g, b) < 50:
+                hit = y
+                break
+        if hit is None:
+            continue
+        cols.append(x)
+        ink_y += hit
+        ink_n += 1
+    if ink_n < 10:
+        return None
+    groups: list[tuple[int, int]] = []
+    start = prev = cols[0]
+    for x in cols[1:]:
+        if x - prev > 10:
+            if prev - start > 12:
+                groups.append((start, prev))
+            start = x
+        prev = x
+    if prev - start > 12:
+        groups.append((start, prev))
+    if not groups:
+        return None
+    a, b = groups[-1]
+    return (a + b) // 2, ink_y // ink_n
 
 
 def is_modal_present(clicker, env: dict) -> bool:
     """Быстрая проверка: висит ли сейчас модальное окно (с фокусом окна CS2)."""
     clicker._mi.focus()
-    rect = clicker.content_rect()
-    if not rect:
+    fr = _client_view(clicker)
+    if fr is None:
         return False
-    img = grab_window(env, rect)
-    if img is None:
-        return False
-    return detect_modal(img).present
+    return _modal_on_client(fr)[1].present
+
+
+def _client_view(clicker):
+    """Кадр окна и поле игры. None, если снять не удалось."""
+    if not hasattr(clicker, "capture_client"):
+        return None
+    return clicker.capture_client()
+
+
+def _modal_on_client(fr):
+    crop = fr.image.crop((
+        fr.client.left, fr.client.top,
+        fr.client.left + fr.client.width, fr.client.top + fr.client.height,
+    ))
+    info = detect_modal(crop)
+    return crop, info
 
 
 def clear_modals(clicker, env: dict, *, max_rounds: int = 2, log=print) -> bool:
     """Закрывать модалки, пока экран не станет «чистым». True — чисто/закрыто.
 
-    ВАЖНО: перед снимком фокусируем окно CS2 — иначе поверх него может быть
-    IDE/другое окно, его тёмная область ложно примется за модалку, и пойдут
-    слепые клики. Фокус + анализ яркости рамки даёт честную картину.
+    Панель и кнопка ищутся на игровом поле текущего кадра, поэтому размер окна
+    и полный экран не требуют заново открывать эти окна. Зелёная «получить» / GO
+    не нажимается.
     """
+    import time as _t
+
     closed = True
     for rnd in range(max_rounds):
-        clicker._mi.focus()  # поднять CS2 поверх прочих окон перед снимком
-        rect = clicker.content_rect()
-        if not rect:
+        clicker._mi.focus()
+        fr = _client_view(clicker)
+        if fr is None:
             log("[popup] окно CS2 не найдено")
             return False
-        img = grab_window(env, rect)
-        if img is None:
-            return False
-        info = detect_modal(img)
+        _crop, info = _modal_on_client(fr)
         if not info.present:
             if rnd:
                 log(f"[popup] закрыто (ring={info.ring_mean:.0f})")
             return True
-        # подтверждение: модалка должна держаться 2 кадра подряд. Иначе это может
-        # быть тёмный кадр геймплея (в игре), а не настоящее окно — не кликаем.
-        import time as _t
         _t.sleep(0.4)
-        img2 = grab_window(env, rect)
-        if img2 is None or not detect_modal(img2).present:
+        fr2 = _client_view(clicker)
+        if fr2 is None:
+            return False
+        crop2, info2 = _modal_on_client(fr2)
+        if not info2.present:
             log("[popup] тёмный кадр не подтвердился как окно — пропускаю (вероятно, игра)")
             return True
-        log(f"[popup] обнаружена модалка {info} — закрываю")
+        log(f"[popup] обнаружена модалка {info2} — закрываю")
         closed = False
-        for (sx, sy) in dismiss_candidates(rect, info.panel):
-            clicker.click_screen(sx, sy, settle=0.9)
-            chk = grab_window(env, rect)
-            if chk is not None and not detect_modal(chk).present:
-                log(f"[popup] закрыта кликом ({sx},{sy})")
+        points: list[tuple[float, float]] = []
+        if info2.panel:
+            local = _panel_dismiss(crop2, info2.panel)
+            if local is not None and _not_green(crop2, *local):
+                points.append(fr2.client.frac(
+                    fr2.client.left + local[0], fr2.client.top + local[1],
+                ))
+        for fx, fy in BUTTON_GRID:
+            if (fx, fy) not in points:
+                points.append((fx, fy))
+        for fx, fy in points:
+            px, py = fr2.client.pixel(fx, fy)
+            if not _not_green(fr2.image, px, py):
+                log(f"[popup] пропускаю зелёную кнопку @({fx:.3f},{fy:.3f})")
+                continue
+            clicker.act_client(fx, fy, settle=0.9)
+            chk = _client_view(clicker)
+            if chk is not None and not _modal_on_client(chk)[1].present:
+                log(f"[popup] закрыта кликом @({fx:.3f},{fy:.3f})")
                 closed = True
                 break
         if not closed:

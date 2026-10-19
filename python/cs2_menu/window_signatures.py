@@ -91,33 +91,33 @@ def _default_registry() -> dict[str, WindowSig]:
             id="error", description="Ошибка/подтверждение (один OK)",
             # OK центрированной панели (позиция зависит от ширины диалога): несколько
             # típичных центров + «Disconnected»/update-ошибки.
-            buttons=[Button("ok", 0.609, 0.540),   # Disconnected / Unable to connect
-                     Button("ok", 0.662, 0.549),   # узкая панель
-                     Button("ok", 0.500, 0.549)],  # центр
+            buttons=[Button("ok", 0.612, 0.552),   # Disconnected / Unable to connect
+                     Button("ok", 0.666, 0.561),   # узкая панель
+                     Button("ok", 0.500, 0.561)],  # центр
         ),
         "prime_upsell": WindowSig(
             id="prime_upsell", description="Prime / магазин upsell",
-            buttons=[Button("close", 0.715, 0.912)],
+            buttons=[Button("close", 0.720, 0.933)],
         ),
         "notification": WindowSig(
             id="notification", description="Уведомление / toast",
-            buttons=[Button("close", 0.715, 0.912)],
+            buttons=[Button("close", 0.720, 0.933)],
         ),
         # Overlay-диалог: НЕ меняет fingerprint (MENU_CONTEXT = экран под ним),
         # ловится по яркости/подсветке. Калибровано парсингом окна.
         "community_servers": WindowSig(
             id="community_servers",
             description="Диалог 'Community Servers' (never-show / OK / Cancel)",
-            buttons=[Button("dont_show", 0.519, 0.570),
-                     Button("ok", 0.624, 0.570),
-                     Button("close", 0.660, 0.570)],
+            buttons=[Button("dont_show", 0.520, 0.583),
+                     Button("ok", 0.627, 0.583),
+                     Button("close", 0.664, 0.583)],
         ),
         # Полноэкранный под-экран (инспекция предмета/charm, карточка магазина):
         # яркая 3D-сцена, кнопка CLOSE в правом-нижнем углу.
         "fullscreen_sub": WindowSig(
             id="fullscreen_sub",
             description="Под-экран инспекции/магазина (CLOSE справа-внизу)",
-            buttons=[Button("close", 0.750, 0.932)],
+            buttons=[Button("close", 0.756, 0.953)],
         ),
     }
 
@@ -125,8 +125,8 @@ def _default_registry() -> dict[str, WindowSig]:
 # «Универсальные» точки кнопки закрытия (доли контента) — пробуем кликом напрямую у
 # неизвестных окон (hover-подсветка на ярких 3D-сценах ненадёжна).
 _UNIVERSAL_CLOSE: list[tuple[float, float, str]] = [
-    (0.750, 0.932, "close-bottom-right"),  # CLOSE под-экрана инспекции/магазина
-    (0.715, 0.912, "close-promo"),         # CLOSE промо-модалки (Prime)
+    (0.756, 0.953, "close-bottom-right"),  # CLOSE под-экрана инспекции/магазина
+    (0.720, 0.933, "close-promo"),         # CLOSE промо-модалки (Prime)
 ]
 
 
@@ -236,18 +236,21 @@ def _region_luma(img: Image.Image, px: int, py: int, half: int = 16) -> float:
 def hover_button(clicker, env: dict, btn: Button) -> dict:
     """Навести курсор на кнопку и проверить подсветку (без клика).
 
-    Возвращает {screen, highlighted, luma_before, luma_after}.
+    Доли — от игрового поля. Возвращает {screen, highlighted, luma_before, luma_after}.
     """
-    rect = clicker.content_rect()
-    cx, cy, cw, ch = rect
-    px, py = int(btn.fx * cw), int(btn.fy * ch)
-    sx, sy = cx + px, cy + py
     clicker._mi.focus()
-    before = grab_window(env, rect)
-    lb = _region_luma(before, px, py) if before is not None else 0.0
+    before = clicker.capture_client()
+    if before is None:
+        return {"screen": (0, 0), "luma_before": 0.0, "luma_after": 0.0, "highlighted": False}
+    px, py = before.client.pixel(btn.fx, btn.fy)
+    sx, sy = before.screen(btn.fx, btn.fy)
+    lb = _region_luma(before.image, px, py)
     clicker.hover_screen(sx, sy)
-    after = grab_window(env, rect)
-    la = _region_luma(after, px, py) if after is not None else 0.0
+    after = clicker.capture_client()
+    if after is None:
+        la = 0.0
+    else:
+        la = _region_luma(after.image, *after.client.pixel(btn.fx, btn.fy))
     return {
         "screen": (sx, sy),
         "luma_before": round(lb, 1),
@@ -261,7 +264,7 @@ def press_button(clicker, env: dict, btn: Button, *, hover_first: bool = True) -
     info = {"highlighted": None}
     if hover_first:
         info = hover_button(clicker, env, btn)
-    clicker.click_frac(btn.fx, btn.fy, settle=0.9)
+    clicker.act_client(btn.fx, btn.fy, settle=0.9)
     return info
 
 
@@ -312,13 +315,13 @@ DARK_BASELINE_MAX = 105.0
 # опознаются ни по памяти, ни по затемнению фона — например, «Disconnected»/«Unable to
 # connect» фон не затемняет, поэтому яркостный детектор его не видит.
 PROBE_BUTTONS: list[tuple[float, float, str]] = [
-    (0.609, 0.540, "ok"),      # Disconnected / Unable to establish connection
-    (0.662, 0.549, "ok"),      # узкая панель OK
-    (0.500, 0.549, "ok"),      # центр OK
-    (0.624, 0.570, "ok"),      # Community Servers OK
-    (0.660, 0.570, "cancel"),  # Community Servers Cancel
-    (0.715, 0.912, "close"),   # промо/уведомление CLOSE (Prime)
-    (0.750, 0.932, "close"),   # под-экран инспекции/магазина CLOSE
+    (0.612, 0.552, "ok"),      # Disconnected / Unable to establish connection
+    (0.666, 0.561, "ok"),      # узкая панель OK
+    (0.500, 0.561, "ok"),      # центр OK
+    (0.627, 0.583, "ok"),      # Community Servers OK
+    (0.664, 0.583, "cancel"),  # Community Servers Cancel
+    (0.720, 0.933, "close"),   # промо/уведомление CLOSE (Prime)
+    (0.756, 0.953, "close"),   # под-экран инспекции/магазина CLOSE
 ]
 
 
@@ -341,7 +344,7 @@ def _press_if_button(clicker, env: dict, fx: float, fy: float, label: str, log) 
     d = res["luma_after"] - res["luma_before"]
     log(f"[win]   кнопка {label} @({fx:.3f},{fy:.3f}) luma "
         f"{res['luma_before']}→{res['luma_after']} (Δ{d:+.0f}) → клик")
-    clicker.click_frac(fx, fy, settle=0.9)
+    clicker.act_client(fx, fy, settle=0.9)
     res2 = hover_button(clicker, env, Button(label, fx, fy))
     if not _looks_like_button(res2):
         log(f"[win]   закрыто — кнопка исчезла (luma {res2['luma_before']}→{res2['luma_after']})")
@@ -399,14 +402,18 @@ def _detect_window(clicker, env: dict, reader_state_fn, registry) -> DetectResul
 
     # 2) яркость (затемнение фона модалкой) — один кадр
     clicker._mi.focus()
-    rect = clicker.content_rect()
-    if rect:
-        img = grab_window(env, rect)
-        if img is not None:
-            info = detect_modal(img)
-            if info.present:
-                return DetectResult(True, "vision-ring", ring_mean=info.ring_mean)
-            return DetectResult(False, "none", ring_mean=info.ring_mean)
+    from cs2_menu.modal_vision import _client_view, _modal_on_client
+    fr = _client_view(clicker)
+    if fr is not None:
+        _crop, info = _modal_on_client(fr)
+        if info.present:
+            return DetectResult(True, "vision-ring", ring_mean=info.ring_mean)
+        from cs2_menu.live_ui import find_inspect_close
+        close = find_inspect_close(fr.image, fr.client)
+        if close is not None:
+            return DetectResult(True, "inspect-close", probe_hit=(close[0], close[1], "close"),
+                                ring_mean=info.ring_mean)
+        return DetectResult(False, "none", ring_mean=info.ring_mean)
     return DetectResult(False, "none")
 
 
@@ -440,12 +447,19 @@ def _close_one(clicker, env: dict, det: DetectResult, reader_state_fn, registry,
     if _esc_close(clicker, env, reader_state_fn, registry, log):
         return True
 
+    # осмотр предмета / окно дропа: белая CLOSE, зелёную «получить» не трогаем
+    if det.source == "inspect-close" and det.probe_hit is not None:
+        fx, fy, label = det.probe_hit
+        log(f"[win] закрываю осмотр {label} @({fx:.3f},{fy:.3f})")
+        clicker.act_client(fx, fy, settle=0.8)
+        if not _detect_window(clicker, env, reader_state_fn, registry).present:
+            return True
     # 2) наведение+клик (один проход)
     log("[win] ESC не закрыл — навожу курсор на кнопку закрытия")
     if det.sig is not None and det.sig.buttons:
         for btn in det.sig.ordered_buttons():
             if btn.label == "dont_show":
-                clicker.click_frac(btn.fx, btn.fy, settle=0.5)  # «не показывать»
+                clicker.act_client(btn.fx, btn.fy, settle=0.5)  # «не показывать»
                 continue
             if _press_if_button(clicker, env, btn.fx, btn.fy, btn.label, log):
                 return True
@@ -493,3 +507,78 @@ def close_window(clicker, env: dict, *, reader_state_fn=None, max_rounds: int = 
         closed_any = True
     log(f"[win] достигнут предел ({max_rounds}) — окно всплывает снова, выхожу")
     return closed_any
+
+
+def review_store_drop(clicker, log=print) -> bool:
+    """Открыть магазин, прокликать предметы дропа, окна закрыть, на «получить» только навестись."""
+    from cs2_menu.live_ui import find_drop_cards, find_inspect_close, find_nav, find_team_select
+
+    clicker._mi.focus()
+    fr = clicker.capture_client()
+    if fr is None:
+        log("[drop] окно CS2 не найдено")
+        return False
+    nav = find_nav(fr.image, fr.client)
+    teams = find_team_select(fr.image, fr.client)
+    if "cancel" in teams and "store" not in nav:
+        log("[drop] открыт выбор стороны — выхожу в меню")
+        clicker.click_live("cancel", settle=1.3)
+    fr = clicker.capture_client()
+    on_store = False
+    if fr is not None:
+        from cs2_menu.live_ui import find_band
+        tabs = find_band(
+            fr.image, fr.client, ("home", "general", "market", "tools", "armory"), 0.055, 0.11,
+        )
+        on_store = "general" in tabs and "market" in tabs
+    if not on_store:
+        clicker.click_live("store", settle=1.1)
+    clicker.click_live("store_home", settle=1.0)
+    fr = clicker.capture_client()
+    cards = find_drop_cards(fr.image, fr.client) if fr else []
+    if len(cards) != 4 and fr is not None and "store" in find_nav(fr.image, fr.client):
+        from cs2_menu.live_ui import find_green
+        if find_green(fr.image, fr.client) is not None:
+            cards = [(0.218, 0.247), (0.321, 0.247), (0.423, 0.247), (0.525, 0.247)]
+            log("[drop] карточки по кадру не собрались, беру записанные четыре")
+    if len(cards) != 4:
+        log("[drop] блок дропа на экране не найден")
+        return False
+    log(f"[drop] карточек: {len(cards)}")
+    for i, (fx, fy) in enumerate(cards, 1):
+        log(f"[drop] предмет {i} @({fx:.3f},{fy:.3f})")
+        clicker.act_client(fx, fy, settle=1.0)
+        _close_drop_view(clicker, log)
+    hovered = clicker.click_live("claim", hover=True, settle=0.4)
+    log("[drop] курсор на «получить», кнопка не нажата" if hovered
+        else "[drop] кнопку «получить» на кадре не нашёл")
+    return hovered
+
+
+def _close_drop_view(clicker, log) -> None:
+    """Закрыть окно осмотра предмета. Пока видна верхняя навигация — это ещё магазин, ESC не жмём."""
+    from cs2_menu.live_ui import find_inspect_close, find_nav
+    from cs2_menu.modal_vision import clear_modals
+
+    fr = clicker.capture_client()
+    if fr is None:
+        return
+    if find_nav(fr.image, fr.client):
+        log("[drop]   отдельное окно не открылось")
+        return
+    try:
+        clicker._mi.game_input.key_tap("escape", hold_ms=60)
+    except Exception as exc:  # noqa: BLE001
+        log(f"[drop]   ESC не отправился ({exc})")
+    time.sleep(0.7)
+    fr = clicker.capture_client()
+    if fr is not None and find_nav(fr.image, fr.client):
+        log("[drop]   окно предмета закрыто")
+        return
+    if fr is not None:
+        close = find_inspect_close(fr.image, fr.client)
+        if close is not None:
+            log("[drop]   жму CLOSE осмотра")
+            clicker.act_client(*close, settle=0.8)
+            return
+    clear_modals(clicker, getattr(clicker, "_env", {}) or {}, max_rounds=1, log=log)
