@@ -299,15 +299,13 @@ class NavConfig:
     aim_overshoot_s: tuple[float, float] = (0.08, 0.16)  # с: вдвое короче окно перевода
     aim_miss_chance: float = 0.015           # xxHash: редкий промах (было 10%, теперь 1.5%)
     aim_miss_u: tuple[float, float] = (0.8, 2.2)   # u: если и мимо — то едва мимо овала
-    aim_chest_chance: float = 0.20           # xxHash: грудь вместо головы (если грудь видна)
-    aim_shoulder_chance: float = 0.08        # xxHash: плечо вместо головы (если видно только плечо — всегда)
-    aim_head_off_xy: tuple[float, float] = (0.04, 0.45)  # u: внутри головы, не на краю хитбокса
-    aim_head_off_z: tuple[float, float] = (-0.28, 0.32)
-    aim_chest_off_xy: tuple[float, float] = (0.10, 1.10)
-    aim_chest_off_z: tuple[float, float] = (-0.60, 0.60)
-    aim_shoulder_off_xy: tuple[float, float] = (0.04, 0.40)
-    aim_shoulder_off_z: tuple[float, float] = (-0.30, 0.30)
-    aim_bone_off_along: tuple[float, float] = (-0.18, 0.18)
+    aim_chest_chance: float = 0.35           # xxHash: туловище, если видны и голова, и грудь
+    aim_head_radius: tuple[float, float] = (1.1, 2.4)         # u: круг на голове
+    aim_head_radius_err: tuple[float, float] = (0.12, 0.40)
+    aim_chest_radius: tuple[float, float] = (2.2, 4.6)        # u: круг на туловище
+    aim_chest_radius_err: tuple[float, float] = (0.25, 0.70)
+    aim_shoulder_radius: tuple[float, float] = (0.55, 1.40)   # u: круг на плече
+    aim_shoulder_radius_err: tuple[float, float] = (0.08, 0.26)
     unscope_click_chance: float = 0.20       # xxHash: выход из скоупа 2×ПКМ, иначе нож→оружие
     unscope_click_gap: tuple[float, float] = (0.14, 0.34)  # с между кликами ПКМ
     # --- стрельба
@@ -470,7 +468,8 @@ class Navigator:
         self._aim_part = "head"               # head/chest/left_shoulder/right_shoulder
         self._aim_chest = False               # back-compat alias (_aim_part == "chest")
         self._aim_bone_delta = (0.0, 0.0, 0.0)  # кость − голова на момент выбора (если кость пропала из чтения)
-        self._aim_spot = (0.0, 0.0, 0.0)      # lat, along, up — точка на кости (xxHash, на мишень)
+        self._aim_spot = (0.0, 0.0, 0.0)      # lat, along, up — точка внутри радиуса кости
+        self._aim_head_spot = (0.0, 0.0, 0.0) # куда антиотдача поднимает спрей с туловища
         self._shot_miss: bool | None = None
         self._prev_mem = None  # (yaw, pitch)
         self._pend_yaw = _PendingAxis()       # мышь «в полёте»: отправлено, в памяти ещё нет
@@ -687,6 +686,7 @@ class Navigator:
         self._aim_part = "head"
         self._aim_chest = False
         self._aim_spot = (0.0, 0.0, 0.0)
+        self._aim_head_spot = (0.0, 0.0, 0.0)
         self._aim_bone_delta = (0.0, 0.0, 0.0)
 
     def _enemy_from_reader(self, p) -> dict:
@@ -2210,43 +2210,35 @@ class Navigator:
         pitch = -math.degrees(math.atan2(tz - (z + self._eye_z), max(1.0, horiz)))
         return yaw, pitch
 
+    def _sample_in_radius(self, span: tuple[float, float], err_span: tuple[float, float]) -> tuple[float, float, float]:
+        """Точка внутри круга на кости. Длина радиуса — диапазон плюс погрешность, оба xxHash."""
+        radius = max(0.15, self._xx_band(span, err_span))
+        rho = self._xx_u01() * radius
+        ang = self._xx_u01() * math.tau
+        return rho * math.cos(ang), 0.0, rho * math.sin(ang)
+
     def _sample_aim_bone(self, target: dict, x: float, y: float, z: float) -> None:
-        """На захват мишени: выбираем часть тела под прицел с учётом видимости.
-        База: голова (с вероятностью (1-chest-shoulder)), грудь, плечо (lev/prav).
-        Если движок говорит spotted, но LOS в выбранную кость закрыт — пробуем
-        другие части по приоритету head → chest → плечо. Точку на кости
-        псевдо-рандомим через xxHash (lat/along/up в своём диапазоне)."""
+        """Голова, либо 35% туловище, если видны обе. Видна только одна — только она.
+        Плечо — когда головы и туловища нет. Точка каждый раз новая, внутри радиуса кости."""
         cfg = self.cfg
         parts = self._visible_parts(target, x, y, z)
-        # Только LOS по кости (не за стеной); off-screen OK. Частичный peek = одно плечо.
         allow: dict[str, bool] = {}
         for part, key in _AIM_PART_KEYS.items():
             allow[part] = bool(target.get(f"{part}_visible")) or parts.get(part) is not None
 
-        base = {
-            "head": max(0.0, 1.0 - cfg.aim_chest_chance - cfg.aim_shoulder_chance),
-            "chest": cfg.aim_chest_chance,
-            "left_shoulder": cfg.aim_shoulder_chance * 0.5,
-            "right_shoulder": cfg.aim_shoulder_chance * 0.5,
-        }
-        weights = {k: (base[k] if allow.get(k) else 0.0) for k in _AIM_PARTS_ORDER}
-        total = sum(weights.values())
-
-        if total <= 0.0:
-            # ни одна часть не видна и не спотится — целимся в голову вслепую
+        shoulders = [p for p in ("left_shoulder", "right_shoulder") if allow.get(p)]
+        if allow.get("head") and allow.get("chest"):
+            pick = "chest" if self._xx_u01() < cfg.aim_chest_chance else "head"
+        elif allow.get("head"):
             pick = "head"
+        elif allow.get("chest"):
+            pick = "chest"
+        elif len(shoulders) == 1:
+            pick = shoulders[0]
+        elif len(shoulders) > 1:
+            pick = shoulders[0] if self._xx_u01() < 0.5 else shoulders[1]
         else:
-            r = self._xx_u01() * total
-            acc = 0.0
             pick = "head"
-            for part in _AIM_PARTS_ORDER:
-                w = weights[part]
-                if w <= 0.0:
-                    continue
-                acc += w
-                if r <= acc:
-                    pick = part
-                    break
 
         self._aim_part = pick
         self._aim_chest = (pick == "chest")
@@ -2257,22 +2249,18 @@ class Navigator:
         )
 
         if pick == "chest":
-            rlo, rhi = cfg.aim_chest_off_xy
-            zlo, zhi = cfg.aim_chest_off_z
+            span, err = cfg.aim_chest_radius, cfg.aim_chest_radius_err
         elif pick in ("left_shoulder", "right_shoulder"):
-            rlo, rhi = cfg.aim_shoulder_off_xy
-            zlo, zhi = cfg.aim_shoulder_off_z
+            span, err = cfg.aim_shoulder_radius, cfg.aim_shoulder_radius_err
         else:
-            rlo, rhi = cfg.aim_head_off_xy
-            zlo, zhi = cfg.aim_head_off_z
-
-        lat = (rlo + self._xx_u01() * (rhi - rlo)) * (1.0 if self._xx_u01() < 0.5 else -1.0)
-        alo, ahi = cfg.aim_bone_off_along
-        along = alo + self._xx_u01() * (ahi - alo)
-        up = zlo + self._xx_u01() * (zhi - zlo)
-        self._aim_spot = (lat, along, up)
-        self.log(f"Точка прицела: {_AIM_PART_RU.get(pick, pick)} "
-                 f"({lat:+.1f}/{along:+.1f}/{up:+.1f}u)")
+            span, err = cfg.aim_head_radius, cfg.aim_head_radius_err
+        self._aim_spot = self._sample_in_radius(span, err)
+        self._aim_head_spot = self._sample_in_radius(cfg.aim_head_radius, cfg.aim_head_radius_err)
+        lat, _, up = self._aim_spot
+        self.log(
+            f"Точка прицела: {_AIM_PART_RU.get(pick, pick)} "
+            f"радиус {math.hypot(lat, up):.1f}u ({lat:+.1f}/{up:+.1f})"
+        )
 
     def _target_aim_xyz(self, target: dict, x: float, y: float) -> tuple[float, float, float]:
         """Мировая точка на выбранной кости + смещение, зафиксированное на мишень.
@@ -2286,8 +2274,29 @@ class Navigator:
             head = target.get("head_position") or target["position"]
             d = self._aim_bone_delta
             bone = (head[0] + d[0], head[1] + d[1], head[2] + d[2])
+        pt = self._place_on_bone(bone, self._aim_spot, x, y)
+        if (
+            self._aim_part == "chest"
+            and self._fire_held
+            and self._rcs_active()
+            and self._mem_shots > 0
+        ):
+            head = target.get("head_position")
+            if head is not None:
+                t = min(1.0, self._mem_shots / 8.0)
+                hp = self._place_on_bone(head, self._aim_head_spot, x, y)
+                pt = (
+                    pt[0] + (hp[0] - pt[0]) * t,
+                    pt[1] + (hp[1] - pt[1]) * t,
+                    pt[2] + (hp[2] - pt[2]) * t,
+                )
+        return pt
+
+    def _place_on_bone(
+        self, bone: tuple[float, float, float], spot: tuple[float, float, float], x: float, y: float
+    ) -> tuple[float, float, float]:
         bx, by, bz = bone
-        lat, along, up = self._aim_spot
+        lat, along, up = spot
         dx, dy = bx - x, by - y
         dist = math.hypot(dx, dy) or 1.0
         fx, fy = dx / dist, dy / dist
