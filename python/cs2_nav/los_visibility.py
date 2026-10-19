@@ -35,14 +35,16 @@ def los_clear(
 
     * Горизонталь — трасс по проходимым клеткам на высоте пола (не на высоте глаз:
       иначе layer_at не находит ярус и всё кажется «за стеной»).
-    * Вертикаль — глаза и кость в одном «этаже» (|tz − eyes| ≤ 96).
-    * Off-screen не учитывается — только стена на карте.
+    * Вертикаль — глаза и кость в одном пролёте (|tz − eyes| ≤ 168), лестница не прячет голову.
+    * Одна пустая клетка навмеша — не стена. Off-screen не учитывается.
     """
     eyes_z = feet_z + eye_z
-    if abs(tz - eyes_z) > 96.0:
+    if abs(tz - eyes_z) > 168.0:
         return False
 
     local_node = cmap.layer_at(x, y, feet_z)
+    if local_node is None:
+        local_node = cmap.nearest_node(x, y, feet_z, max_radius=48.0)
     if local_node is None:
         return False
 
@@ -54,11 +56,16 @@ def los_clear(
 
     cz = local_node.z
     steps = max(1, int(stop / 8.0))
+    gap = 0
     for i in range(1, steps + 1):
         k = (i / steps) * (stop / d)
         node = cmap.layer_at(x + dx * k, y + dy * k, cz, dz_max=cmap.cfg.jump_height)
         if node is None:
-            return False
+            gap += 1
+            if gap > 1:
+                return False
+            continue
+        gap = 0
         cz = node.z
     return True
 
@@ -115,15 +122,18 @@ def apply_los_visibility(
         return
 
     feet = enemy.get("feet", enemy.get("position"))
-    if feet is not None:
-        fx, fy, fz = feet[0], feet[1], feet[2]
-        torso_z = fz + 50.0
-        head = enemy.get("head_position")
-        if head is not None:
-            torso_z = head[2] - 8.0
-        enemy["visible"] = los_clear(
-            cmap, x, y, feet_z, fx, fy, torso_z,
-            eye_z=eye_z, hull_radius=hull_radius, target_body_radius=target_body_radius,
-        )
-    else:
+    if feet is None:
         enemy["visible"] = False
+        return
+    fx, fy, fz = feet[0], feet[1], feet[2]
+    torso_z = fz + 50.0
+    head = enemy.get("head_position")
+    if head is not None:
+        torso_z = head[2] - 8.0
+    clear = los_clear(
+        cmap, x, y, feet_z, fx, fy, torso_z,
+        eye_z=eye_z, hull_radius=hull_radius, target_body_radius=target_body_radius,
+    )
+    if clear and enemy.get("chest_position") is not None:
+        enemy["chest_visible"] = True
+    enemy["visible"] = bool(clear)

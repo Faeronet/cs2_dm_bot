@@ -182,6 +182,13 @@ _ALIAS = {
     "sg553": "sg556",
     "m4a1-s": "m4a1_silencer",
     "m4a1s": "m4a1_silencer",
+    "mac-10": "mac10",
+    "mac_10": "mac10",
+    "mp5": "mp5sd",
+    "mp5-sd": "mp5sd",
+    "mp5_sd": "mp5sd",
+    "pp-bizon": "bizon",
+    "pp_bizon": "bizon",
 }
 
 # Механический цикл тапа (с). AWP/Scout — перезарядка затвора.

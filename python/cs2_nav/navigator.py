@@ -325,8 +325,8 @@ class NavConfig:
     combat_strafe_chance: float = 0.25       # xxHash: A/D шаги МЕЖДУ выстрелами (первый — всегда с места)
     combat_strafe_dist: tuple[float, float] = (18.0, 44.0)  # u: короткий шаг, каждый раз новый
     kill_step_chance: float = 0.70           # xxHash: после убийства, перед следующей мишенью
-    kill_step_dist: tuple[float, float] = (56.7, 76.7)        # u: прежняя сотня ÷1.5
-    kill_step_dist_err: tuple[float, float] = (5.3, 12.0)     # u: погрешность тоже ÷1.5
+    kill_step_dist: tuple[float, float] = (28.4, 38.4)        # u: предыдущий диапазон ÷2
+    kill_step_dist_err: tuple[float, float] = (2.7, 6.0)      # u: погрешность тоже ÷2
     kill_step_fire_delay: tuple[float, float] = (0.06, 0.13)  # с: после нажатия контрстрейфа
     kill_step_fire_delay_err: tuple[float, float] = (0.01, 0.025)
     # --- скоуп снайперок без хипфайр-прицела (AWP/SSG/автоснайпер)
@@ -470,6 +470,8 @@ class Navigator:
         self._aim_bone_delta = (0.0, 0.0, 0.0)  # кость − голова на момент выбора (если кость пропала из чтения)
         self._aim_spot = (0.0, 0.0, 0.0)      # lat, along, up — точка внутри радиуса кости
         self._aim_head_spot = (0.0, 0.0, 0.0) # куда антиотдача поднимает спрей с туловища
+        self._aim_world = (0.0, 0.0, 0.0)     # смещение точки в мире, не пересчитывается от бота
+        self._aim_head_world = (0.0, 0.0, 0.0)
         self._shot_miss: bool | None = None
         self._prev_mem = None  # (yaw, pitch)
         self._pend_yaw = _PendingAxis()       # мышь «в полёте»: отправлено, в памяти ещё нет
@@ -577,6 +579,7 @@ class Navigator:
         self._target_visible_now = False         # мишень в списке видимых на этом тике (стреляем только тогда)
         self._eye_z = self.cfg.eye_height        # высота глаз над ногами (обновляется из памяти)
         self._mem_shots = 0                      # m_iShotsFired
+        self._spray_t0: float | None = None      # зажим: если счётчик памяти моргнул
         self._rcs_shots_seen = 0
         self._rcs_shot_t = 0.0
         self._rcs_scale_x = 1.0
@@ -663,9 +666,23 @@ class Navigator:
         if "visible" not in e or e.get("_vis_pos") != (round(x), round(y), round(z)):
             self._apply_los_visibility(e, x, y, z)
             e["_vis_pos"] = (round(x), round(y), round(z))
-        if e.get("spotted") and not e.get("visible"):
+        self._sync_visible_from_bones(e)
+        return bool(e.get("visible"))
+
+    def _sync_visible_from_bones(self, e: dict) -> None:
+        """Хоть одна кость видна — мишень видна. Движок подтвердил LOS, а навмеш нет — помечаем кость."""
+        parts = ("head", "chest", "left_shoulder", "right_shoulder")
+        if any(e.get(f"{part}_visible") for part in parts):
             e["visible"] = True
-        return bool(e.get("visible") or e.get("spotted"))
+            return
+        if not e.get("spotted") or e.get("dormant"):
+            return
+        for part, key in _AIM_PART_KEYS.items():
+            if e.get(key) is not None:
+                e[f"{part}_visible"] = True
+                e["visible"] = True
+                return
+        e["visible"] = True
 
     def _visible_parts(self, e: dict, x: float, y: float, z: float) -> dict[str, tuple[float, float, float] | None]:
         """Какие кости видны из глаз бота (LOS по 2.5D-карте).
@@ -687,6 +704,8 @@ class Navigator:
         self._aim_chest = False
         self._aim_spot = (0.0, 0.0, 0.0)
         self._aim_head_spot = (0.0, 0.0, 0.0)
+        self._aim_world = (0.0, 0.0, 0.0)
+        self._aim_head_world = (0.0, 0.0, 0.0)
         self._aim_bone_delta = (0.0, 0.0, 0.0)
 
     def _enemy_from_reader(self, p) -> dict:
@@ -1392,10 +1411,33 @@ class Navigator:
         self._rcs_sampled = False
         self._rcs_shots_seen = 0
         self._rcs_shot_t = 0.0
+        self._spray_t0 = None
         self._rcs_wander = [0.0, 0.0]
 
+    def _spray_shots(self, now: float) -> int:
+        """Пули в текущем зажиме. Память и цикл оружия — одно и то же для винтовок и ПП.
+
+        m_iShotsFired на пистолетах-пулемётах часто читается нулём между тиками.
+        Пока ЛКМ держится, число не падает ниже пуль, которые уже должны были выйти.
+        """
+        mem = max(0, self._mem_shots)
+        if not self._fire_held:
+            return mem
+        if self._spray_t0 is None:
+            self._spray_t0 = now
+        wid = int(self.weapon.get("id") or 0)
+        wname = str(self.weapon.get("name") or "")
+        cycle = max(0.05, weapon_cycle_s(wid, wname))
+        est = int((now - self._spray_t0) / cycle)
+        if est < 1 and now > self._spray_t0:
+            est = 1
+        return max(mem, est)
+
     def _rcs_active(self) -> bool:
-        if not self.cfg.rcs_enabled or not self.weapon.get("auto"):
+        """Зажим: винтовки и пистолеты-пулемёты ведут одну и ту же линию отдачи."""
+        if not self.cfg.rcs_enabled:
+            return False
+        if not self.weapon.get("auto"):
             return False
         if self._long_spray is False:
             return False
@@ -1787,7 +1829,7 @@ class Navigator:
             return 0.0, 0.0
         wid = int(self.weapon.get("id") or 0)
         wname = str(self.weapon.get("name") or "")
-        n = self._mem_shots
+        n = self._spray_shots(now)
         if n != self._rcs_shots_seen:
             if self._rcs_shots_seen == 0 and n > 0:
                 self._rcs_resample()
@@ -1861,11 +1903,12 @@ class Navigator:
         d_pitch = self._pitch_rate * dt
         if abs(d_yaw) > abs(yaw_err) and abs(yaw_err) < 4.0:
             d_yaw = yaw_err
-            self._yaw_rate *= 0.15 if abs(yaw_err) < 0.6 else 0.45
+            self._yaw_rate *= 0.72
             self._yaw_acc = 0.0
         if abs(d_pitch) > abs(pitch_err) and abs(pitch_err) < 4.0:
             d_pitch = pitch_err
-            self._pitch_rate *= 0.15 if abs(pitch_err) < 0.6 else 0.45
+            # не гасить скорость: следующая пуля ПП приходит раньше, чем рука снова разгонится
+            self._pitch_rate *= 0.72
             self._pitch_acc = 0.0
         return d_yaw, d_pitch
 
@@ -2192,7 +2235,11 @@ class Navigator:
         py, pp = self._aim_steady_d
 
         def keep(delta: float, prev: float) -> float:
-            if abs(delta) < 0.40 and prev * delta < 0.0:
+            # в скоупе тот же дрожащий градус выглядит как сильное вождение
+            lim = 0.16 if self._scoped_now else 0.32
+            if abs(delta) < lim and prev * delta <= 0.0:
+                return 0.0
+            if abs(delta) < lim * 0.55:
                 return 0.0
             return delta
 
@@ -2256,6 +2303,9 @@ class Navigator:
             span, err = cfg.aim_head_radius, cfg.aim_head_radius_err
         self._aim_spot = self._sample_in_radius(span, err)
         self._aim_head_spot = self._sample_in_radius(cfg.aim_head_radius, cfg.aim_head_radius_err)
+        anchor = bone if bone is not None else head
+        self._aim_world = self._offset_world(anchor, self._aim_spot, x, y)
+        self._aim_head_world = self._offset_world(head, self._aim_head_spot, x, y)
         lat, _, up = self._aim_spot
         self.log(
             f"Точка прицела: {_AIM_PART_RU.get(pick, pick)} "
@@ -2274,7 +2324,8 @@ class Navigator:
             head = target.get("head_position") or target["position"]
             d = self._aim_bone_delta
             bone = (head[0] + d[0], head[1] + d[1], head[2] + d[2])
-        pt = self._place_on_bone(bone, self._aim_spot, x, y)
+        ox, oy, oz = self._aim_world
+        pt = (bone[0] + ox, bone[1] + oy, bone[2] + oz)
         if (
             self._aim_part == "chest"
             and self._fire_held
@@ -2283,14 +2334,23 @@ class Navigator:
         ):
             head = target.get("head_position")
             if head is not None:
-                t = min(1.0, self._mem_shots / 8.0)
-                hp = self._place_on_bone(head, self._aim_head_spot, x, y)
+                # доля пути к голове, не вся отдача: на ПП короткая линия иначе съедается
+                t = min(0.40, self._spray_shots(self._now()) / 16.0)
+                hx, hy, hz = self._aim_head_world
+                hp = (head[0] + hx, head[1] + hy, head[2] + hz)
                 pt = (
                     pt[0] + (hp[0] - pt[0]) * t,
                     pt[1] + (hp[1] - pt[1]) * t,
                     pt[2] + (hp[2] - pt[2]) * t,
                 )
         return pt
+
+    def _offset_world(
+        self, bone: tuple[float, float, float], spot: tuple[float, float, float], x: float, y: float
+    ) -> tuple[float, float, float]:
+        """Смещение от кости фиксируется один раз. Иначе шаг в сторону крутит точку вокруг мишени."""
+        px, py, pz = self._place_on_bone(bone, spot, x, y)
+        return px - bone[0], py - bone[1], pz - bone[2]
 
     def _place_on_bone(
         self, bone: tuple[float, float, float], spot: tuple[float, float, float], x: float, y: float
@@ -4061,16 +4121,25 @@ class Navigator:
             jerk = self._turn_jerk
         g = cfg.aim_lock_gain
         close = math.hypot(yaw_err, pitch_err) < 1.5
+        scoped = self._scoped_now and not self._chase_on
         if close:
             # До точки быстро. Внутри полпикселя стоим: лишний пиксель перебрасывает прицел.
-            g = 480.0 if self._chase_on else 320.0
-            r = min(r, 720.0 if self._chase_on else 420.0)
-            acc = min(acc, 2800.0)
+            # В скоупе дожим тише: тот же градус там выглядит как рывок.
+            if scoped:
+                g = 90.0
+                r = min(r, 70.0)
+                acc = min(acc, 700.0)
+            else:
+                g = 480.0 if self._chase_on else 320.0
+                r = min(r, 720.0 if self._chase_on else 420.0)
+                acc = min(acc, 2800.0)
             jerk = min(jerk, cfg.yaw_jerk_max)
         lag = dt
         ey = yaw_err - self._yaw_rate * lag
         ep = pitch_err - self._pitch_rate * lag
         hold = self._half_px_deg()
+        if scoped:
+            hold = max(hold, cfg.fire_tolerance_deg * 0.6)
         if math.hypot(yaw_err, pitch_err) <= hold:
             ey = 0.0
             ep = 0.0
@@ -4102,7 +4171,8 @@ class Navigator:
             self._pitch_rate = 0.0
             self._pitch_acc = 0.0
         # у точки не нести скорость дальше: иначе прицел рисует кружок вокруг мишени
-        if math.hypot(yaw_err, pitch_err) < 0.55 and not self._chase_on:
+        quiet = 1.15 if self._scoped_now else 0.55
+        if math.hypot(yaw_err, pitch_err) < quiet and not self._chase_on:
             self._yaw_rate *= 0.2
             self._pitch_rate *= 0.2
             self._yaw_acc = 0.0
@@ -4688,6 +4758,7 @@ class Navigator:
             self.input.mouse_up("left")
         self._fire_held = False
         self._fire_release_at_tick = -1
+        self._spray_t0 = None
         if was:
             self._begin_rcs_return()
 
@@ -4698,6 +4769,7 @@ class Navigator:
             self.input.mouse_up("left")
             self._fire_held = False
             self._fire_release_at_tick = -1
+            self._spray_t0 = None
 
     def _sample_strafe_dist(self) -> float:
         lo, hi = self.cfg.combat_strafe_dist
@@ -4728,7 +4800,7 @@ class Navigator:
             self._sample_combat_strafe(index)
             return
         cfg = self.cfg
-        dist = max(32.0, self._xx_band(cfg.kill_step_dist, cfg.kill_step_dist_err))
+        dist = max(16.0, self._xx_band(cfg.kill_step_dist, cfg.kill_step_dist_err))
         side = -1 if self._xx_u01() < 0.5 else 1
         self._combat_strafe = {
             "index": index,
@@ -4879,8 +4951,7 @@ class Navigator:
             self.all_enemies = self._read_enemies()
             for e in self.all_enemies:
                 self._apply_los_visibility(e, x, y, z)
-                if e.get("spotted") and not e.get("dormant"):
-                    e["visible"] = True
+                self._sync_visible_from_bones(e)
                 e["_vis_pos"] = (round(x), round(y), round(z))
             self.visible_enemies = [e for e in self.all_enemies if e.get("visible") or e.get("spotted")]
             alive_ids = {e["index"] for e in self.all_enemies}
