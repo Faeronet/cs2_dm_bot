@@ -210,7 +210,7 @@ class NavConfig:
     precal_px: int = 16                      # px за тик, если precal_ticks > 0
     # --- мишени вокруг (LOS по карте + spotted, не конус камеры)
     engage_targets: bool = True              # смотреть на видимую вокруг мишень, продолжая идти по маршруту
-    enemies_poll_hz: float = 20.0            # как часто читать список врагов из памяти (перебор 64 сущностей)
+    enemies_poll_hz: float = 40.0            # каждый тик: мишень сзади не ждёт следующий опрос
     ladders_poll_hz: float = 0.5             # лестницы меняются редко — полный перебор entity list
     doors_poll_hz: float = 2.0               # двери: состояние open/closed меняется чаще
     door_block_margin: float = 20.0          # запас вокруг запертой двери при обходе
@@ -240,7 +240,7 @@ class NavConfig:
     target_max_dist: float = 1400.0          # дальше — игнорируем
     target_reaction: tuple[float, float] = (0.0, 0.0)     # с: наводимся в тот же тик, как увидели
     target_fast_reaction: tuple[float, float] = (0.0, 0.0)
-    target_hold: float = 0.85                # с: spotted в CS2 мигает — не бросаем наводку на каждый кадр
+    target_hold: float = 0.45                # с: короткий провал LOS не отдаёт камеру маршруту
     target_yaw_rate_max: float = 330.0       # °/с: (режим без стрельбы) наводка резче панорамы
     target_yaw_gain: float = 9.0             # 1/с: (режим без стрельбы)
     target_aim_jitter: float = 0.0           # °: на голове макета дрейф сбивает центр — держим прицел
@@ -256,8 +256,25 @@ class NavConfig:
     aim_far_dist: float = 750.0
     aim_close_boost: float = 5.68            # ÷1.5 к 8.52
     aim_far_boost: float = 4.32              # ÷1.5 к 6.48
-    aim_speed_jitter: float = 0.12           # ± доля: конечная скорость фазы (xxHash, не одно число)
-    aim_accel_span: tuple[float, float] = (0.84, 1.18)  # xxHash: ускорение к этой скорости, не одна цифра
+    aim_speed_jitter: float = 0.12           # ± доля: плавание уже выбранной скорости (xxHash)
+    aim_accel_span: tuple[float, float] = (0.84, 1.18)  # запасной множитель, если фаза без своего диапазона
+    # наведение: те же диапазон+погрешность xxHash, потолок выше — до точки быстрее
+    aim_aim_rate: tuple[float, float] = (1820.0, 3240.0)
+    aim_aim_rate_err: tuple[float, float] = (90.0, 320.0)
+    # разворот: старт — скорость камеры навигации
+    aim_turn_rate: tuple[float, float] = (2060.0, 3670.0)      # °/с конечная скорость разворота
+    aim_turn_rate_err: tuple[float, float] = (100.0, 360.0)    # °/с погрешность к выбранной скорости
+    aim_turn_accel: tuple[float, float] = (1700.0, 3720.0)     # °/с² сила набора
+    aim_turn_accel_err: tuple[float, float] = (110.0, 360.0)
+    aim_turn_jerk: tuple[float, float] = (11000.0, 25000.0)    # °/с³ скорость набора ускорения
+    aim_turn_jerk_err: tuple[float, float] = (550.0, 2100.0)
+    # преследование: старт — скорость в момент входа (0, если прицел уже стоял)
+    aim_chase_rate: tuple[float, float] = (1050.0, 2230.0)
+    aim_chase_rate_err: tuple[float, float] = (70.0, 270.0)
+    aim_chase_accel: tuple[float, float] = (1100.0, 2480.0)
+    aim_chase_accel_err: tuple[float, float] = (70.0, 250.0)
+    aim_chase_jerk: tuple[float, float] = (7800.0, 18600.0)
+    aim_chase_jerk_err: tuple[float, float] = (400.0, 1600.0)
     flick_ramp: float = 0.12                 # с: набор к профилю флика (короче — быстрее подхват)
     flick_min_deg: float = 4.0               # меньше — без флика, сразу коррекция
     flick_base_time: float = 0.012           # ×1.5 к 0.008
@@ -267,11 +284,11 @@ class NavConfig:
     flick_error_frac: float = 0.004
     flick_error_min: float = 0.05            # °
     aim_correct_delay: tuple[float, float] = (0.0, 0.0)  # без паузы между фликом и выстрелом
-    aim_lock_gain: float = 88.0              # ÷1.5 к 132
-    aim_lock_rate: float = 1360.0            # ÷1.5 к 2040
+    aim_lock_gain: float = 240.0             # дожим в центр кости, без ползания рядом
+    aim_lock_rate: float = 1360.0            # потолок дожима; вблизи ещё режется в _aim_lock
     aim_correct_gain: float = 88.0           # ÷1.5
     aim_correct_rate: float = 1360.0         # ÷1.5
-    aim_max_px_per_tick: int = 1600          # ÷1.5 к 2400: потолок мыши на развороте
+    aim_max_px_per_tick: int = 3400          # в скоупе градус стоит больше пикселей — иначе разворот обрезается
     aim_chase_speed: tuple[float, float] = (3.0, 4.5)  # xxHash: ведение ходящей мишени в 2–3 раза быстрее
     aim_chase_move: float = 70.0             # u/s: ходьба тоже считается движением, не только бег
     aim_chase_strafe: float = 40.0           # u/s поперёк луча
@@ -284,45 +301,48 @@ class NavConfig:
     aim_miss_u: tuple[float, float] = (0.8, 2.2)   # u: если и мимо — то едва мимо овала
     aim_chest_chance: float = 0.20           # xxHash: грудь вместо головы (если грудь видна)
     aim_shoulder_chance: float = 0.08        # xxHash: плечо вместо головы (если видно только плечо — всегда)
-    aim_head_off_xy: tuple[float, float] = (0.5, 2.2)   # u: точка на голове, не всегда центр
-    aim_head_off_z: tuple[float, float] = (-1.5, 1.6)
-    aim_chest_off_xy: tuple[float, float] = (0.8, 4.0)
-    aim_chest_off_z: tuple[float, float] = (-3.2, 3.0)
-    aim_shoulder_off_xy: tuple[float, float] = (0.4, 1.8)  # u: плечо мелкое — разброс поменьше
-    aim_shoulder_off_z: tuple[float, float] = (-1.2, 1.2)
-    aim_bone_off_along: tuple[float, float] = (-0.7, 0.7)  # u: чуть ближе/дальше по лучу
+    aim_head_off_xy: tuple[float, float] = (0.04, 0.45)  # u: внутри головы, не на краю хитбокса
+    aim_head_off_z: tuple[float, float] = (-0.28, 0.32)
+    aim_chest_off_xy: tuple[float, float] = (0.10, 1.10)
+    aim_chest_off_z: tuple[float, float] = (-0.60, 0.60)
+    aim_shoulder_off_xy: tuple[float, float] = (0.04, 0.40)
+    aim_shoulder_off_z: tuple[float, float] = (-0.30, 0.30)
+    aim_bone_off_along: tuple[float, float] = (-0.18, 0.18)
     unscope_click_chance: float = 0.20       # xxHash: выход из скоупа 2×ПКМ, иначе нож→оружие
     unscope_click_gap: tuple[float, float] = (0.14, 0.34)  # с между кликами ПКМ
     # --- стрельба
     fire_enabled: bool = True
     shots_per_target: int = 0                # выстрелов по мишени; 0 = стреляем, пока мишень не пропадёт
-    fire_tolerance_deg: float = 0.10
-    fire_tolerance_pitch_deg: float = 0.10
-    fire_target_half_width: float = 4.5      # u: полуось овала по XY
-    fire_target_up_margin: float = 5.5       # u: полуось овала по Z
-    fire_oval_frac: float = 0.45             # шире окно попадания (было 0.28 — слишком узкое, выстрел задерживался)
+    fire_tolerance_deg: float = 0.08
+    fire_tolerance_pitch_deg: float = 0.08
+    fire_target_half_width: float = 2.6      # u: полуось овала по XY, внутри хитбокса
+    fire_target_up_margin: float = 3.2       # u: полуось овала по Z
+    fire_oval_frac: float = 0.55             # доля мировой полуоси; пол уже допуска в градусах
     fire_confirm_s: float = 0.0              # точка в овале — стреляем в этот же тик
     fire_interval: tuple[float, float] = (0.14, 0.22)   # запасной интервал тапа, если нет таблицы
     fire_first_delay: tuple[float, float] = (0.0, 0.0)
     fire_hold_ticks: int = 1                 # тиков держим ЛКМ на тапе (≥1 тик игры)
     fire_stop_moving: bool = True            # стоим на месте во время стрельбы (точность как у игрока)
-    vuln_fire_delay: tuple[float, float] = (0.86, 1.18)  # с: после снятия spawn-защиты, xxHash около 1 с
+    vuln_fire_delay: tuple[float, float] = (0.0, 0.0)    # защита снята — стреляем в тот же тик
     combat_strafe_chance: float = 0.25       # xxHash: A/D шаги МЕЖДУ выстрелами (первый — всегда с места)
     combat_strafe_dist: tuple[float, float] = (18.0, 44.0)  # u: короткий шаг, каждый раз новый
     # --- скоуп снайперок без хипфайр-прицела (AWP/SSG/автоснайпер)
     scope_noscope_chance: float = 0.30       # xxHash: автоснайперы
-    scope_noscope_awp: float = 0.02          # xxHash: AWP, отдельно от SSG
+    scope_noscope_awp: float = 0.003         # xxHash: AWP почти всегда в скоупе
     scope_noscope_ssg: float = 0.15          # xxHash: половина прежних 30%
-    scope_noscope_close: float = 450.0       # u: ближе — AWP и SSG без скоупа
+    scope_noscope_close: float = 450.0       # u: SSG без скоупа
+    scope_noscope_awp_close: float = 160.0   # u: AWP без скоупа только в упор
     scope_enter_deg: tuple[float, float] = (1.8, 4.6)   # °: радиус прицела, чтобы войти в скоуп
     scope_enter_u: tuple[float, float] = (14.0, 34.0)   # u: мировой промах около мишени (не тот же, что °)
-    scope_settle: tuple[float, float] = (0.07, 0.18)    # с: после входа в скоуп ещё доводим
+    scope_settle: tuple[float, float] = (0.0, 0.0)      # на точке — выстрел сразу, без паузы после скоупа
     # --- антиотдача: ведём линию мышью, не телепортируем прицел на точку пули
     rcs_enabled: bool = True
-    rcs_rate: float = 28.0                   # °/с база ведения линии (потом плавает)
-    rcs_rate_jitter: float = 0.030           # ± доля скорости xxHash (меньше дрейфа — точнее линия)
-    rcs_gain: float = 10.5                   # 1/с: догон линии, не lock 340°/с
-    rcs_wind_sigma: float = 0.20             # °/с ветер WindMouse на линии (меньше бокового разноса)
+    rcs_rate: float = 140.0                  # °/с: догон паттерна, чтобы пуля не уходила из круга
+    rcs_rate_jitter: float = 0.020           # ± доля скорости xxHash
+    rcs_gain: float = 26.0                   # 1/с: догон линии отдачи
+    rcs_wind_sigma: float = 0.20             # не используется: кривая — тот же WindMouse, что на маршруте
+    rcs_cluster: tuple[float, float] = (0.10, 0.24)      # °: тесный круг попаданий
+    rcs_cluster_err: tuple[float, float] = (0.015, 0.05) # °: погрешность радиуса, xxHash
     rcs_return_mul: tuple[float, float] = (0.92, 1.32)  # xxHash: скорость возврата от скорости RCS
     rcs_return_done: float = 0.65            # °: считаем, что вернулись
     rcs_break_deg: float = 5.5               # °: сошли с линии слишком далеко — отпускаем зажим
@@ -330,13 +350,16 @@ class NavConfig:
     # --- перезарядка / осмотр / нож / дальние тапы
     habits_enabled: bool = True
     habit_clear_dist: float = 380.0          # u: «рядом нет мишеней»
-    long_tap_dist: float = 1100.0            # u: дальше автомат тапает (кроме 20% зажима)
+    long_tap_dist: float = 1100.0            # u: дальше автомат бьёт парами, не зажимом
+    long_tap_burst: int = 2                  # пуль в одной дальней очереди-тапе
     long_spray_chance: float = 0.20          # шанс зажима на дистанции
     combat_reload_chance: float = 0.045      # редко перезарядиться, даже если мишень рядом
     healthshot_hp: float = 70.0              # колоть шприц при HP ≤ этого
     healthshot_early_chance: float = 0.20    # xxHash: порог чуть выше 70%
     healthshot_early_hp: tuple[float, float] = (73.0, 82.0)
-    healthshot_inject: tuple[float, float] = (1.02, 1.28)  # с: анимация укола
+    healthshot_deploy: tuple[float, float] = (0.40, 0.68)  # с: шприц в руке, потом ЛКМ
+    healthshot_inject: tuple[float, float] = (2.40, 2.90)  # с: держим до конца анимации, иначе слот её срывает
+    healthshot_settle: tuple[float, float] = (0.12, 0.22)  # с: после отпускания, до смены оружия
     eye_height: float = 64.0                 # z глаз над ногами (стоя)
     target_body_radius: float = 16.0         # мишень — цилиндр, как игрок
     target_avoid_dist: float = 72.0          # начинаем обходить мишень на теле маршрута с этого расстояния
@@ -393,6 +416,14 @@ class Navigator:
         self._aim_speed_mul = 1.0
         self._aim_accel_mul = 1.0             # xxHash на вход в фазу: насколько быстро добираем скорость
         self._chase_rise = 0.08
+        self._aim_rate = 1800.0
+        self._turn_rate = 2000.0
+        self._turn_acc = 1600.0
+        self._turn_jerk = 10000.0
+        self._chase_rate = 800.0
+        self._chase_acc = 1100.0
+        self._chase_jerk = 8000.0
+        self._chase_motion_ready = False
 
         self.route: Route | None = None
         self.goal_id: int | None = None
@@ -425,6 +456,8 @@ class Navigator:
         self._tgt_lat = 0.0
         self._tgt_aim_dist = 400.0
         self._track_aim = [0.0, 0.0]
+        self._aim_steady: tuple[float, float] | None = None
+        self._aim_steady_d = (0.0, 0.0)
         self._track_want = (0.0, 0.0)
         self._track_phase = "center"
         self._track_until = 0.0
@@ -549,6 +582,8 @@ class Navigator:
         self._rcs_arc = 0.0
         self._rcs_rate_var = 0.0
         self._rcs_sampled = False
+        self._rcs_cluster = 0.7
+        self._rcs_wander = [0.0, 0.0]
         self._rcs_return = False
         self._rcs_return_rate = 28.0
         self._rcs_return_until = 0.0
@@ -556,6 +591,7 @@ class Navigator:
         # флик: None | dict(t0, T, dyaw, dpitch, s_prev); _flick_pending — новый захват, флик ещё не спланирован
         self._flick: dict | None = None
         self._flick_pending = False
+        self._turn_commit = 0.0                 # сторона разворота у ±180°, чтобы прицел не гасил сам себя
         self._aim_handoff_t0: float | None = None
         self._aim_used_flick = False
         self._subflicks = 0                      # корректирующих подвижений после основного маха
@@ -568,6 +604,8 @@ class Navigator:
         self._target_engage_until = 0.0          # до какого момента держим взгляд на текущей мишени
         self._target_cooldown: dict[int, float] = {}   # index → когда снова можно смотреть
         self._target_behind_since: float | None = None
+        self._engage_q: list[int] = []            # порядок атаки: ближе к прицелу раньше, без пересортировки на ходу
+        self._target_lost_at: float | None = None # когда текущая впервые пропала из видимости
         self.weapon: dict = {"id": 0, "name": "", "clip": 0, "in_reload": False, "auto": False, "fire": "none"}
         self.life: dict = {
             "alive": True,
@@ -575,7 +613,8 @@ class Navigator:
             "health": 100,
             "events": {"died": False, "respawned": False},
         }
-        self._long_spray: bool | None = None     # дальняя: None = ещё не кинули 20%
+        self._long_spray: bool | None = None     # дальняя: False = тап парами
+        self._far_burst_n = 0
         self._reload_frac = 0.20                 # доля обоймы, при которой жмём R
         self._reload_wid = -1
         self._reload_skip = False                # рядом была мишень — в этот магазин боевой R не катили
@@ -609,13 +648,19 @@ class Navigator:
         )
 
     def _around_visible(self, e: dict, x: float, y: float, z: float) -> bool:
-        """Прямая видимость вокруг бота (LOS по карте), не конус камеры."""
+        """Прямая видимость вокруг бота: навмеш или статус движка (маска локального игрока).
+
+        2.5D-карта часто молчит на ступенях и стыках ярусов, хотя игра уже пометила мишень видимой.
+        Радарная метка за стеной сюда не входит.
+        """
         if e.get("dormant"):
             return False
         if "visible" not in e or e.get("_vis_pos") != (round(x), round(y), round(z)):
             self._apply_los_visibility(e, x, y, z)
             e["_vis_pos"] = (round(x), round(y), round(z))
-        return bool(e.get("visible"))
+        if e.get("spotted") and not e.get("visible"):
+            e["visible"] = True
+        return bool(e.get("visible") or e.get("spotted"))
 
     def _visible_parts(self, e: dict, x: float, y: float, z: float) -> dict[str, tuple[float, float, float] | None]:
         """Какие кости видны из глаз бота (LOS по 2.5D-карте).
@@ -703,24 +748,16 @@ class Navigator:
         }
 
     def _note_vulnerability(self, e: dict, now: float) -> None:
-        """Пока spawn-защита — не стреляем; после снятия ждём ~1 с (xxHash, не ровно секунда)."""
+        """Пока spawn-защита — не стреляем. Как только снялась, огонь в тот же тик."""
         idx = e["index"]
         if not e.get("vulnerable", True):
             self._immune_seen.add(idx)
             self._vuln_ready_at.pop(idx, None)
             return
-        if idx not in self._immune_seen or idx in self._vuln_ready_at:
-            return
-        lo, hi = self.cfg.vuln_fire_delay
-        wait = lo + self._xx_u01() * (hi - lo)
-        self._vuln_ready_at[idx] = now + wait
-        self.log(f"Мишень {e.get('name') or idx} уязвима — огонь через {wait:.2f}s")
+        self._vuln_ready_at.pop(idx, None)
 
     def _target_can_fire(self, now: float, target: dict) -> bool:
-        if not target.get("vulnerable", True):
-            return False
-        ready = self._vuln_ready_at.get(target["index"])
-        return ready is None or now >= ready
+        return bool(target.get("vulnerable", True))
 
     def _read_enemies(self) -> list[dict]:
         """Все живые враги из памяти (видимые и нет). Fallback — только spotted."""
@@ -1333,21 +1370,23 @@ class Navigator:
             return self._scoped_now
 
     def _rcs_resample(self) -> None:
-        """Новый спрей: лёгкий хаос xxHash. Разброс сжат, under всегда <1 (как игрок:
-        чуть недо-компенсируем, не перекидываем камеру за траекторию отдачи)."""
-        self._rcs_scale_x = 0.955 + self._xx_u01() * 0.040   # 0.955..0.995: не overshoot по yaw
-        self._rcs_scale_y = 0.960 + self._xx_u01() * 0.035   # 0.960..0.995: не overshoot по pitch
-        self._rcs_rot = (self._xx_u01() - 0.5) * 0.9          # ±0.45° поворот паттерна
-        self._rcs_lag = 0.020 + self._xx_u01() * 0.020       # 0.020..0.040 с реакция руки
-        self._rcs_under = 0.955 + self._xx_u01() * 0.035     # 0.955..0.990 всегда недо-коррекция
-        self._rcs_arc = (self._xx_u01() - 0.5) * 0.08         # ±0.04 — мягкий изгиб линии
+        """Новый спрей: масштаб около полной компенсации, кривая — WindMouse внутри круга."""
+        self._rcs_scale_x = 0.994 + self._xx_u01() * 0.012   # 0.994..1.006
+        self._rcs_scale_y = 0.994 + self._xx_u01() * 0.012
+        self._rcs_rot = (self._xx_u01() - 0.5) * 0.35
+        self._rcs_lag = 0.006 + self._xx_u01() * 0.012       # рука почти сразу за паттерном
+        self._rcs_under = 0.996 + self._xx_u01() * 0.008     # 0.996..1.004, не систематический недовод
+        self._rcs_arc = (self._xx_u01() - 0.5) * 0.04
         self._rcs_rate_var = (self._xx_u01() - 0.5) * self.cfg.rcs_rate_jitter
+        self._rcs_cluster = max(0.06, self._xx_band(self.cfg.rcs_cluster, self.cfg.rcs_cluster_err))
+        self._rcs_wander = [0.0, 0.0]
         self._rcs_sampled = True
 
     def _rcs_reset(self) -> None:
         self._rcs_sampled = False
         self._rcs_shots_seen = 0
         self._rcs_shot_t = 0.0
+        self._rcs_wander = [0.0, 0.0]
 
     def _rcs_active(self) -> bool:
         if not self.cfg.rcs_enabled or not self.weapon.get("auto"):
@@ -1366,17 +1405,19 @@ class Navigator:
         return cycle + 0.14 + self._xx_u01() * 0.18
 
     def _should_spray(self, dist: float) -> bool:
-        """Зажим только вблизи; на long_tap_dist автомат тапает, кроме ~20% зажима с RCS."""
+        """Зажим только вблизи. Дальше автомат бьёт парой тапов, не держит кнопку."""
         if not self.weapon.get("auto"):
             return False
         if dist < self.cfg.long_tap_dist:
             if self._long_spray is False:
                 self._long_spray = None
+                self._far_burst_n = 0
             return True
-        if self._long_spray is None:
-            self._long_spray = self._xx_u01() < self.cfg.long_spray_chance
-            self.log("Дальний зажим с антиотдачей" if self._long_spray else "Дальний тап")
-        return self._long_spray
+        if self._long_spray is not False:
+            self._long_spray = False
+            self._far_burst_n = 0
+            self.log(f"Дальний тап ({self.cfg.long_tap_burst})")
+        return False
 
     def _pulse_key(self, key: str, now: float, hold: float | None = None) -> None:
         if hold is None:
@@ -1594,21 +1635,22 @@ class Navigator:
         already = is_healthshot(int(self.weapon.get("id") or 0), str(self.weapon.get("name") or ""))
         self._habit = {
             "kind": "healthshot",
-            "phase": "inject" if already else "pick",
+            "phase": "deploy" if already else "pick",
             "back": back,
             "t0": now,
-            "next": now,
+            "next": now if not already else now + self._xx_range(self.cfg.healthshot_deploy),
             "tries": 0,
             "seen": set(),
         }
         thr = self._healthshot_thr()
         self.log(f"Медшприц (HP {int(self.life.get('health') or 0):.0f} ≤ {thr:.0f})")
-        if already:
-            self._healthshot_click(now)
 
     def _injecting(self) -> bool:
         h = self._habit
-        return bool(h and h.get("kind") == "healthshot" and h.get("phase") in {"inject", "wait"})
+        return bool(
+            h and h.get("kind") == "healthshot"
+            and h.get("phase") in {"deploy", "inject", "wait", "settle"}
+        )
 
     def _healthshot_click(self, now: float) -> None:
         h = self._habit
@@ -1631,7 +1673,9 @@ class Navigator:
             wid = int(self.weapon.get("id") or 0)
             name = str(self.weapon.get("name") or "")
             if is_healthshot(wid, name):
-                self._healthshot_click(now)
+                lo, hi = self.cfg.healthshot_deploy
+                h["phase"] = "deploy"
+                h["next"] = now + lo + self._xx_u01() * (hi - lo)
                 return
             if busy:
                 self._habit_abort(now, back_to_gun=True)
@@ -1651,15 +1695,28 @@ class Navigator:
                 fn(-1)
             h["next"] = now + 0.08 + self._xx_u01() * 0.07
             return
+        if phase == "deploy":
+            if now < float(h.get("next") or 0.0):
+                return
+            self._healthshot_click(now)
+            return
         if phase == "inject":
             self._healthshot_click(now)
             return
         if phase == "wait":
+            # ЛКМ держим всю анимацию. Ранний слот оружия обрывает укол.
             if now < float(h.get("next") or 0.0):
                 return
             if self._fire_held:
                 self.input.mouse_up("left")
                 self._fire_held = False
+            lo, hi = self.cfg.healthshot_settle
+            h["phase"] = "settle"
+            h["next"] = now + lo + self._xx_u01() * (hi - lo)
+            return
+        if phase == "settle":
+            if now < float(h.get("next") or 0.0):
+                return
             self._pulse_key(str(h.get("back") or "1"), now)
             h["phase"] = "to_gun"
             h["next"] = now + self._key_gap()
@@ -1753,10 +1810,27 @@ class Navigator:
             ny, np_ = -p / mag, y / mag
             y += ny * bend
             p += np_ * bend * 0.35
-        return y, p
+        wy, wp = self._rcs_wander_step(1.0 / max(1.0, self.cfg.tick_hz))
+        return y + wy, p + wp
+
+    def _rcs_wander_step(self, dt: float) -> tuple[float, float]:
+        """Кривая вокруг линии отдачи: тот же WindMouse, что панорама маршрута.
+
+        Смещение держится внутри круга. Радиус круга — диапазон плюс погрешность xxHash.
+        """
+        cfg = self.cfg
+        wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay)
+        self._rcs_wander[0] += wy * dt
+        self._rcs_wander[1] += wp * 0.5 * dt
+        r = max(0.06, self._rcs_cluster)
+        mag = math.hypot(self._rcs_wander[0], self._rcs_wander[1])
+        if mag > r:
+            self._rcs_wander[0] *= r / mag
+            self._rcs_wander[1] *= r / mag
+        return self._rcs_wander[0], self._rcs_wander[1]
 
     def _rcs_step(self, yaw_err: float, pitch_err: float, dt: float) -> tuple[float, float]:
-        """Ведем линию как рукой: S-кривая, плавающая скорость, ветер WindMouse."""
+        """Догоняем кривую отдачи. Вертикаль с тем же ускорением, что yaw: иначе пули уходят вверх."""
         cfg = self.cfg
         j = cfg.rcs_rate_jitter
         decay = 0.92
@@ -1764,21 +1838,37 @@ class Navigator:
         self._rcs_rate_var = self._rcs_rate_var * decay + (self._xx_u01() * 2.0 - 1.0) * kick
         self._rcs_rate_var = max(-j, min(j, self._rcs_rate_var))
         rate = cfg.rcs_rate * (1.0 + self._rcs_rate_var)
-        old_sigma = cfg.hand_wind_sigma
-        cfg.hand_wind_sigma = cfg.rcs_wind_sigma
-        try:
-            return self._camera_step(
-                yaw_err, pitch_err, dt, 0.0,
-                rate_max=rate, gain=cfg.rcs_gain,
-                pitch_gain=cfg.rcs_gain, pitch_rate_max=rate,
-                deadband=0.04, wind=True,
-            )
-        finally:
-            cfg.hand_wind_sigma = old_sigma
+        db = 0.04
+        soft = abs(yaw_err) / (abs(yaw_err) + db)
+        soft_p = abs(pitch_err) / (abs(pitch_err) + db)
+        des_y = max(-rate, min(rate, cfg.rcs_gain * yaw_err * soft))
+        des_p = max(-rate, min(rate, cfg.rcs_gain * pitch_err * soft_p))
+        acc = cfg.yaw_accel_max
+        jerk = cfg.yaw_jerk_max
+        self._yaw_rate, self._yaw_acc = self._track_rate(
+            self._yaw_rate, self._yaw_acc, des_y, dt, acc, jerk
+        )
+        self._pitch_rate, self._pitch_acc = self._track_rate(
+            self._pitch_rate, self._pitch_acc, des_p, dt, acc, jerk
+        )
+        d_yaw = self._yaw_rate * dt
+        d_pitch = self._pitch_rate * dt
+        if abs(d_yaw) > abs(yaw_err) and abs(yaw_err) < 4.0:
+            d_yaw = yaw_err
+            self._yaw_rate *= 0.15 if abs(yaw_err) < 0.6 else 0.45
+            self._yaw_acc = 0.0
+        if abs(d_pitch) > abs(pitch_err) and abs(pitch_err) < 4.0:
+            d_pitch = pitch_err
+            self._pitch_rate *= 0.15 if abs(pitch_err) < 0.6 else 0.45
+            self._pitch_acc = 0.0
+        return d_yaw, d_pitch
 
     def _begin_rcs_return(self) -> None:
         """После зажима: вернуть прицел быстро и плавно, скорость как у RCS, путь WindMouse как на маршруте."""
         if self._rcs_return:
+            return
+        # после убийства цели уже нет — не тянуть прицел «обратно» по ветру
+        if self._target is None:
             return
         if not self._rcs_sampled or self._rcs_shots_seen < 1:
             return
@@ -1821,48 +1911,39 @@ class Navigator:
             yaw_err, pitch_err, dt, 0.0,
             rate_max=rate, gain=self.cfg.rcs_gain,
             pitch_gain=self.cfg.rcs_gain, pitch_rate_max=rate,
-            deadband=0.08, wind=True,
+            deadband=0.08, wind=math.hypot(yaw_err, pitch_err) > 4.0,
         )
 
     # ------------------------------------------------------------ targets
 
     def _update_target(
-        self, now: float, x: float, y: float, z: float, yaw: float, move_bearing: float | None, speed: float
+        self, now: float, x: float, y: float, z: float, yaw: float, move_bearing: float | None, speed: float,
+        pitch: float = 0.0,
     ) -> dict | None:
         """
         Какую мишень вести камерой (или None — идём по маршруту).
 
-        Берём всех, кого видно вокруг (LOS по карте или spotted), не только узкий конус
-        камеры. Ближние сбоку/сзади важнее дальних в прицеле. Пока текущая видна — держим
-        её; на новую переключаемся, только если она заметно опаснее. После исчезновения
-        ещё target_hold секунд смотрим в ту же точку. Смотрим на одну мишень не дольше
-        target_engage_max, потом возвращаемся к маршруту (cooldown). Дальнюю позади на
-        бегу отпускаем; ближнюю вокруг — поворачиваемся.
+        Видимость — вокруг бота, не конус камеры. Если несколько появились сразу,
+        список один раз сортируется по углу к прицелу. Пока текущая видна, прицел
+        на других не переводим. Пропала, а следующая уже видна — берём её сразу.
         """
         cfg = self.cfg
-        if not cfg.engage_targets or (cfg.fire_enabled and not self.yaw_verified and self._target is None):
-            # без подтверждённого соглашения yaw прицел может быть развёрнут — сначала пройдёмся
+        if not cfg.engage_targets:
             self._target = None
+            self._engage_q = []
+            self._target_lost_at = None
             return None
 
         def ang_err(e: dict) -> float:
-            ex, ey, _ = e["position"]
-            return abs(shortest_yaw_err(yaw_to_target(x, y, ex, ey), yaw))
+            ex, ey, ez = e["position"]
+            yerr = abs(shortest_yaw_err(yaw_to_target(x, y, ex, ey), yaw))
+            horiz = math.hypot(ex - x, ey - y)
+            want_pitch = -math.degrees(math.atan2(ez - (z + self._eye_z), max(1.0, horiz)))
+            return math.hypot(yerr, want_pitch - pitch)
 
         def dist_xy(e: dict) -> float:
             ex, ey, _ = e["position"]
             return math.hypot(ex - x, ey - y)
-
-        def threat(e: dict) -> float:
-            d = dist_xy(e)
-            close = 0.55 if d < 380.0 else 1.0
-            return d * close + ang_err(e) * 0.7
-
-        def behind(e: dict) -> bool:
-            if move_bearing is None:
-                return False
-            ex, ey, _ = e["position"]
-            return abs(shortest_yaw_err(yaw_to_target(x, y, ex, ey), move_bearing)) > cfg.target_behind_deg
 
         def start(e: dict, fast: bool) -> None:
             self._target = dict(e)
@@ -1917,9 +1998,18 @@ class Navigator:
                 self._aim_handoff_t0 = None
                 self._aim_used_flick = False
                 self._subflicks = 0
+                self._chase_on = False
+                self._chase_motion_ready = False
                 self._aim_speed_resample()
+                self._rcs_return = False
+                ayaw, apitch = self._aim_angles(x, y, z, e)
+                yerr = shortest_yaw_err(ayaw, yaw)
+                perr = apitch - pitch
+                self._turn_commit = 1.0 if yerr >= 0.0 else -1.0
+                self._kick_turn(yerr, perr)
             self._release_fire()
             self._long_spray = None
+            self._far_burst_n = 0
             if self._habit and self._habit.get("kind") == "unscope_knife":
                 self._habit_abort(now, back_to_gun=True)
             self._unscope_left = 0
@@ -1939,7 +2029,10 @@ class Navigator:
             if self._target is not None:
                 self._recent_aim_index = self._target["index"]
                 self._recent_aim_drop = now
-                self._target_cooldown[self._target["index"]] = now + (cooldown or cfg.target_cooldown)
+                wait = cfg.target_cooldown if cooldown is None else max(0.0, cooldown)
+                lost = self._target["index"]
+                self._target_cooldown[lost] = now + wait
+                self._engage_q = [i for i in self._engage_q if i != lost]
                 if cooldown is not None and cooldown >= cfg.target_done_cooldown:
                     self._given_up[self._target["index"]] = now + cooldown
                 if self._shots_on_target:
@@ -1947,14 +2040,26 @@ class Navigator:
                     reason += f", {self._shots_on_target} выстр."
                 self.log(f"Мишень отпущена ({reason})")
             self._target = None
+            self._target_lost_at = None
             self._target_behind_since = None
             self._aimed_since = None
             self._shot_miss = None
             self._flick = None
             self._flick_pending = False
+            self._turn_commit = 0.0
             self._aim_handoff_t0 = None
             self._aim_used_flick = False
             self._release_fire()
+            self._rcs_return = False
+            self._yaw_rate = 0.0
+            self._pitch_rate = 0.0
+            self._yaw_acc = 0.0
+            self._pitch_acc = 0.0
+            self._wind[0] = 0.0
+            self._wind[1] = 0.0
+            self._track_aim = [0.0, 0.0]
+            self._aim_steady = None
+            self._aim_steady_d = (0.0, 0.0)
             self._begin_unscope(use_knife=unscope_knife)
             self._scope_plan = None
             self._scope_committed = False
@@ -1962,34 +2067,92 @@ class Navigator:
             self._strafe_fire_ok = True
             self._rcs_reset()
             self._long_spray = None
+            self._far_burst_n = 0
             self._aim_fast_peek = False
 
+        alive = {
+            e["index"]: e
+            for e in self.all_enemies
+            if int(e.get("health") or 0) > 0 and dist_xy(e) <= cfg.target_max_dist
+        }
         cand = [
-            e for e in self.all_enemies
-            if dist_xy(e) <= cfg.target_max_dist
-            and self._target_cooldown.get(e["index"], 0.0) <= now
+            e for e in alive.values()
+            if self._target_cooldown.get(e["index"], 0.0) <= now
             and self._around_visible(e, x, y, z)
         ]
+        by_id = {e["index"]: e for e in cand}
+        # мёртвые и вышедшие из мира — сразу из списка, без пересортировки живых
+        self._engage_q = [i for i in self._engage_q if i in alive]
+
+        def enqueue_new() -> None:
+            """Уже стоящие не двигаются. Кто появился позже — в хвост, в порядке угла к прицелу."""
+            have = set(self._engage_q)
+            fresh = sorted((e for e in cand if e["index"] not in have), key=ang_err)
+            for e in fresh:
+                self._engage_q.append(e["index"])
+
+        def acquire(e: dict, fast: bool) -> None:
+            if self._target is not None and self._target["index"] == e["index"]:
+                self._target = dict(e)
+                self._target_last_seen = now
+                return
+            start(e, fast)
+
         cur = self._target
-        same = next((e for e in cand if e["index"] == cur["index"]), None) if cur is not None else None
+        cur_alive = cur is not None and cur["index"] in alive
+        same = by_id.get(cur["index"]) if cur_alive else None
         self._target_visible_now = same is not None
 
+        if cur is not None and not cur_alive:
+            has_next = any(i in by_id for i in self._engage_q if i != cur["index"])
+            drop("убита", 0.0, unscope_knife=not has_next)
+            cur = None
+            same = None
+
         if same is not None:
-            best = min(cand, key=threat)
-            if best["index"] != same["index"] and threat(best) + cfg.target_switch_margin < threat(same):
-                start(best, fast=True)
+            self._target_lost_at = None
+            if same["index"] not in self._engage_q:
+                self._engage_q.insert(0, same["index"])
+            enqueue_new()
+            self._engage_q = [i for i in self._engage_q if i == same["index"] or i in by_id]
+            self._target = dict(same)
+            self._target_last_seen = now
+        elif cur is not None:
+            if self._target_lost_at is None:
+                self._target_lost_at = now
+            enqueue_new()
+            self._engage_q = [i for i in self._engage_q if i == cur["index"] or i in by_id]
+            others = [i for i in self._engage_q if i != cur["index"] and i in by_id]
+            # Рядом с прошлой точкой — один пропуск опроса не считается.
+            # Другая уже видна и далеко от прицела (часто сзади) — берём её в этот же тик.
+            if others:
+                gap = min(ang_err(by_id[i]) for i in others)
+                limit = 0.0 if gap > 40.0 else 0.08
+            else:
+                limit = cfg.target_hold
+            if now - self._target_lost_at < limit:
                 self._target_visible_now = True
             else:
-                self._target = dict(same)
-                self._target_last_seen = now
+                lost = cur["index"]
+                self._engage_q = [i for i in self._engage_q if i != lost and i in by_id]
+                has_next = bool(self._engage_q)
+                drop("пропала из виду", 0.0, unscope_knife=not has_next)
+                if self._engage_q:
+                    acquire(by_id[self._engage_q[0]], True)
+                    self._target_visible_now = True
         elif cand:
-            fast = cur is not None and now - self._target_last_seen <= cfg.target_hold
-            if cur is not None:
-                drop("пропала, есть следующая", unscope_knife=False)
-            start(min(cand, key=threat), fast)
-            self._target_visible_now = True
-        elif cur is not None and now - self._target_last_seen > cfg.target_hold:
-            drop("пропала из виду")
+            self._target_lost_at = None
+            if not self._engage_q:
+                self._engage_q = [e["index"] for e in sorted(cand, key=ang_err)]
+            else:
+                self._engage_q = [i for i in self._engage_q if i in by_id]
+                enqueue_new()
+            if self._engage_q:
+                acquire(by_id[self._engage_q[0]], False)
+                self._target_visible_now = True
+        else:
+            self._engage_q = []
+            self._target_lost_at = None
 
         t = self._target
         if t is None:
@@ -1997,32 +2160,37 @@ class Navigator:
         # задержка реакции: мишень уже «в памяти», но взгляд ещё не перенесён
         if now - self._target_seen_at < self._target_reaction:
             return None
-        # лимит выстрелов (если задан) — обратно к маршруту
+        # лимит выстрелов (если задан) — эта мишень в хвост не возвращается, очередь идёт дальше
         if (
             cfg.fire_enabled and cfg.shots_per_target > 0
             and self._shots_on_target >= cfg.shots_per_target and now >= self._next_fire_at
         ):
             drop("лимит выстрелов", cfg.target_done_cooldown)
             return None
-        # предохранитель: слишком долго на одной мишени (не навелись / она не пропадает)
-        if now >= self._target_engage_until:
-            if not cfg.fire_enabled:
-                drop("достаточно")
-            elif self._shots_on_target:
-                drop("не пропадает, идём дальше", cfg.target_done_cooldown)
-            else:
-                drop("не навелись, идём дальше")
-            return None
-        # дальняя позади на бегу — не бежим спиной; ближнюю вокруг себя разворачиваемся
-        if speed > 100.0 and behind(t) and not self.firing and dist_xy(t) > 400.0:
-            if self._target_behind_since is None:
-                self._target_behind_since = now
-            elif now - self._target_behind_since > 0.6:
-                drop("осталась позади")
-                return None
-        else:
-            self._target_behind_since = None
         return t
+
+    def _steady_aim(self, aim_yaw: float, aim_pitch: float, yaw: float, pitch: float) -> tuple[float, float]:
+        """Мелкое дрожание кости не водит прицел. Сдвиг в одну сторону проходит сразу."""
+        err = math.hypot(shortest_yaw_err(aim_yaw, yaw), aim_pitch - pitch)
+        if self._aim_steady is None or err > 5.0:
+            self._aim_steady = (aim_yaw, aim_pitch)
+            self._aim_steady_d = (0.0, 0.0)
+            return aim_yaw, aim_pitch
+        sy, sp = self._aim_steady
+        dy = shortest_yaw_err(aim_yaw, sy)
+        dp = aim_pitch - sp
+        py, pp = self._aim_steady_d
+
+        def keep(delta: float, prev: float) -> float:
+            if abs(delta) < 0.40 and prev * delta < 0.0:
+                return 0.0
+            return delta
+
+        dy2 = keep(dy, py)
+        dp2 = keep(dp, pp)
+        self._aim_steady = (sy + dy2, sp + dp2)
+        self._aim_steady_d = (dy, dp)
+        return self._aim_steady
 
     def _aim_angles(self, x: float, y: float, z: float, target: dict) -> tuple[float, float]:
         """yaw/pitch из глаз на выбранную точку кости (голова или грудь)."""
@@ -2526,6 +2694,7 @@ class Navigator:
             self._aimed_since = None
             self._shot_miss = False
             self._long_spray = None
+            self._far_burst_n = 0
             self._combat_strafe = None
             self._strafe_fire_ok = True
             self._release_fire()
@@ -2775,6 +2944,10 @@ class Navigator:
         self._target = None
         self.engaged = False
         self.firing = False
+        self._engage_q = []
+        self._target_lost_at = None
+        self._target_cooldown.clear()
+        self._given_up.clear()
         self._immune_seen.clear()
         self._vuln_ready_at.clear()
         self._flick = None
@@ -2811,6 +2984,10 @@ class Navigator:
         self._standoff = None
         self._target = None
         self.engaged = False
+        self._engage_q = []
+        self._target_lost_at = None
+        self._target_cooldown.clear()
+        self._given_up.clear()
         self._hpshot_thr = None
         self._ladder = None
         self._crouch_until = 0.0
@@ -3495,6 +3672,26 @@ class Navigator:
         self._wind[1] = self._wind[1] * decay + self.rng.gauss(0.0, k)
         return self._wind[0], self._wind[1]
 
+    def _aim_wind(self, dt: float, yaw_err: float, pitch_err: float) -> tuple[float, float]:
+        """Дуга наведения: тот же WindMouse, что на маршруте (σ и decay).
+
+        На быстром флике ветер масштабируется скоростью, чтобы изгиб на градус пути
+        совпал с панорамой навигации, а не выродился в прямую.
+        """
+        cfg = self.cfg
+        mag = math.hypot(yaw_err, pitch_err)
+        # у самой мишени дуга уже не нужна: ветер здесь раскачивает прицел
+        if mag < 5.0:
+            return 0.0, 0.0
+        fade = min(1.0, (mag - 5.0) / 8.0)
+        wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay)
+        activity = min(1.0, (abs(self._yaw_rate) + abs(self._pitch_rate)) / 60.0)
+        activity *= min(1.0, mag / 3.5)
+        nav = max(80.0, cfg.yaw_rate_max)
+        rate = max(nav, math.hypot(self._yaw_rate, self._pitch_rate))
+        scale = rate / nav
+        return wy * scale * activity * fade * dt, wp * scale * activity * fade * 0.5 * dt
+
     def _tremor_step(self) -> tuple[float, float]:
         """Тремор удержания (°/тик): медленно меняющийся, без «зернистости» тик-в-тик."""
         decay = 0.85
@@ -3521,17 +3718,42 @@ class Navigator:
         lo, hi = span
         return lo + self._xx_u01() * (hi - lo)
 
+    def _xx_band(self, span: tuple[float, float], err_span: tuple[float, float]) -> float:
+        """Точка из диапазона плюс погрешность из своего диапазона. Оба выбора — xxHash."""
+        err = self._xx_range(err_span)
+        if self._xx_u01() < 0.5:
+            err = -err
+        return self._xx_range(span) + err
+
     def _sample_aim_accel(self) -> float:
         """Ускорение к скорости фазы. Скорость камеры при этом не обнуляется."""
         self._aim_accel_mul = self._xx_range(self.cfg.aim_accel_span)
         return self._aim_accel_mul
 
     def _aim_speed_resample(self) -> None:
-        """Новая точка в диапазоне на каждое захватывание мишени (одинаковая дистанция ≠ одна скорость)."""
-        j = self.cfg.aim_speed_jitter
+        """Новая точка в диапазоне на каждое захватывание мишени (одинаковая дистанция ≠ одна скорость).
+
+        Скорость камеры не обнуляется: разворот стартует с той, что была на навигации.
+        """
+        cfg = self.cfg
+        j = cfg.aim_speed_jitter
         self._aim_speed_var = (self._xx_u01() * 2.0 - 1.0) * j
         self._aim_speed_mul = 1.0 + self._aim_speed_var
         self._sample_aim_accel()
+        self._aim_rate = max(220.0, self._xx_band(cfg.aim_aim_rate, cfg.aim_aim_rate_err))
+        self._turn_rate = max(220.0, self._xx_band(cfg.aim_turn_rate, cfg.aim_turn_rate_err))
+        self._turn_acc = max(280.0, self._xx_band(cfg.aim_turn_accel, cfg.aim_turn_accel_err))
+        self._turn_jerk = max(1200.0, self._xx_band(cfg.aim_turn_jerk, cfg.aim_turn_jerk_err))
+
+    def _sample_chase_motion(self) -> None:
+        """Конечная скорость и разгон преследования. Текущую скорость камеры не трогаем."""
+        cfg = self.cfg
+        if self._chase_motion_ready:
+            return
+        self._chase_rate = max(160.0, self._xx_band(cfg.aim_chase_rate, cfg.aim_chase_rate_err))
+        self._chase_acc = max(180.0, self._xx_band(cfg.aim_chase_accel, cfg.aim_chase_accel_err))
+        self._chase_jerk = max(800.0, self._xx_band(cfg.aim_chase_jerk, cfg.aim_chase_jerk_err))
+        self._chase_motion_ready = True
 
     def _aim_speed_step(self) -> float:
         """AR(1)-плавание множителя в ±jitter; шум — xxHash, не gauss из random."""
@@ -3595,18 +3817,20 @@ class Navigator:
                 if not self._chase_on:
                     self._chase_mul = self._xx_range(cfg.aim_chase_speed)
                     self._chase_rise = self._xx_range(cfg.aim_chase_rise)
-                    self._sample_aim_accel()
                     self._chase_on = True
+                    self._chase_motion_ready = False
                     self._begin_track_over(now)
                 want = self._chase_mul * self._track_pace
                 self._advance_track_phase(now)
             else:
                 self._chase_on = False
+                self._chase_motion_ready = False
                 if not self._shot_miss:
                     self._track_phase = "center"
                     self._track_want = (0.0, 0.0)
         else:
             self._chase_on = False
+            self._chase_motion_ready = False
             self._lat_sign = 0
             if not self._shot_miss:
                 self._track_phase = "center"
@@ -3632,7 +3856,10 @@ class Navigator:
         lead_u = lo + self._xx_u01() * (hi - lo)
         lead = math.degrees(math.atan2(lead_u, max(80.0, self._tgt_aim_dist)))
         cap = 0.28 if self._scoped_now else 0.65
-        lead = min(lead, cap)
+        half = math.degrees(
+            math.atan2(cfg.fire_target_half_width * cfg.fire_oval_frac, max(80.0, self._tgt_aim_dist))
+        )
+        lead = min(lead, cap, max(0.04, half * 0.65))
         sign = 1.0 if self._tgt_lat >= 0.0 else -1.0
         plo, phi = cfg.aim_track_pace
         self._track_pace = plo + self._xx_u01() * (phi - plo)
@@ -3681,26 +3908,151 @@ class Navigator:
             yaw_err, pitch_err, dt, speed, rate_max, gain, pitch_gain, pitch_max, deadband=0.12
         )
 
-    def _aim_lock(self, yaw_err: float, pitch_err: float, dt: float) -> tuple[float, float]:
-        """Дожим в центр: скорость с текущей, ветер — тот же WindMouse, что на маршруте."""
+    def _kick_turn(self, yaw_err: float, pitch_err: float) -> None:
+        """Большой угол, чаще всего мишень сзади: скорость от неё снимаем, к ней сразу есть ход.
+
+        Потолок разворота не меняется — это только старт уже выбранной S-кривой, не прыжок в максимум.
+        """
+        mag = math.hypot(yaw_err, pitch_err)
+        if mag < 70.0:
+            return
+        ux, uy = yaw_err / mag, pitch_err / mag
+        v_along = self._yaw_rate * ux + self._pitch_rate * uy
+        if v_along < 0.0:
+            self._yaw_rate -= ux * v_along
+            self._pitch_rate -= uy * v_along
+            v_along = 0.0
+        v_kin = math.sqrt(max(0.0, 2.0 * max(400.0, self._turn_acc) * mag))
+        floor = min(self._turn_rate * (0.28 + 0.16 * self._xx_u01()), v_kin * 0.72)
+        if v_along < floor:
+            need = floor - v_along
+            self._yaw_rate += ux * need
+            self._pitch_rate += uy * need
+        self._yaw_acc = 0.0
+        self._pitch_acc = 0.0
+
+    def _hold_turn_side(self, yaw_err: float, pitch_err: float) -> tuple[float, float]:
+        """Около ±180° кратчайшая дуга меняет знак каждый тик: разгон гасится, прицел стоит, потом срывается."""
+        if abs(yaw_err) < 140.0:
+            self._turn_commit = 0.0
+            return yaw_err, pitch_err
+        if self._turn_commit == 0.0:
+            self._turn_commit = 1.0 if yaw_err >= 0.0 else -1.0
+        if abs(yaw_err) > 165.0 and yaw_err * self._turn_commit < 0.0:
+            yaw_err = self._turn_commit * abs(yaw_err)
+        return yaw_err, pitch_err
+
+    def _aim_ramp(
+        self,
+        yaw_err: float,
+        pitch_err: float,
+        dt: float,
+        final_rate: float,
+        acc: float,
+        jerk: float,
+    ) -> tuple[float, float]:
+        """S-кривая от текущей скорости камеры. Потолок ниже скорости, с которой ещё можно остановиться.
+
+        Иначе контроллер считает скорость «уже нужной», не тормозит и пролетает мишень
+        на десятки градусов — прицел мотает влево-вправо и на спауне уходит в кручение.
+        """
+        mag = math.hypot(yaw_err, pitch_err)
+        if mag < 1e-4 or dt <= 0.0:
+            return 0.0, 0.0
+        ux, uy = yaw_err / mag, pitch_err / mag
+        v_along = self._yaw_rate * ux + self._pitch_rate * uy
+        v_kin = math.sqrt(max(0.0, 2.0 * acc * mag))
+        # запас на остановку остаётся, но потолок не сбрасывается почти в ноль:
+        # иначе прицел замирает рядом с точкой и выстрел уходит мимо
+        if v_along > v_kin * 0.95:
+            cap = max(0.0, v_kin * 0.62)
+        else:
+            cap = min(final_rate, v_kin * 0.95)
+        if mag < 4.0 and v_along <= v_kin * 0.95:
+            close_v = min(final_rate, mag / max(dt, 1e-4))
+            cap = max(cap, min(close_v, v_kin * 0.95))
+        des_y = ux * cap
+        des_p = uy * cap
+        self._yaw_rate, self._yaw_acc = self._track_rate(
+            self._yaw_rate, self._yaw_acc, des_y, dt, acc, jerk
+        )
+        self._pitch_rate, self._pitch_acc = self._track_rate(
+            self._pitch_rate, self._pitch_acc, des_p, dt, acc, jerk
+        )
+        d_yaw = self._yaw_rate * dt
+        d_pitch = self._pitch_rate * dt
+        wy, wp = self._aim_wind(dt, yaw_err, pitch_err)
+        d_yaw += wy
+        d_pitch += wp
+        if abs(d_yaw) > abs(yaw_err):
+            d_yaw = yaw_err
+            self._yaw_rate = 0.0
+            self._yaw_acc = 0.0
+        if abs(d_pitch) > abs(pitch_err):
+            d_pitch = pitch_err
+            self._pitch_rate = 0.0
+            self._pitch_acc = 0.0
+        if mag < 2.5:
+            d_yaw = self._deg_not_past(d_yaw, yaw_err, self._axis_k(True), yaw=True)
+            d_pitch = self._deg_not_past(d_pitch, pitch_err, self._axis_k(False), yaw=False)
+        return d_yaw, d_pitch
+
+    def _axis_k(self, yaw: bool) -> float:
+        """°/px с тем же множителем скоупа, что у отправки мыши."""
         cfg = self.cfg
-        boost = max(1.0, self._chase_boost)
-        # ведение ходящей мишени быстрее дожима стоячей; потолок и ускорение — из xxHash, не константа
-        follow = boost if self._chase_on else 1.0
-        g = cfg.aim_lock_gain * follow
-        r = cfg.aim_lock_rate * boost * self._aim_speed_mul
-        acc = 6400.0 * self._aim_accel_mul
-        jerk = cfg.yaw_jerk_max * 3.0 * self._aim_accel_mul
+        k = cfg.yaw_per_px if yaw else cfg.pitch_per_px
+        if self._scoped_now and k:
+            k *= 40.0 / 90.0
+        return k
+
+    def _half_px_deg(self) -> float:
+        return abs(self._axis_k(True)) * 0.5
+
+    def _deg_not_past(self, d: float, err: float, k: float, *, yaw: bool) -> float:
+        """Не отправлять пиксель, который перескакивает точку. До неё шаг не режется."""
+        slot = 0 if yaw else 1
+        if abs(k) < 1e-9:
+            return d
+        if abs(err) <= abs(k) * 0.5:
+            self._px_carry[slot] = 0.0
+            return 0.0
+        max_px = err / k
+        want = d / k + self._px_carry[slot]
+        rounded = int(round(want))
+        crosses = rounded > max_px if max_px >= 0.0 else rounded < max_px
+        if not crosses:
+            return d
+        px = math.trunc(max_px)
+        self._px_carry[slot] = 0.0
+        return px * k
+
+    def _aim_lock(self, yaw_err: float, pitch_err: float, dt: float) -> tuple[float, float]:
+        """Дожим в овал: скорость с текущей, у точки тихо, чтобы выстрел успевал."""
+        cfg = self.cfg
+        if self._chase_on:
+            self._sample_chase_motion()
+            r = self._chase_rate
+            acc = self._chase_acc
+            jerk = self._chase_jerk
+        else:
+            r = self._aim_rate
+            acc = self._turn_acc
+            jerk = self._turn_jerk
+        g = cfg.aim_lock_gain
+        close = math.hypot(yaw_err, pitch_err) < 1.5
+        if close:
+            # До точки быстро. Внутри полпикселя стоим: лишний пиксель перебрасывает прицел.
+            g = 480.0 if self._chase_on else 320.0
+            r = min(r, 720.0 if self._chase_on else 420.0)
+            acc = min(acc, 2800.0)
+            jerk = min(jerk, cfg.yaw_jerk_max)
         lag = dt
         ey = yaw_err - self._yaw_rate * lag
         ep = pitch_err - self._pitch_rate * lag
-        # меньше полупикселя — не дёргаем мышь туда-сюда (иначе ±1 px дрожание у точки)
-        if abs(ey) < 0.55 * abs(cfg.yaw_per_px):
+        hold = self._half_px_deg()
+        if math.hypot(yaw_err, pitch_err) <= hold:
             ey = 0.0
-            self._yaw_rate, self._yaw_acc = 0.0, 0.0
-        if abs(ep) < 0.55 * abs(cfg.pitch_per_px):
             ep = 0.0
-            self._pitch_rate, self._pitch_acc = 0.0, 0.0
         vmax_y = math.sqrt(2.0 * 0.7 * acc * abs(ey)) if ey else 0.0
         vmax_p = math.sqrt(2.0 * 0.7 * acc * abs(ep)) if ep else 0.0
         des_y = max(-min(r, vmax_y), min(min(r, vmax_y), g * ey))
@@ -3709,18 +4061,33 @@ class Navigator:
         self._pitch_rate, self._pitch_acc = self._track_rate(self._pitch_rate, self._pitch_acc, des_p, dt, acc, jerk)
         d_yaw = self._yaw_rate * dt
         d_pitch = self._pitch_rate * dt
-        activity = min(1.0, (abs(self._yaw_rate) + abs(self._pitch_rate)) / 60.0)
-        activity *= min(1.0, abs(yaw_err) / 3.5)
-        wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay)
-        d_yaw += wy * activity * dt
-        d_pitch += wp * activity * 0.5 * dt
-        # к точке ведения (голова + лёгкий перелёт), без уезда ветром в сторону
-        if abs(d_yaw) > abs(yaw_err):
+        if not close:
+            wy, wp = self._aim_wind(dt, yaw_err, pitch_err)
+            d_yaw += wy
+            d_pitch += wp
+        # лишний шаг за точку забираем. Скорость после посадки — угловая скорость мишени:
+        # 0, если она стоит, иначе прицел не отстаёт от овала и выстрел не пропадает.
+        carry = 0.0
+        if self._chase_on:
+            # atan, не «радианы = единицы/дистанция»: иначе посадка ставит сотни °/с и прицел срывается
+            carry = math.degrees(math.atan2(self._tgt_lat, max(80.0, self._tgt_aim_dist)))
+            carry = max(-90.0, min(90.0, carry))
+        if abs(d_yaw) > abs(yaw_err) and abs(yaw_err) < 1.5:
             d_yaw = yaw_err
-            self._yaw_rate, self._yaw_acc = 0.0, 0.0
-        if abs(d_pitch) > abs(pitch_err):
+            self._yaw_rate = max(-r, min(r, carry))
+            self._yaw_acc = 0.0
+        if abs(d_pitch) > abs(pitch_err) and abs(pitch_err) < 1.5:
             d_pitch = pitch_err
-            self._pitch_rate, self._pitch_acc = 0.0, 0.0
+            self._pitch_rate = 0.0
+            self._pitch_acc = 0.0
+        # у точки не нести скорость дальше: иначе прицел рисует кружок вокруг мишени
+        if math.hypot(yaw_err, pitch_err) < 0.55 and not self._chase_on:
+            self._yaw_rate *= 0.2
+            self._pitch_rate *= 0.2
+            self._yaw_acc = 0.0
+            self._pitch_acc = 0.0
+        d_yaw = self._deg_not_past(d_yaw, yaw_err, self._axis_k(True), yaw=True)
+        d_pitch = self._deg_not_past(d_pitch, pitch_err, self._axis_k(False), yaw=False)
         return d_yaw, d_pitch
 
     def _plan_flick(self, now: float, yaw_err: float, pitch_err: float, corrective: bool = False) -> None:
@@ -3765,7 +4132,6 @@ class Navigator:
             "prev": (0.0, 0.0),
         }
         self._aim_used_flick = True
-        self._wind = [0.0, 0.0]
         delay = self.rng.uniform(*cfg.aim_correct_delay) * (0.5 if corrective else 1.0)
         self._correct_from = now + T + delay
         self._flick["ramp"] = min(cfg.flick_ramp * (0.55 if corrective else 1.0), 0.45 * T)
@@ -3797,11 +4163,8 @@ class Navigator:
         dist: float,
     ) -> tuple[float, float, str]:
         """
-        Наводка: сначала продолжаем поворот как на маршруте (та же скорость), затем
-        при угле ≥ aim_flick_deg — флик; иначе так и ведём камеру, чуть быстрее на ближней.
-
-        Ошибку считаем с учётом движений мыши «в полёте» (отправлены, в памяти ещё нет):
-        иначе петля досылает уже посланное, перелетает и ёрзает около точки.
+        Наводка с текущей скорости камеры: разворот и преследование набирают свою
+        конечную скорость по S-кривой, а не прыжком. Ошибка — с учётом мыши «в полёте».
         """
         self._aim_speed_step()
         return self._aim_step_inner(
@@ -3822,82 +4185,36 @@ class Navigator:
         speed: float,
         dist: float,
     ) -> tuple[float, float, str]:
-        cfg = self.cfg
-        axis = max(abs(yaw_err), abs(pitch_err))
-        if self._flick_pending:
-            if self._aim_handoff_t0 is None:
-                self._aim_handoff_t0 = now
-                if self._aim_fast_peek:
-                    self._peek_handoff = 0.035 + self._xx_u01() * 0.040
-                else:
-                    self._peek_handoff = cfg.aim_handoff_s
-            handoff = self._peek_handoff
-            if axis > 75.0:
-                handoff *= 0.62
-            if now - self._aim_handoff_t0 < handoff:
-                oy, op = self._track_aim
-                d_yaw, d_pitch = self._aim_track(yaw_err - oy, pitch_err - op, dt, speed, dist)
-                return d_yaw, d_pitch, "handoff"
-            if axis >= cfg.aim_flick_deg:
-                self._plan_flick(now, yaw_err, pitch_err)
-                if self._flick is not None:
-                    self._flick["aim_prev"] = (aim_yaw, aim_pitch)
-            else:
-                self._flick_pending = False
-                self._flick = None
-                self._correct_from = now
-        f = self._flick
-        if f is not None:
-            tau = (now + dt - f["t0"]) / f["T"]
-            px, py = self._flick_pos(f, tau)
-            d_yaw = px - f["prev"][0]
-            d_pitch = py - f["prev"][1]
-            f["prev"] = (px, py)
-            ap = f.get("aim_prev", (aim_yaw, aim_pitch))
-            d_yaw += shortest_yaw_err(aim_yaw, ap[0])
-            d_pitch += aim_pitch - ap[1]
-            f["aim_prev"] = (aim_yaw, aim_pitch)
-            wy, wp = self._wind_step(f["wind_sigma"] / max(0.1, 0.5 * f["T"]), 0.85)
-            wpos = f.setdefault("wind_pos", [0.0, 0.0])
-            wpos[0] += wy * dt
-            wpos[1] += wp * dt
-            env = math.sin(math.pi * min(1.0, tau))
-            wnow = (wpos[0] * env, wpos[1] * env)
-            wprev = f.get("wind_prev", (0.0, 0.0))
-            d_yaw += wnow[0] - wprev[0]
-            d_pitch += wnow[1] - wprev[1]
-            f["wind_prev"] = wnow
-            if tau >= 1.0:
-                self._flick = None
-                self._yaw_rate = d_yaw / dt
-                self._pitch_rate = d_pitch / dt
-                self._sample_aim_accel()
-                return d_yaw, d_pitch, "flick"
-            self._yaw_rate = d_yaw / dt
-            self._pitch_rate = d_pitch / dt
-            return d_yaw, d_pitch, "flick"
-        if now < self._correct_from:
-            self._yaw_rate, self._yaw_acc = self._track_rate(
-                self._yaw_rate, self._yaw_acc, 0.0, dt, cfg.yaw_accel_max, cfg.yaw_jerk_max
-            )
-            self._pitch_rate, self._pitch_acc = self._track_rate(
-                self._pitch_rate, self._pitch_acc, 0.0, dt, cfg.yaw_accel_max, cfg.yaw_jerk_max
-            )
-            return self._yaw_rate * dt, self._pitch_rate * dt, "settle"
+        # баллистический флик сюда больше не ставим: он набирал тысячи °/с за один тик
+        self._flick = None
+        self._flick_pending = False
         if self._rcs_return_going(now, yaw_err, pitch_err):
             d_yaw, d_pitch = self._rcs_return_step(yaw_err, pitch_err, dt)
             return d_yaw, d_pitch, "rcs_return"
-        if not (self._rcs_active() and self._fire_held):
-            if math.hypot(yaw_err, pitch_err) >= cfg.flick_min_deg * 1.25 and self._subflicks < 1:
-                self._subflicks += 1
-                self._plan_flick(now, yaw_err, pitch_err, corrective=True)
-                if self._flick is not None:
-                    self._flick["aim_prev"] = (aim_yaw, aim_pitch)
-                    return self._aim_step_inner(now, dt, yaw_err, pitch_err, aim_yaw, aim_pitch, speed, dist)
         if self._rcs_active() and self._fire_held:
             d_yaw, d_pitch = self._rcs_step(yaw_err, pitch_err, dt)
             return d_yaw, d_pitch, "rcs"
-        d_yaw, d_pitch = self._aim_lock(yaw_err - self._track_aim[0], pitch_err - self._track_aim[1], dt)
+        oy, op = self._track_aim
+        ay, ap = self._hold_turn_side(yaw_err - oy, pitch_err - op)
+        mag = math.hypot(ay, ap)
+        if mag >= 1.5:
+            # преследование — когда уже рядом и мишень идёт; большой угол — разворот; иначе доводка
+            if self._chase_on and mag < 8.0:
+                self._sample_chase_motion()
+                d_yaw, d_pitch = self._aim_ramp(
+                    ay, ap, dt, self._chase_rate, self._chase_acc, self._chase_jerk
+                )
+                return d_yaw, d_pitch, "chase"
+            if mag >= self.cfg.aim_flick_deg:
+                d_yaw, d_pitch = self._aim_ramp(
+                    ay, ap, dt, self._turn_rate, self._turn_acc, self._turn_jerk
+                )
+                return d_yaw, d_pitch, "turn"
+            d_yaw, d_pitch = self._aim_ramp(
+                ay, ap, dt, self._aim_rate, self._turn_acc, self._turn_jerk
+            )
+            return d_yaw, d_pitch, "aim"
+        d_yaw, d_pitch = self._aim_lock(ay, ap, dt)
         return d_yaw, d_pitch, "lock"
 
     def _send_mouse(self, d_yaw: float, d_pitch: float, max_px: int | None = None) -> tuple[int, int]:
@@ -4024,6 +4341,14 @@ class Navigator:
             return "ssg"
         return "auto"
 
+    def _close_noscope_dist(self, kind: str) -> float:
+        cfg = self.cfg
+        if kind == "awp":
+            return cfg.scope_noscope_awp_close
+        if kind == "ssg":
+            return cfg.scope_noscope_close
+        return -1.0
+
     def _noscope_now(self, dist: float) -> bool:
         """Жребий зафиксирован на мишень; ближняя дистанция проверяется каждый тик."""
         plan = self._scope_plan
@@ -4031,7 +4356,8 @@ class Navigator:
             return False
         if plan.get("noscope"):
             return True
-        return plan.get("kind") in {"awp", "ssg"} and dist <= self.cfg.scope_noscope_close
+        kind = str(plan.get("kind") or "")
+        return dist <= self._close_noscope_dist(kind)
 
     def _sample_scope(self, index: int, dist: float | None = None) -> None:
         """На захват: ноускоуп по своему шансу оружия (xxHash) или вблизи у AWP/SSG."""
@@ -4050,11 +4376,7 @@ class Navigator:
             chance = cfg.scope_noscope_ssg
         else:
             chance = cfg.scope_noscope_chance
-        close = (
-            dist is not None
-            and kind in {"awp", "ssg"}
-            and dist <= cfg.scope_noscope_close
-        )
+        close = dist is not None and dist <= self._close_noscope_dist(kind)
         noscope = close or self._xx_u01() < chance
         lo, hi = cfg.scope_enter_deg
         deg = lo + self._xx_u01() * (hi - lo)
@@ -4073,7 +4395,7 @@ class Navigator:
         }
         if noscope:
             self._begin_unscope(use_knife=False)
-            why = "вблизи" if close else f"{chance * 100:.0f}%"
+            why = "вблизи" if close else f"{chance * 100:.2f}%"
             self.log(f"Снайперка ({kind}): ноускоуп ({why})")
         else:
             self._unscope_left = 0
@@ -4202,8 +4524,7 @@ class Navigator:
             if (
                 plan is not None
                 and not plan.get("noscope")
-                and plan.get("kind") in {"awp", "ssg"}
-                and dist <= self.cfg.scope_noscope_close
+                and dist <= self._close_noscope_dist(str(plan.get("kind") or ""))
                 and not plan.get("close_logged")
             ):
                 plan["close_logged"] = True
@@ -4264,64 +4585,36 @@ class Navigator:
         auto = bool(self.weapon.get("auto"))
         tx, ty, tz = self._target_aim_xyz(target, x, y)
         dist = math.hypot(tx - x, ty - y, tz - (z + self._eye_z))
+        # ошибка до точки, куда реально ведём (кость + небольшое отклонение), не до идеального центра
+        aim_yaw_err = yaw_err - self._track_aim[0]
+        aim_pitch_err = pitch_err - self._track_aim[1]
+        on_oval = self._fire_on_oval(
+            aim_yaw_err - self._pend_yaw.value(),
+            aim_pitch_err - self._pend_pitch.value(),
+            dist,
+        )
+        spray = self._should_spray(dist)
+        holding_spray = (
+            spray
+            and self._fire_held
+            and max(abs(aim_yaw_err), abs(aim_pitch_err)) <= cfg.rcs_break_deg
+        )
         abort = (
             not cfg.fire_enabled
             or (cfg.shots_per_target > 0 and self._shots_on_target >= cfg.shots_per_target)
             or not self._weapon_ready()
             or not self._target_visible_now
-            or self._flick is not None
-            or self._flick_pending
-            or now < self._correct_from
             or self._scope_blocks_fire(now, yaw_err, pitch_err, dist)
             or not self._target_can_fire(now, target)
-            or not self._strafe_fire_ok
+            or (not on_oval and not holding_spray)
         )
         if abort:
             self._aimed_since = None
+            self._far_burst_n = 0
             self._release_fire()
             return False
-        spray = self._should_spray(dist)
-        # где прицел окажется, когда долетит уже отправленная мышь (память отстаёт на 1–3 тика):
-        # для движущейся мишени «по памяти» точка кости всегда чуть в стороне и выстрел не наступает
-        on_oval = self._fire_on_oval(
-            yaw_err - self._pend_yaw.value(), pitch_err - self._pend_pitch.value(), dist
-        )
-        if self._shot_miss is None and not (spray and self._fire_held):
-            self._shot_miss = self._xx_u01() < cfg.aim_miss_chance
-        if self._shot_miss and not (spray and self._fire_held):
-            lo, hi = cfg.aim_miss_u
-            if abs(self._track_want[0]) + abs(self._track_want[1]) < 0.05:
-                sign = 1.0 if self._xx_u01() < 0.5 else -1.0
-                miss_u = lo + self._xx_u01() * (hi - lo)
-                lead = math.degrees(math.atan2(miss_u, max(80.0, dist)))
-                cap = 0.22 if self._scoped_now else 0.50
-                lead = min(lead, cap)
-                self._track_want = (sign * lead, (self._xx_u01() - 0.5) * 0.12)
-            world = dist * math.tan(math.radians(min(89.0, math.hypot(yaw_err, pitch_err))))
-            if on_oval or world < lo:
-                self._aimed_since = None
-                self._release_fire()
-                return False
-            if world > hi:
-                self._aimed_since = None
-                self._release_fire()
-                return False
-        elif not on_oval:
-            if spray and self._fire_held:
-                if max(abs(yaw_err), abs(pitch_err)) > cfg.rcs_break_deg:
-                    self._aimed_since = None
-                    self._release_fire()
-                    return False
-            else:
-                self._aimed_since = None
-                self._release_fire()
-                return False
-        if self._aimed_since is None:
-            self._aimed_since = now
-            wait = max(cfg.fire_confirm_s, self.rng.uniform(*cfg.fire_first_delay))
-            self._next_fire_at = max(self._next_fire_at, now + wait)
-            if now < self._next_fire_at:
-                return False
+        # точка уже на прицеле — без паузы «подумать»
+        self._aimed_since = now
         if auto and self._fire_held and not spray:
             self._release_fire()
             return False
@@ -4352,7 +4645,16 @@ class Navigator:
         self._fire_release_at_tick = self._tick_no + cfg.fire_hold_ticks
         self._shots_on_target += 1
         self.shots_fired += 1
-        self._next_fire_at = now + (self._auto_tap_wait() if auto else self._tap_wait())
+        if auto:
+            cycle = weapon_cycle_s(int(self.weapon.get("id") or 0), str(self.weapon.get("name") or ""))
+            self._far_burst_n += 1
+            if self._far_burst_n < max(1, cfg.long_tap_burst):
+                self._next_fire_at = now + cycle
+            else:
+                self._far_burst_n = 0
+                self._next_fire_at = now + cycle + 0.16 + self._xx_u01() * 0.14
+        else:
+            self._next_fire_at = now + self._tap_wait()
         self._on_combat_strafe_shot()
         return True
 
@@ -4506,8 +4808,10 @@ class Navigator:
             self.all_enemies = self._read_enemies()
             for e in self.all_enemies:
                 self._apply_los_visibility(e, x, y, z)
+                if e.get("spotted") and not e.get("dormant"):
+                    e["visible"] = True
                 e["_vis_pos"] = (round(x), round(y), round(z))
-            self.visible_enemies = [e for e in self.all_enemies if e.get("visible")]
+            self.visible_enemies = [e for e in self.all_enemies if e.get("visible") or e.get("spotted")]
             alive_ids = {e["index"] for e in self.all_enemies}
             for e in self.all_enemies:
                 idx = e["index"]
@@ -4867,7 +5171,7 @@ class Navigator:
 
         # --- мишень? камера уходит на неё, ноги продолжают маршрут
         route_bearing = yaw_to_target(x, y, cx_, cy_) if math.hypot(cx_ - x, cy_ - y) > 4.0 else None
-        target = self._update_target(now, x, y, z, yaw, route_bearing, speed)
+        target = self._update_target(now, x, y, z, yaw, route_bearing, speed, mem_pitch)
         was_engaged = self.engaged
         self.engaged = target is not None
         if self.engaged and not was_engaged:
@@ -4890,6 +5194,7 @@ class Navigator:
         if target is not None:
             self.engaged_ticks += 1
             aim_yaw, aim_pitch = self._aim_angles(x, y, z, target)
+            aim_yaw, aim_pitch = self._steady_aim(aim_yaw, aim_pitch, yaw, mem_pitch)
             if self._rcs_active():
                 rcs_y, rcs_p = self._rcs_offset(now)
             look_yaw = aim_yaw + rcs_y
@@ -4936,7 +5241,12 @@ class Navigator:
                     look_mode = "route"
             rate_cap = None
             gain = None
-        look_yaw = self._filter_look_yaw(look_yaw, look_mode, yaw, now)
+        if look_mode == "aim":
+            # один регулятор: фильтр маршрута здесь тянет прицел обратно на дорогу
+            self._look_mode = "aim"
+            self._look_yaw_f = look_yaw
+        else:
+            look_yaw = self._filter_look_yaw(look_yaw, look_mode, yaw, now)
         yaw_err = shortest_yaw_err(look_yaw, yaw)
         pitch_err = pitch_target - mem_pitch
         if warm_k < 1.0 and look_mode != "aim":
@@ -4985,7 +5295,7 @@ class Navigator:
             d_yaw, d_pitch, aim_phase = self._aim_step(
                 now, dt, yaw_err, pitch_err, aim_yaw, aim_pitch, speed, aim_dist
             )
-            if aim_phase == "flick":
+            if aim_phase in ("flick", "turn", "chase", "aim", "lock", "rcs", "rcs_return"):
                 max_px = cfg.aim_max_px_per_tick
             elif self._chase_on:
                 max_px = int(cfg.aim_max_px_per_tick * 0.75)
@@ -5012,7 +5322,7 @@ class Navigator:
             d_yaw, d_pitch, aim_phase = self._aim_step(
                 now, dt, yaw_err, pitch_err, aim_yaw, aim_pitch, speed, aim_dist
             )
-            if aim_phase == "flick":
+            if aim_phase in ("flick", "turn", "chase", "aim", "lock", "rcs", "rcs_return"):
                 max_px = cfg.aim_max_px_per_tick
             elif self._chase_on:
                 max_px = int(cfg.aim_max_px_per_tick * 0.75)
