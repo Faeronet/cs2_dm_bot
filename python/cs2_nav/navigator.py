@@ -216,9 +216,9 @@ class NavConfig:
     ladders_poll_hz: float = 0.5             # лестницы меняются редко — полный перебор entity list
     doors_poll_hz: float = 2.0               # двери: состояние open/closed меняется чаще
     door_block_margin: float = 20.0          # запас вокруг запертой двери при обходе
-    door_use_dist: float = 96.0              # u: +use достаёт, жмём на ходу
-    door_use_approach: float = 140.0         # u: дверь впереди по маршруту
-    door_use_hold: tuple[float, float] = (0.07, 0.12)
+    door_use_dist: float = 128.0             # u: +use достаёт, жмём на ходу
+    door_use_approach: float = 160.0         # u: дверь впереди по маршруту
+    door_use_hold: tuple[float, float] = (0.20, 0.36)
     door_use_retry: float = 0.55             # с: повтор, если всё ещё закрыта
     breakables_poll_hz: float = 1.0          # решётки/окна: hp меняется реже дверей
     breakable_block_margin: float = 16.0     # запас вокруг целой решётки, если её нельзя прострелить
@@ -637,6 +637,8 @@ class Navigator:
         self._reload_wid = -1
         self._reload_skip = False                # рядом была мишень — в этот магазин боевой R не катили
         self._reload_clip_seen = 0
+        self._spawn_gun_until = -1.0             # <0: после появления проверить слот оружия
+        self._spawn_gun_next = 0.0
         self._habit: dict | None = None
         self._habit_next = 0.0
         self._hpshot_thr: float | None = None
@@ -1531,10 +1533,57 @@ class Navigator:
                 return True
         return False
 
+    def _inventory_ids(self) -> list[int]:
+        pawn_of = getattr(self.reader, "local_pawn", None)
+        ids_of = getattr(self.reader, "pawn_weapon_ids", None)
+        if not callable(pawn_of) or not callable(ids_of):
+            return []
+        try:
+            pawn = pawn_of()
+            if not pawn:
+                return []
+            return [int(i) for i in ids_of(pawn)]
+        except Exception:
+            return []
+
+    def _inventory_has_primary(self) -> bool:
+        """В инвентаре есть слот 1: винтовка, ПП, дробовик или снайперка, не пистолет."""
+        for item_id in self._inventory_ids():
+            if is_gun(item_id) and not weapon_is_pistol(item_id):
+                return True
+        return False
+
     def _gun_slot_key(self) -> str:
+        if self._inventory_has_primary():
+            return "1"
         wid = int(self.weapon.get("id") or 0)
         name = str(self.weapon.get("name") or "")
         return "2" if weapon_is_pistol(wid, name) else "1"
+
+    def _ensure_spawn_primary(self, now: float) -> None:
+        """Спавн иногда оставляет пистолет, хотя основное уже выдано. Жмём 1, пока не возьмём его."""
+        if not self.life.get("alive", True):
+            return
+        if self._spawn_gun_until < 0.0:
+            self._spawn_gun_until = now + 3.0
+        if self._spawn_gun_until <= 0.0 or now > self._spawn_gun_until:
+            self._spawn_gun_until = 0.0
+            return
+        h = self._habit
+        if h and h.get("kind") in {"healthshot", "knife", "unscope_knife"}:
+            return
+        if not self._inventory_has_primary():
+            return
+        wid = int(self.weapon.get("id") or 0)
+        name = str(self.weapon.get("name") or "")
+        if wid and is_gun(wid, name) and not weapon_is_pistol(wid, name):
+            self._spawn_gun_until = 0.0
+            return
+        if now < self._spawn_gun_next:
+            return
+        self._pulse_key("1", now, 0.06)
+        self._spawn_gun_next = now + 0.45
+        self.log("Спавн: в руках не основное, жму слот 1")
 
     def _reload_frac_for_weapon(self) -> float:
         """Порог оставшейся обоймы: ~20% (±диапазон), редко ~60%, малый магазин 5–10% ±1%."""
@@ -2620,6 +2669,13 @@ class Navigator:
     # ------------------------------------------------------------ planning
 
     def _door_xyz(self, door: dict) -> tuple[float, float, float] | None:
+        box = self._object_aabb(door, 0.0)
+        if box is not None:
+            return (
+                (box[0] + box[3]) * 0.5,
+                (box[1] + box[4]) * 0.5,
+                (box[2] + box[5]) * 0.5,
+            )
         pos = door.get("position")
         if not isinstance(pos, dict):
             return None
@@ -2629,16 +2685,26 @@ class Navigator:
             return None
 
     def _door_blocks_route(self, door: dict) -> bool:
-        """Запертую или неиспользуемую дверь обходим. Закрытую, но открываемую — проходим."""
-        if door.get("locked") or door.get("usable") is False:
-            return True
+        """Закрытую дверь не обходим: подходим и жмём использовать."""
         return False
 
     def _door_needs_open(self, door: dict) -> bool:
-        if self._door_blocks_route(door) or door.get("passable"):
+        if door.get("passable") or door.get("open"):
             return False
         state = str(door.get("state") or "")
         return state not in ("open", "ajar", "opening")
+
+    def _door_gap(self, door: dict, x: float, y: float) -> float:
+        """Расстояние до полотна, не до петли. Иначе бот проходит мимо и не жмёт E."""
+        box = self._object_aabb(door, 0.0)
+        if box is not None:
+            dx = 0.0 if box[0] <= x <= box[3] else min(abs(x - box[0]), abs(x - box[3]))
+            dy = 0.0 if box[1] <= y <= box[4] else min(abs(y - box[1]), abs(y - box[4]))
+            return math.hypot(dx, dy)
+        pt = self._door_xyz(door)
+        if pt is None:
+            return 1e9
+        return math.hypot(pt[0] - x, pt[1] - y)
 
     def _closed_door_ahead(self, route: Route, x: float, y: float, z: float) -> dict | None:
         """Закрытая дверь на маршруте впереди, ближайшая к боту."""
@@ -2652,18 +2718,18 @@ class Navigator:
             pt = self._door_xyz(door)
             if pt is None or abs(pt[2] - z) > 96.0:
                 continue
-            rad = max(float(door.get("width") or 40.0) * 0.5, 28.0) + 16.0
+            rad = max(float(door.get("width") or 40.0) * 0.5, 56.0) + 28.0
             hit = False
             d = self.s
             while d <= end:
                 px, py, pz = route.point_at(d)
-                if abs(pz - pt[2]) <= 80.0 and math.hypot(px - pt[0], py - pt[1]) <= rad:
+                if abs(pz - pt[2]) <= 96.0 and self._door_gap(door, px, py) <= rad:
                     hit = True
                     break
                 d += 10.0
             if not hit:
                 continue
-            dist = math.hypot(pt[0] - x, pt[1] - y)
+            dist = self._door_gap(door, x, y)
             if dist < best_d:
                 best, best_d = door, dist
         return best
@@ -2683,12 +2749,9 @@ class Navigator:
     def _door_use(self, now: float, x: float, y: float) -> None:
         """Короткое E на ходу. Клавиши движения не трогаем."""
         door = self._door_ahead
-        if door is None or self.firing:
+        if door is None:
             return
-        pt = self._door_xyz(door)
-        if pt is None:
-            return
-        if math.hypot(pt[0] - x, pt[1] - y) > self.cfg.door_use_dist:
+        if self._door_gap(door, x, y) > self.cfg.door_use_dist:
             return
         idx = int(door.get("index") or 0)
         if now < self._door_use_at.get(idx, 0.0):
@@ -3586,6 +3649,8 @@ class Navigator:
         self._hpshot_thr = None
         self._ladder = None
         self._crouch_until = 0.0
+        self._spawn_gun_until = -1.0
+        self._spawn_gun_next = 0.0
         if self.cfg.background_workers:
             self._await_route = True
             self._request_plan(pos)
@@ -5564,6 +5629,7 @@ class Navigator:
         mem_yaw, mem_pitch = ang.y, ang.x
         self.weapon = self._read_weapon()
         self.life = self._read_life()
+        self._ensure_spawn_primary(now)
         self._mem_shots = self._read_shots_fired()
         self._scoped_now = self._read_scoped()
         if self.cfg.background_workers:

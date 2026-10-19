@@ -40,6 +40,22 @@ BREAKABLE_MODEL_HINTS = (
     "fence",
     "glass",
     "chainlink",
+    "sheet",
+    "corrugated",
+    "plywood",
+    "plank",
+    "boards",
+)
+
+# Колонна, фонтан, стена коннектора — обычная геометрия карты, не мишень.
+PANEL_SKIP = (
+    "fountain",
+    "column",
+    "pillar",
+    "statue",
+    "planter",
+    "barrel",
+    "crate",
 )
 
 MAP_ENTITY_SKIP = (
@@ -169,13 +185,29 @@ def is_map_entity_model(model: str) -> bool:
     return not any(skip in path for skip in MAP_ENTITY_SKIP)
 
 
+def is_path_panel(*parts: str) -> bool:
+    """Лист, решётка, окно. Не вся сущность карты: иначе бот стреляет в фонтан и колонну."""
+    text = " ".join(p for p in parts if p).lower().replace("\\", "/")
+    if any(skip in text for skip in PANEL_SKIP):
+        return False
+    if "door" in text and not any(h in text for h in ("cage", "grate", "sheet")):
+        return False
+    return any(h in text for h in BREAKABLE_MODEL_HINTS) or any(
+        h in text for h in BREAKABLE_NAME_HINTS
+    )
+
+
+def is_panel_shape(width: float, depth: float, height: float) -> bool:
+    """Тонкая панель на проходе. Толстая геометрия (колонна, фонтан, стена) — нет."""
+    thin = min(width, depth)
+    wide = max(width, depth)
+    return thin <= 40.0 and 16.0 <= wide <= 220.0 and 16.0 <= height <= 200.0
+
+
 def is_breakable_model(model: str) -> bool:
     if not model:
         return False
-    path = model.lower().replace("\\", "/")
-    if is_map_entity_model(model):
-        return True
-    return any(h in path for h in BREAKABLE_MODEL_HINTS)
+    return is_path_panel(model)
 
 
 def _designer_skipped(name: str) -> bool:
@@ -276,8 +308,6 @@ def read_breakable(
     if bounds and not _valid_bounds(bounds[0], bounds[1]):
         bounds = None
 
-    blocks = entity_blocks_movement(backend, schema, entity, bounds)
-
     if bounds:
         bounds_mins, bounds_maxs = bounds
         width, depth, height = _size_from_bounds(bounds_mins, bounds_maxs)
@@ -286,15 +316,23 @@ def read_breakable(
         bounds_maxs = Vec3(position.x + 16.0, position.y + 16.0, position.z + 64.0)
         width, depth, height = _size_from_bounds(bounds_mins, bounds_maxs)
 
+    thin = is_panel_shape(width, depth, height)
+    panel = is_path_panel(designer, model)
+    # лист миража часто запечён как тонкая сущность карты без слова grate в имени
+    if thin and is_map_entity_model(model) and not any(
+        skip in f"{designer} {model}".lower() for skip in PANEL_SKIP
+    ):
+        panel = True
+    if thin and entity_has_break_pieces(backend, schema, entity):
+        panel = True
+    if not panel or not thin:
+        return None
+
     if max_health > 0:
         broken = health <= 0 or life_state != LIFE_ALIVE
-    elif blocks:
-        broken = False
-    elif model and is_map_entity_model(model):
-        # de_mirage: визуальная часть решётки без solid=6 — не «сломана», просто без коллизии
-        broken = False
     else:
-        broken = health <= 0 or life_state != LIFE_ALIVE
+        # лист на мираже часто без max health и без solid=6, но живой и его надо прострелить
+        broken = life_state != LIFE_ALIVE
 
     return BreakableInfo(
         index=index,
@@ -308,7 +346,7 @@ def read_breakable(
         life_state=life_state,
         life=life_state_name(life_state),
         broken=broken,
-        passable=broken or not blocks,
+        passable=broken,
         width=max(width, 4.0),
         depth=max(depth, 4.0),
         height=max(height, 4.0),
