@@ -573,6 +573,9 @@ class Navigator:
         self._combat_strafe: dict | None = None  # шаги A/D; после убийства — отдельный отход
         self._strafe_fire_ok = True
         self._pend_kill_step = False             # следующая новая мишень после убийства
+        self._awp_first_stop = False             # AWP: контрстрейф хода до первого выстрела
+        self._awp_watch: dict | None = None      # выстрел AWP: жива ли мишень (промах)
+        self._move_speed = 0.0
         self._immune_seen: set[int] = set()      # видели spawn-защиту
         self._vuln_ready_at: dict[int, float] = {}  # index → когда можно стрелять после уязвимости
         self._tick_no = 0
@@ -587,6 +590,7 @@ class Navigator:
         self._rcs_rot = 0.0
         self._rcs_lag = 0.10
         self._rcs_under = 0.97
+        self._rcs_pitch_boost = 1.32
         self._rcs_arc = 0.0
         self._rcs_rate_var = 0.0
         self._rcs_sampled = False
@@ -1401,6 +1405,8 @@ class Navigator:
         self._rcs_rot = (self._xx_u01() - 0.5) * 0.35
         self._rcs_lag = 0.006 + self._xx_u01() * 0.012       # рука почти сразу за паттерном
         self._rcs_under = 0.996 + self._xx_u01() * 0.008     # 0.996..1.004, не систематический недовод
+        # пули уходят над головой: вертикаль чуть сильнее линии, цифра каждый спрей своя
+        self._rcs_pitch_boost = max(1.20, self._xx_band((1.28, 1.42), (0.02, 0.05)))
         self._rcs_arc = (self._xx_u01() - 0.5) * 0.04
         self._rcs_rate_var = (self._xx_u01() - 0.5) * self.cfg.rcs_rate_jitter
         self._rcs_cluster = max(0.06, self._xx_band(self.cfg.rcs_cluster, self.cfg.rcs_cluster_err))
@@ -1841,16 +1847,14 @@ class Navigator:
         t = now - self._rcs_lag
         dt_shot = max(0.0, t - (self._rcs_shot_t - self._rcs_lag))
         frac = min(1.0, dt_shot / max(0.05, cycle)) if t >= self._rcs_shot_t - self._rcs_lag else 0.0
-        shots_lag = n
-        if t < self._rcs_shot_t:
-            shots_lag = max(0, n - 1)
-            frac = 1.0
-        y, p = recoil_offset(wid, wname, shots_lag, frac)
+        # текущая пуля уже в паттерне, небольшой заход к следующей — очередь не остаётся сверху
+        frac = max(frac, 0.25)
+        y, p = recoil_offset(wid, wname, n, frac)
         rad = math.radians(self._rcs_rot)
         c, s = math.cos(rad), math.sin(rad)
         y, p = y * c - p * s, y * s + p * c
         y *= self._rcs_scale_x * self._rcs_under
-        p *= self._rcs_scale_y * self._rcs_under
+        p *= self._rcs_scale_y * self._rcs_under * self._rcs_pitch_boost
         mag = math.hypot(y, p)
         if mag > 0.15:
             prog = min(1.0, n / 12.0)
@@ -1886,11 +1890,12 @@ class Navigator:
         self._rcs_rate_var = self._rcs_rate_var * decay + (self._xx_u01() * 2.0 - 1.0) * kick
         self._rcs_rate_var = max(-j, min(j, self._rcs_rate_var))
         rate = cfg.rcs_rate * (1.0 + self._rcs_rate_var)
+        rate_p = rate * 1.35
         db = 0.04
         soft = abs(yaw_err) / (abs(yaw_err) + db)
         soft_p = abs(pitch_err) / (abs(pitch_err) + db)
         des_y = max(-rate, min(rate, cfg.rcs_gain * yaw_err * soft))
-        des_p = max(-rate, min(rate, cfg.rcs_gain * pitch_err * soft_p))
+        des_p = max(-rate_p, min(rate_p, cfg.rcs_gain * 1.45 * pitch_err * soft_p))
         acc = cfg.yaw_accel_max
         jerk = cfg.yaw_jerk_max
         self._yaw_rate, self._yaw_acc = self._track_rate(
@@ -2067,9 +2072,11 @@ class Navigator:
             else:
                 ex, ey, _ = e["position"]
                 self._sample_scope(e["index"], math.hypot(ex - x, ey - y))
+            self._awp_watch = None
+            self._awp_first_stop = self._sniper_kind() == "awp"
             if self._pend_kill_step:
                 self._pend_kill_step = False
-                self._begin_kill_sidestep(e["index"])
+                self._begin_kill_sidestep(e["index"], "После убийства")
             elif resume and self._combat_strafe and self._combat_strafe.get("index") == e["index"]:
                 pass
             else:
@@ -2117,6 +2124,8 @@ class Navigator:
             self._scope_committed = False
             self._combat_strafe = None
             self._strafe_fire_ok = True
+            self._awp_first_stop = False
+            self._awp_watch = None
             self._rcs_reset()
             self._long_spray = None
             self._far_burst_n = 0
@@ -4698,6 +4707,7 @@ class Navigator:
             or self._scope_blocks_fire(now, yaw_err, pitch_err, dist)
             or not self._target_can_fire(now, target)
             or not self._kill_step_can_fire(now)
+            or self._awp_stop_blocks()
             or (not on_oval and not holding_spray)
         )
         if abort:
@@ -4794,8 +4804,8 @@ class Navigator:
         }
         self.log(f"Стрейф A/D при огне ({self._combat_strafe['dist']:.0f}u)")
 
-    def _begin_kill_sidestep(self, index: int) -> None:
-        """После убийства: 70% отойти в сторону перед следующей мишенью. Иначе обычный шаг."""
+    def _begin_kill_sidestep(self, index: int, why: str = "После убийства") -> None:
+        """70% отойти в сторону, затем контрстрейф. Те же диапазоны после убийства и промаха AWP."""
         if self._xx_u01() >= self.cfg.kill_step_chance:
             self._sample_combat_strafe(index)
             return
@@ -4817,7 +4827,44 @@ class Navigator:
             "fire_at": None,
         }
         self._strafe_fire_ok = False
-        self.log(f"После убийства шаг {'A' if side < 0 else 'D'} на {dist:.0f}u")
+        self.log(f"{why}: шаг {'A' if side < 0 else 'D'} на {dist:.0f}u")
+
+    def _awp_stop_blocks(self) -> bool:
+        """Первый выстрел AWP только после контрстрейфа хода."""
+        if not self._awp_first_stop or self._sniper_kind() != "awp":
+            return False
+        return self._move_speed > 18.0
+
+    def _note_awp_shot(self, target: dict, now: float) -> None:
+        if self._sniper_kind() != "awp":
+            return
+        self._awp_first_stop = False
+        self._awp_watch = {
+            "index": target["index"],
+            "hp": int(target.get("health") or 0),
+            "at": now,
+            "done": False,
+        }
+
+    def _awp_miss_tick(self, now: float, target: dict | None) -> None:
+        """Промах AWP: с тем же шансом и дистанцией, что шаг после убийства, потом контрстрейф."""
+        w = self._awp_watch
+        if w is None or w.get("done") or self._sniper_kind() != "awp":
+            return
+        if target is None or target.get("index") != w["index"]:
+            w["done"] = True
+            return
+        if now - float(w["at"]) < 0.22:
+            return
+        w["done"] = True
+        hp = int(target.get("health") or 0)
+        if hp <= 0 or hp < int(w["hp"]):
+            return
+        self._awp_first_stop = True
+        st = self._combat_strafe
+        if st is not None and st.get("kill_step") and st.get("fire_at") is None:
+            return
+        self._begin_kill_sidestep(int(target["index"]), "После промаха")
 
     def _kill_step_can_fire(self, now: float) -> bool:
         st = self._combat_strafe
@@ -4828,6 +4875,8 @@ class Navigator:
 
     def _on_combat_strafe_shot(self) -> None:
         self._shot_miss = None
+        if self._target is not None:
+            self._note_awp_shot(self._target, self._now())
         st = self._combat_strafe
         if st is None:
             return
@@ -4909,9 +4958,11 @@ class Navigator:
             return {"a"} if st["side"] < 0 else {"d"}
         return self._counter_strafe_keys(vx, vy, speed, yaw_next)
 
-    def _counter_strafe_keys(self, vx: float, vy: float, speed: float, yaw_next: float) -> set[str]:
+    def _counter_strafe_keys(
+        self, vx: float, vy: float, speed: float, yaw_next: float, min_speed: float = 60.0
+    ) -> set[str]:
         """Погасить скорость: клавиша против направления движения (как counter-strafe игрока)."""
-        if speed < 60.0:
+        if speed < min_speed:
             return set()
         vel_bearing = math.degrees(math.atan2(vy, vx))
         rel = shortest_yaw_err(vel_bearing + 180.0, yaw_next)
@@ -4941,6 +4992,7 @@ class Navigator:
                 self._eye_z = cfg.eye_height
         x, y, z = p.x, p.y, p.z
         speed = math.hypot(v.x, v.y)
+        self._move_speed = speed
         mem_yaw, mem_pitch = ang.y, ang.x
         self.weapon = self._read_weapon()
         self.life = self._read_life()
@@ -5407,6 +5459,7 @@ class Navigator:
                 fire_pitch_err = aim_pitch - mem_pitch
             tx, ty, tz = self._target_aim_xyz(target, x, y)
             aim_dist = math.hypot(tx - x, ty - y, tz - (z + self._eye_z))
+            self._awp_miss_tick(now, target)
             self._combat_strafe_update(now, x, y, speed)
             if not self._unscoping():
                 self._scope_step(now, fire_yaw_err, fire_pitch_err, aim_dist)
@@ -5510,17 +5563,22 @@ class Navigator:
         if self._ladder is not None and (not self.firing or climbing):
             keys = self._ladder_keys(x, y, z, yaw_next, speed)
         elif self.firing:
-            strafe_keys = self._combat_strafe_keys(v.x, v.y, speed, yaw_next)
-            if strafe_keys is not None:
-                keys = strafe_keys
-            elif cfg.fire_stop_moving:
-                keys = self._counter_strafe_keys(v.x, v.y, speed, yaw_next)
+            st = self._combat_strafe
+            sidestep_go = bool(st and st.get("kill_step") and st.get("phase") == "go")
+            if self._awp_first_stop and self._sniper_kind() == "awp" and not sidestep_go:
+                keys = self._counter_strafe_keys(v.x, v.y, speed, yaw_next, min_speed=8.0)
             else:
-                peek_keys = self._peek_move_keys(x, y, look_yaw)
-                if peek_keys is not None:
-                    keys = peek_keys
+                strafe_keys = self._combat_strafe_keys(v.x, v.y, speed, yaw_next)
+                if strafe_keys is not None:
+                    keys = strafe_keys
+                elif cfg.fire_stop_moving:
+                    keys = self._counter_strafe_keys(v.x, v.y, speed, yaw_next)
                 else:
-                    keys = self._choose_keys(rel, yaw_err, speed, engaged=self.engaged)
+                    peek_keys = self._peek_move_keys(x, y, look_yaw)
+                    if peek_keys is not None:
+                        keys = peek_keys
+                    else:
+                        keys = self._choose_keys(rel, yaw_err, speed, engaged=self.engaged)
         else:
             peek_keys = self._peek_move_keys(x, y, look_yaw)
             if peek_keys is not None:
@@ -5534,13 +5592,15 @@ class Navigator:
             self._brake = False            # остановились, но не дошли — дошагиваем
         if goal_d < brake_d and speed > 60.0 and not cfg.loop:
             self._brake = True
-        if (self._brake or hold) and self._ladder is None:
+        awp_stopping = self._awp_first_stop and self._sniper_kind() == "awp" and speed > 8.0
+        if (self._brake or hold) and self._ladder is None and not awp_stopping:
             keys = set()
 
         # прыжок по маршруту: 57u обычный, 64u с приседом; выше — не прыгаем, обходим
         climb = None
         if (
             self._ladder is None
+            and not awp_stopping
             and speed > 28.0
             and now - self._last_jump_at >= 0.55
             and math.hypot(cx_ - x, cy_ - y) < 64.0
@@ -5549,7 +5609,7 @@ class Navigator:
             if climb:
                 self._do_climb(climb, now)
 
-        if self._ladder is None:
+        if self._ladder is None and not awp_stopping:
             override = self._handle_stuck(now, (x, y, z), speed, keys, rel)
             if override is not None:
                 keys = override
