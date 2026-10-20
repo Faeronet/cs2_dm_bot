@@ -390,49 +390,39 @@ class DetectResult:
 
 
 def _detect_window(clicker, env: dict, reader_state_fn, registry) -> DetectResult:
-    """Есть ли сейчас окно/уведомление/ошибка — ТОЛЬКО детекция, без кликов и ESC.
+    """Есть ли сейчас окно ошибки — только если на кадре видна панель диалога.
 
-    Надёжные и БЫСТРЫЕ признаки (один кадр, без наведения):
-      1) ПАМЯТЬ — fingerprint совпал с известной НЕ-чистой сигнатурой;
-      2) ЯРКОСТЬ — фон затемнён модалкой (ring < порога) — modal_vision.
-
-    ВАЖНО: наведение (hover-подсветка) НЕ используется для детекции присутствия —
-    на обычных экранах (например, «идёт поиск матча») интерактивные элементы дают
-    слабую подсветку (Δ≈16) неотличимую от не-затемняющего диалога, что раньше
-    приводило к ложному срабатыванию и зависанию. Поэтому присутствие окна
-    определяем только по затемнению фона/памяти; наведение — лишь при ЗАКРЫТИИ.
+    Тёмное меню, очередь поиска и чёрный кадр gamescope окном не считаются:
+    иначе ESC крутится по кругу и сбрасывает поиск. Совпавший fingerprint
+    памяти сам по себе тоже не окно — контекст меню не меняется, когда диалог
+    уже закрыт, и закрытие по нему не заканчивается.
     """
-    # 1) память
+    from cs2_menu.live_ui import find_nav
+    from cs2_menu.modal_vision import _client_view, _modal_on_client
+
+    fr = _client_view(clicker)
+    if fr is None:
+        return DetectResult(False, "none")
+    if find_nav(fr.image, fr.client):
+        return DetectResult(False, "none")
+    _crop, info = _modal_on_client(fr)
+    if not info.present or info.panel is None:
+        return DetectResult(False, "none", ring_mean=info.ring_mean)
     fp = _read_fp(reader_state_fn)
     for sig in registry.values():
         if fp and fp in sig.fingerprints and not sig.is_clean:
-            return DetectResult(True, "memory", sig=sig)
-
-    # 2) яркость (затемнение фона модалкой) — один кадр, без фокуса окна
-    from cs2_menu.modal_vision import _client_view, _modal_on_client
-    fr = _client_view(clicker)
-    if fr is not None:
-        _crop, info = _modal_on_client(fr)
-        if info.present:
-            return DetectResult(True, "vision-ring", ring_mean=info.ring_mean)
-        from cs2_menu.live_ui import find_inspect_close
-        close = find_inspect_close(fr.image, fr.client)
-        if close is not None:
-            return DetectResult(True, "inspect-close", probe_hit=(close[0], close[1], "close"),
-                                ring_mean=info.ring_mean)
-        return DetectResult(False, "none", ring_mean=info.ring_mean)
-    return DetectResult(False, "none")
+            return DetectResult(True, "memory", sig=sig, ring_mean=info.ring_mean)
+    return DetectResult(True, "vision-ring", ring_mean=info.ring_mean)
 
 
-def _esc_close(clicker, env: dict, reader_state_fn, registry, log, attempts: int = 3) -> bool:
-    """Закрыть окно клавишей ESC. На XWayland/mutter клавиша доходит до CS2 только
-    когда окно активно, а `windowactivate --sync` срабатывает НЕ всегда (таймаут 2с),
-    поэтому пробуем несколько раз: перед каждым ESC заново активируем окно и проверяем
-    результат. Как только окно исчезло — успех (без наведения/кликов)."""
+def _esc_close(clicker, env: dict, reader_state_fn, registry, log, attempts: int = 1) -> bool:
+    """Один ESC. В gamescope активация окна на рабочем столе курсор не двигает,
+    а повторный ESC уводит из меню и снимает поиск."""
     mi = clicker._mi
     wid = str(mi._window_id) if getattr(mi, "_window_id", None) else ""
+    gamescope = hasattr(getattr(mi, "game_input", None), "grab_field")
     for a in range(attempts):
-        if wid:
+        if wid and not gamescope:
             mi._xdo("windowactivate", "--sync", wid)
             time.sleep(0.25)
         try:
@@ -482,6 +472,9 @@ def _close_one(clicker, env: dict, det: DetectResult, reader_state_fn, registry,
     return False
 
 
+_stuck_until = 0.0
+
+
 def close_window(clicker, env: dict, *, reader_state_fn=None, max_rounds: int = 5,
                  log=print) -> bool:
     """Распознать окно(а) по сигнатуре и закрыть. НЕ зависает (кадр окна ~0.4с).
@@ -494,6 +487,10 @@ def close_window(clicker, env: dict, *, reader_state_fn=None, max_rounds: int = 
          на кнопку (OK / Close / «не показывать») с подтверждением по исчезновению.
       3) Окно не поддаётся — выходим (поток не блокируем, без бесконечных попыток).
     """
+    global _stuck_until
+    if time.monotonic() < _stuck_until:
+        log("[win] прошлая попытка окно не закрыла — повторно не жму")
+        return False
     reg = load_registry()
     closed_any = False
     for i in range(max_rounds):
@@ -509,10 +506,12 @@ def close_window(clicker, env: dict, *, reader_state_fn=None, max_rounds: int = 
             extra = f" ring={det.ring_mean:.0f}"
         log(f"[win] окно #{i + 1} [{det.source}]{extra} — закрываю")
         if not _close_one(clicker, env, det, reader_state_fn, reg, log):
-            log("[win] это окно не закрылось — выхожу (поток не блокирую)")
+            _stuck_until = time.monotonic() + 120.0
+            log("[win] это окно не закрылось — две минуты меню не трогаю")
             return closed_any
         closed_any = True
-    log(f"[win] достигнут предел ({max_rounds}) — окно всплывает снова, выхожу")
+    _stuck_until = time.monotonic() + 120.0
+    log(f"[win] достигнут предел ({max_rounds}) — две минуты меню не трогаю")
     return closed_any
 
 

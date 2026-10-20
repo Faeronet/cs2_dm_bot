@@ -141,19 +141,14 @@ def launch_until_spawn(
     step("map_group_alpha", settle=1.0)
     step("go", settle=1.6)
 
-    clear()
     log_fn("фаза 1/3: ждём загрузку карты (очередь → матч)…")
     map_start = time.monotonic()
     map_deadline = map_start + 120
-    did_recheck = False
     while time.monotonic() < map_deadline:
         sig = _signals(reader)
         if sig["map_loaded"]:
             log_fn(f"карта загружена: {sig['map']!r}")
             break
-        if not did_recheck and time.monotonic() - map_start > 18:
-            clear()
-            did_recheck = True
         time.sleep(2.0)
     else:
         root_shot(env, "/tmp/dmof_result.png")

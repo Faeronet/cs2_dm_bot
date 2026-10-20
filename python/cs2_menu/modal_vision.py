@@ -126,12 +126,33 @@ class ModalInfo:
         return f"ModalInfo(present={self.present}, ring={self.ring_mean:.1f}, panel={self.panel})"
 
 
+def _panel_flat(gray: Image.Image, panel: tuple[int, int, int, int]) -> bool:
+    """Диалог — ровная серая панель. Персонаж и арт меню такой же яркости, но пёстрые."""
+    x0, y0, x1, y1 = panel
+    crop = gray.crop((x0, y0, max(x0 + 1, x1), max(y0 + 1, y1)))
+    px = crop.load()
+    w, h = crop.size
+    vals = [px[x, y] for y in range(0, h, 4) for x in range(0, w, 4)]
+    if len(vals) < 20:
+        return False
+    vals.sort()
+    med = vals[len(vals) // 2]
+    close = sum(1 for v in vals if abs(v - med) <= 18)
+    return close / len(vals) >= 0.45
+
+
 def detect_modal(img: Image.Image) -> ModalInfo:
+    """Модалка — тёмный overlay и отдельная ровная панель по центру.
+
+    Тёмный кадр меню, очередь поиска и чёрный захват Xwayland панелью не являются:
+    у них нет светлого прямоугольника диалога, и закрывать там нечего.
+    """
     gray = img.convert("L")
     ring = _ring_mean(gray)
-    present = ring < RING_DARK_MAX
-    panel = _find_panel(gray, ring) if present else None
-    return ModalInfo(present, ring, panel)
+    panel = _find_panel(gray, ring) if ring < RING_DARK_MAX else None
+    if panel is not None and not _panel_flat(gray, panel):
+        panel = None
+    return ModalInfo(panel is not None, ring, panel)
 
 
 def _not_green(img: Image.Image, x: int, y: int) -> bool:
