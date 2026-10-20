@@ -593,16 +593,17 @@ class HybridInput(GameInput):
         x = min(width - 1, max(0, int(round(fx * (width - 1)))))
         y = min(height - 1, max(0, int(round(fy * (height - 1)))))
         # Абсолютный mousemove под захватом курсора уносит указатель в угол.
-        # Короткий шаг и новая сверка: длинная цепочка перелетает с PLAY на STORE.
-        # Клик только когда курсор уже на кнопке.
-        for _ in range(10):
+        # Весь остаток пути — одной командой, иначе десять коротких шагов
+        # с правого края так и остаются на правой половине окна.
+        # Клик только когда курсор уже на кнопке, не на соседней.
+        for _ in range(3):
             pos = self._pointer_pos()
             if pos is None:
                 print("[menu-click] курсор композита не читается", flush=True)
                 return False
             cx, cy = pos
             dx, dy = x - cx, y - cy
-            if abs(dx) <= 12 and abs(dy) <= 12:
+            if abs(dx) <= 16 and abs(dy) <= 16:
                 if not click:
                     return True
                 out = self._inner_run("click", "1")
@@ -610,15 +611,21 @@ class HybridInput(GameInput):
                     print("[menu-click] клик не вышел", flush=True)
                     return False
                 return True
-            step = 36
-            sx = dx if abs(dx) <= step else (step if dx > 0 else -step)
-            sy = dy if abs(dy) <= step else (step if dy > 0 else -step)
-            out = self._inner_run("mousemove_relative", "--", str(sx), str(sy))
+            args: list[str] = []
+            step = 160
+            left, up = dx, dy
+            while left or up:
+                sx = max(-step, min(step, left))
+                sy = max(-step, min(step, up))
+                args += ["mousemove_relative", "--", str(sx), str(sy)]
+                left -= sx
+                up -= sy
+            out = self._inner_run(*args)
             if out is None or out.returncode != 0:
                 err = "" if out is None else (out.stderr or out.stdout or "").strip()
                 print(f"[menu-click] сдвиг ({cx},{cy}) -> ({x},{y}) не вышел {err[:160]}", flush=True)
                 return False
-            time.sleep(0.03)
+            time.sleep(0.05)
         end = self._pointer_pos()
         where = "?" if end is None else f"({end[0]},{end[1]})"
         print(f"[menu-click] не дошёл до ({x},{y}), сейчас {where} — клик отменён", flush=True)
