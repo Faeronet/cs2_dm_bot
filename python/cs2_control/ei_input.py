@@ -592,10 +592,11 @@ class HybridInput(GameInput):
         fy = min(1.0, max(0.0, float(fy)))
         x = min(width - 1, max(0, int(round(fx * (width - 1)))))
         y = min(height - 1, max(0, int(round(fy * (height - 1)))))
-        # xdotool на длинной цепочке обрывается по таймауту: курсор замирает
-        # справа посредине и в нижнем углу. Показание getmouselocation под
-        # захватом врёт, поэтому от левого верхнего угла идём сами.
-        return self._xtest_from_origin(x, y, click=click)
+        # Под захватом курсора ось X сжата в правую половину: центр меню
+        # оказывается в центре правой части, левой половины словно нет.
+        # От левого верхнего угла шлём 2x − ширина, чтобы центр встал в центр.
+        x_move = 2 * x - (width - 1)
+        return self._xtest_from_origin(x_move, y, click=click)
 
     def _xtest_from_origin(self, x: int, y: int, *, click: bool) -> bool:
         """Прижать курсор в левый верх относительными шагами и дойти до (x, y)."""
