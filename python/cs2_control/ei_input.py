@@ -595,7 +595,10 @@ class HybridInput(GameInput):
         # Один отправленный пиксель по X сдвигается примерно на 1.5.
         # Полная координата уезжала в правую половину, а 2x−ширина — в телевизор.
         x_move = int(round(x * 2 / 3))
-        return self._xtest_from_origin(x_move, y, click=click)
+        # Ниже верхней полосы клик садится на 18 px ниже центра кнопки.
+        # PLAY этой полосы и так попадает — его не поднимаем.
+        y_move = y if y < 40 else max(0, y - 18)
+        return self._xtest_from_origin(x_move, y_move, click=click)
 
     def _xtest_from_origin(self, x: int, y: int, *, click: bool) -> bool:
         """Прижать курсор в левый верх относительными шагами и дойти до (x, y)."""
