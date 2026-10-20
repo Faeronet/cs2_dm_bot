@@ -293,11 +293,14 @@ class ScreenClicker:
         from cs2_menu.live_ui import FALLBACK, resolve_point
 
         pt = None
+        fb = FALLBACK.get(name)
         fr = self.capture_client()
         if fr is not None and not _blank(fr.image):
             pt = resolve_point(fr.image, fr.client, name)
-        if pt is None:
-            pt = FALLBACK.get(name)
+        # Кадр легко путает PLAY и STORE: соседняя кнопка на полосе.
+        # Далеко от снятой доли кликать нельзя — откроется магазин и капсула.
+        if fb is not None and (pt is None or abs(pt[0] - fb[0]) > 0.04 or abs(pt[1] - fb[1]) > 0.04):
+            pt = fb
         if pt is None:
             print(f"[menu-click] {name}: нет доли", flush=True)
             return False

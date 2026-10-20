@@ -592,52 +592,36 @@ class HybridInput(GameInput):
         fy = min(1.0, max(0.0, float(fy)))
         x = min(width - 1, max(0, int(round(fx * (width - 1)))))
         y = min(height - 1, max(0, int(round(fy * (height - 1)))))
-        pos = self._pointer_pos()
-        if pos is None:
-            print("[menu-click] курсор композита не читается", flush=True)
-            return False
-        cx, cy = pos
-        # Абсолютный mousemove AnyDesk и XTest под захватом курсора
-        # прибивает указатель в правый нижний угол. Сдвигаем относительно
-        # того места, где он уже стоит, короткими шагами.
-        args: list[str] = []
-        dx, dy = x - cx, y - cy
-        step = 40
-        while dx or dy:
-            sx = max(-step, min(step, dx))
-            sy = max(-step, min(step, dy))
-            args += ["mousemove_relative", "--", str(sx), str(sy)]
-            dx -= sx
-            dy -= sy
-        if click:
-            args += ["click", "1"]
-        if args:
-            out = self._inner_run(*args)
+        # Абсолютный mousemove под захватом курсора уносит указатель в угол.
+        # Короткий шаг и новая сверка: длинная цепочка перелетает с PLAY на STORE.
+        # Клик только когда курсор уже на кнопке.
+        for _ in range(10):
+            pos = self._pointer_pos()
+            if pos is None:
+                print("[menu-click] курсор композита не читается", flush=True)
+                return False
+            cx, cy = pos
+            dx, dy = x - cx, y - cy
+            if abs(dx) <= 12 and abs(dy) <= 12:
+                if not click:
+                    return True
+                out = self._inner_run("click", "1")
+                if out is None or out.returncode != 0:
+                    print("[menu-click] клик не вышел", flush=True)
+                    return False
+                return True
+            step = 36
+            sx = dx if abs(dx) <= step else (step if dx > 0 else -step)
+            sy = dy if abs(dy) <= step else (step if dy > 0 else -step)
+            out = self._inner_run("mousemove_relative", "--", str(sx), str(sy))
             if out is None or out.returncode != 0:
                 err = "" if out is None else (out.stderr or out.stdout or "").strip()
                 print(f"[menu-click] сдвиг ({cx},{cy}) -> ({x},{y}) не вышел {err[:160]}", flush=True)
                 return False
+            time.sleep(0.03)
         end = self._pointer_pos()
-        if end is None:
-            return not click
-        ex, ey = end
-        if abs(ex - x) <= 24 and abs(ey - y) <= 24:
-            return True
-        # X-курсор остался в углу. Тот же сдвиг — виртуальной мышью gamescope.
-        self._emit_rel(x - ex, y - ey)
-        if click:
-            self.mouse_down("left")
-            time.sleep(0.05)
-            self.mouse_up("left")
-        time.sleep(0.05)
-        end = self._pointer_pos()
-        if end is not None and abs(end[0] - x) <= 24 and abs(end[1] - y) <= 24:
-            return True
         where = "?" if end is None else f"({end[0]},{end[1]})"
-        print(
-            f"[menu-click] курсор ({cx},{cy}) -> цель ({x},{y}), сейчас {where}",
-            flush=True,
-        )
+        print(f"[menu-click] не дошёл до ({x},{y}), сейчас {where} — клик отменён", flush=True)
         return False
 
     def hover_field(self, fx: float, fy: float) -> bool:
