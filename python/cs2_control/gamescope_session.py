@@ -82,10 +82,25 @@ def steam_pids() -> list[int]:
     return [pid for pid in _pids() if _is_steam_client(_cmdline(pid))]
 
 
-def gamescope_xdisplay() -> str:
-    """Экран Xwayland внутри gamescope.
+def _environ(pid: int) -> dict[str, str]:
+    try:
+        raw = open(f"/proc/{pid}/environ", "rb").read()
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for item in raw.split(b"\x00"):
+        if b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        out[key.decode(errors="replace")] = value.decode(errors="replace")
+    return out
 
-    Рабочий стол часто уже держит :0, и тогда gamescope берёт :1 или :2.
+
+def gamescope_x11() -> tuple[str, str | None]:
+    """Экран и ключ Xwayland внутри gamescope.
+
+    Рабочий стол и AnyDesk часто уже держат :0. Gamescope тогда берёт :1 или :2,
+    и курсор меню живёт только там. Мышь удалённого рабочего стола в это поле не входит.
     """
     for pid in _pids():
         cmd = _cmdline(pid)
@@ -93,10 +108,24 @@ def gamescope_xdisplay() -> str:
             continue
         if gamescope_ancestor(pid) is None:
             continue
-        for part in cmd[1:]:
+        display = None
+        auth = None
+        args = cmd[1:]
+        for i, part in enumerate(args):
             if len(part) > 1 and part.startswith(":") and part[1:].isdigit():
-                return part
-    return ":0"
+                display = part
+            if part == "-auth" and i + 1 < len(args):
+                auth = args[i + 1]
+        if display is None:
+            continue
+        if not auth:
+            auth = _environ(pid).get("XAUTHORITY") or None
+        return display, auth
+    return ":0", None
+
+
+def gamescope_xdisplay() -> str:
+    return gamescope_x11()[0]
 
 
 def gamescope_ancestor(pid: int) -> int | None:

@@ -443,13 +443,20 @@ class HybridInput(GameInput):
 
     def _inner_env(self) -> dict[str, str]:
         """Xwayland внутри gamescope. Курсор меню живёт здесь, не на рабочем столе."""
-        from cs2_control.gamescope_session import _session_env, gamescope_xdisplay
+        from cs2_control.gamescope_session import _session_env, gamescope_x11
 
         env = _session_env()
-        env["DISPLAY"] = gamescope_xdisplay()
-        auth = f"/run/user/{os.getuid()}/gdm/Xauthority"
-        if os.path.isfile(auth):
+        display, auth = gamescope_x11()
+        env["DISPLAY"] = display
+        if auth and os.path.isfile(auth):
             env["XAUTHORITY"] = auth
+        else:
+            gdm = f"/run/user/{os.getuid()}/gdm/Xauthority"
+            if os.path.isfile(gdm):
+                env["XAUTHORITY"] = gdm
+        if not getattr(self, "_inner_announced", False):
+            self._inner_announced = True
+            print(f"Курсор меню: экран gamescope {display}", flush=True)
         lib = os.path.join(os.path.dirname(os.path.dirname(self._xdo_bin())), "lib", "x86_64-linux-gnu")
         if os.path.isdir(lib):
             prev = env.get("LD_LIBRARY_PATH", "")
