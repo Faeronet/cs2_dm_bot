@@ -219,6 +219,27 @@ def _named_row(
     return found
 
 
+def menu_bar_visible(im: Image.Image, client: Client) -> bool:
+    """Верхняя полоса главного меню. На логотипе Valve её нет — логотип в центре."""
+    if find_nav(im, client):
+        return True
+    px = im.load()
+    w, h = im.size
+    y0 = max(0, client.top + int(client.height * 0.008))
+    y1 = min(h, client.top + int(client.height * 0.08))
+    x0 = max(0, client.left + int(client.width * 0.20))
+    x1 = min(w, client.left + int(client.width * 0.80))
+    n = 0
+    for y in range(y0, y1, 2):
+        for x in range(x0, x1, 2):
+            r, g, b = px[x, y][:3]
+            if r > 180 and g > 180 and b > 180:
+                n += 1
+                if n >= 36:
+                    return True
+    return False
+
+
 def find_nav(im: Image.Image, client: Client) -> dict[str, tuple[float, float]]:
     y0 = client.top + int(client.height * 0.012)
     y1 = client.top + int(client.height * 0.055)

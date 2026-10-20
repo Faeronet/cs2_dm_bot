@@ -26,6 +26,25 @@ def ensure_flat_accel() -> None:
             pass
 
 
+def grab_rect(env: dict, rect: tuple[int, int, int, int], out: str) -> bool:
+    """Снимок прямоугольника на том экране, где окно видно глазами."""
+    x, y, w, h = rect
+    x0, y0 = max(0, x), max(0, y)
+    if w < 2 or h < 2:
+        return False
+    disp = env.get("DISPLAY", ":1")
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "x11grab",
+             "-video_size", f"{w}x{h}", "-i", f"{disp}+{x0},{y0}",
+             "-frames:v", "1", "-update", "1", out],
+            env=env, capture_output=True, timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and Path(out).exists()
+
+
 def root_shot(env: dict, out: str, *, size: tuple[int, int] = (SCREEN_W, SCREEN_H)) -> bool:
     disp = env.get("DISPLAY", ":1")
     w, h = size
@@ -232,6 +251,38 @@ class ScreenClicker:
             min(full.size[0], x + w), min(full.size[1], y + h),
         ))
         return Frame(im, (x, y), detect_client(im))
+
+    def capture_visible(self):
+        """Кадр, на котором видно игру.
+
+        Поле внутри gamescope часто чёрное или без меню: картинка лежит в окне
+        на рабочем столе. Пока верхней полосы нет, берётся это окно.
+        """
+        from PIL import Image
+
+        from cs2_menu.live_ui import Client, Frame, menu_bar_visible
+
+        field = self.capture_client()
+        if (
+            field is not None
+            and not _blank(field.image)
+            and menu_bar_visible(field.image, field.client)
+        ):
+            return field
+        rect = self.content_rect()
+        host = None
+        if rect and self._env is not None:
+            shot = "/tmp/_menu_visible.png"
+            if grab_rect(self._env, rect, shot):
+                im = Image.open(shot).convert("RGB")
+                if not _blank(im):
+                    w, h = im.size
+                    host = Frame(im, (rect[0], rect[1]), Client(0, 0, w, h))
+        if host is not None:
+            return host
+        if field is not None and not _blank(field.image):
+            return field
+        return None
 
     def act_client(self, fx: float, fy: float, *, hover: bool = False, hold_ms: int = 70, settle: float = 0.9) -> bool:
         """Клик или наведение по доле поля gamescope. Фокус окна не нужен."""

@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from cs2_menu import MenuController
 from cs2_menu.driver import UIStateReader
+from cs2_menu.live_ui import menu_bar_visible
 from cs2_menu.window_signatures import close_window
 from cs2_menu.xwl_pointer import ScreenClicker, ensure_flat_accel, root_shot
 from cs2_reader.reader import Reader
@@ -107,6 +108,28 @@ def _valid_map(name: str) -> bool:
     return bool(normalize_map(name))
 
 
+def wait_for_main_menu(clicker: ScreenClicker, log_fn=log, timeout: float = 150.0) -> bool:
+    """Не жать PLAY, пока на экране логотип Valve или загрузка.
+
+    Главное меню узнаём по белой полосе сверху. Пока её нет, клики по долям
+    попадают в логотип, а скрипт уже считает, что поиск матча пошёл.
+    """
+    deadline = time.monotonic() + timeout
+    log_fn("жду главное меню, на логотипе кнопки не жму")
+    next_note = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        fr = clicker.capture_visible()
+        if fr is not None and menu_bar_visible(fr.image, fr.client):
+            log_fn("главное меню на экране — жму кнопки")
+            return True
+        if time.monotonic() >= next_note:
+            log_fn("меню ещё не открылось, жду")
+            next_note = time.monotonic() + 15.0
+        time.sleep(1.0)
+    log_fn("главное меню так и не открылось")
+    return False
+
+
 def launch_until_spawn(
     reader: Reader,
     menu: MenuController,
@@ -134,6 +157,8 @@ def launch_until_spawn(
         if shots:
             root_shot(env, f"/tmp/dmof_{name}.png")
 
+    if not wait_for_main_menu(clicker, log_fn):
+        return 2
     clear()
     step("play", settle=1.3)
     step("matchmaking", settle=1.1)
