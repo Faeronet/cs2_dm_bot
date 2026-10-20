@@ -82,6 +82,23 @@ def steam_pids() -> list[int]:
     return [pid for pid in _pids() if _is_steam_client(_cmdline(pid))]
 
 
+def gamescope_xdisplay() -> str:
+    """Экран Xwayland внутри gamescope.
+
+    Рабочий стол часто уже держит :0, и тогда gamescope берёт :1 или :2.
+    """
+    for pid in _pids():
+        cmd = _cmdline(pid)
+        if not cmd or os.path.basename(cmd[0]) != "Xwayland":
+            continue
+        if gamescope_ancestor(pid) is None:
+            continue
+        for part in cmd[1:]:
+            if len(part) > 1 and part.startswith(":") and part[1:].isdigit():
+                return part
+    return ":0"
+
+
 def gamescope_ancestor(pid: int) -> int | None:
     seen: set[int] = set()
     while pid > 1 and pid not in seen:

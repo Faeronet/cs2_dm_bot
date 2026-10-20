@@ -443,10 +443,10 @@ class HybridInput(GameInput):
 
     def _inner_env(self) -> dict[str, str]:
         """Xwayland внутри gamescope. Курсор меню живёт здесь, не на рабочем столе."""
-        from cs2_control.gamescope_session import _session_env
+        from cs2_control.gamescope_session import _session_env, gamescope_xdisplay
 
         env = _session_env()
-        env["DISPLAY"] = ":0"
+        env["DISPLAY"] = gamescope_xdisplay()
         auth = f"/run/user/{os.getuid()}/gdm/Xauthority"
         if os.path.isfile(auth):
             env["XAUTHORITY"] = auth
@@ -548,14 +548,15 @@ class HybridInput(GameInput):
         import subprocess
 
         width, height = self._display_size()
+        env = self._inner_env()
         try:
             proc = subprocess.run(
                 [
                     "ffmpeg", "-y", "-loglevel", "error",
                     "-f", "x11grab", "-video_size", f"{width}x{height}",
-                    "-i", ":0+0,0", "-frames:v", "1", path,
+                    "-i", f"{env['DISPLAY']}+0,0", "-frames:v", "1", path,
                 ],
-                env=self._inner_env(),
+                env=env,
                 capture_output=True,
                 timeout=8,
             )
