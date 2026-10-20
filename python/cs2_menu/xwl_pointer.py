@@ -1,15 +1,8 @@
-"""Надёжный ввод мышью в меню CS2 на XWayland (GNOME/mutter).
+"""Меню CS2 внутри gamescope.
 
-Почему так:
-  * xdotool mousemove двигает X-указатель, который композитор Wayland ИГНОРИРУЕТ —
-    клик uinput срабатывает в позиции курсора КОМПОЗИТОРА, а не X.
-  * Поэтому позиционируем курсор ОТНОСИТЕЛЬНЫМИ дельтами uinput (ядро → libinput →
-    композитор). При flat-профиле ускорения и speed=0 одна дельта = один пиксель.
-  * Курсор «прижимаем» в угол (0,0) большими отрицательными дельтами, затем шагаем
-    на (x, y) — получается детерминированная абсолютная позиция.
-  * Скриншот — ffmpeg x11grab (пооконный xwd даёт мусор, xwd -root — BadColor).
-
-Координаты кликов задаём ДОЛЯМИ прямоугольника окна CS2 (устойчиво к переносу окна).
+Курсор композита не выходит за поле игры и не достаёт до верхней рамки окна:
+для него игра уже на весь свой экран. Поэтому кадр и клики считаются от поля
+gamescope (1280×800), а не от окна на рабочем столе.
 """
 
 from __future__ import annotations
@@ -97,12 +90,31 @@ def detect_content_offset(shot_path: str, win: tuple[int, int, int, int]) -> int
     return None
 
 
+def _blank(im) -> bool:
+    """Чёрный кадр Xwayland: картинка игры в нём не лежит, доли с него не читаются."""
+    px = im.convert("L").load()
+    w, h = im.size
+    total = n = 0
+    for y in range(0, h, 16):
+        for x in range(0, w, 16):
+            total += px[x, y]
+            n += 1
+    return n > 0 and total / n < 8.0
+
+
 def move_abs(inp, sx: int, sy: int, *, step_delay: float = 0.0003) -> None:
     """Абсолютное позиционирование курсора композитора через относительные дельты."""
     # остановить фоновое сглаживание мыши, если включено
     if getattr(inp, "_running", False):
         inp._running = False
         time.sleep(0.05)
+    # Указатель libei живёт в окне gamescope, а sx/sy — пиксели всего экрана.
+    origin = getattr(inp, "pointer_origin", (0, 0)) or (0, 0)
+    sx = max(0, int(sx) - int(origin[0]))
+    sy = max(0, int(sy) - int(origin[1]))
+    if hasattr(inp, "move_abs_local") and inp.move_abs_local(sx, sy):
+        time.sleep(0.05)
+        return
     # прижать в угол (0,0): диагональ экрана с запасом
     for _ in range(60):
         inp._emit_rel(-200, -200)
@@ -146,7 +158,10 @@ class ScreenClicker:
         if not self._mi._window_id and not self._mi.refresh_window():
             return None
         self._mi.refresh_window()
-        geo = self._mi.geometry()
+        # Картинка меню рисуется в рамке mutter, а не в прямоугольнике gamescope:
+        # тот сдвинут вниз, и клик по доле окна попадает ниже кнопки.
+        decor = self._mi.decor_geometry()
+        geo = decor if decor.get("width") else self._mi.geometry()
         if not geo.get("width"):
             return None
         return geo.get("x", 0), geo.get("y", 0), geo["width"], geo.get("height", 0)
@@ -185,15 +200,29 @@ class ScreenClicker:
         return int(round(x + fx * w)), int(round(y + fy * h))
 
     def capture_client(self):
-        """Кадр окна и игровое поле внутри рамки. None, если окна нет."""
+        """Кадр поля gamescope. Рамки окна на этом кадре нет."""
         from PIL import Image
 
-        from cs2_menu.live_ui import Frame, detect_client
+        from cs2_menu.live_ui import Client, Frame, detect_client
 
+        grab = getattr(self._mi.game_input, "grab_field", None)
+        shot = "/tmp/_menu_field.png"
+        if grab is not None:
+            size = grab(shot)
+            if not size:
+                return None
+            im = Image.open(shot).convert("RGB")
+            # Чёрный кадр Xwayland не показывает меню. Модалкой его считать нельзя:
+            # иначе ESC закроет поиск. Доли кнопок берутся из FALLBACK.
+            if _blank(im):
+                return None
+            w, h = im.size
+            return Frame(im, (0, 0), Client(0, 0, w, h))
+        # Вне gamescope — прежний кадр окна на рабочем столе, с вырезанием рамки.
+        self._mi.focus()
         rect = self.window_rect()
         if not rect or self._env is None:
             return None
-        shot = "/tmp/_menu_client.png"
         if not root_shot(self._env, shot):
             return None
         x, y, w, h = rect
@@ -205,51 +234,77 @@ class ScreenClicker:
         return Frame(im, (x, y), detect_client(im))
 
     def act_client(self, fx: float, fy: float, *, hover: bool = False, hold_ms: int = 70, settle: float = 0.9) -> bool:
-        """Клик или наведение по доле игрового поля, не рамки окна."""
-        fr = self.capture_client()
-        if fr is None:
-            return False
-        sx, sy = fr.screen(fx, fy)
-        if hover:
-            return self.hover_screen(sx, sy, settle=min(settle, 0.4))
-        return self.click_screen(sx, sy, hold_ms=hold_ms, settle=settle)
+        """Клик или наведение по доле поля gamescope. Фокус окна не нужен."""
+        return self._use_field(fx, fy, hover=hover, settle=settle)
 
     def click_live(self, name: str, *, hover: bool = False, hold_ms: int = 70, settle: float = 0.9) -> bool:
-        """Клик или наведение по имени. Точка ищется на кадре, иначе — снятая доля поля."""
+        """Клик или наведение по имени. Кадр только уточняет долю; без кадра берётся снятая."""
         from cs2_menu.live_ui import FALLBACK, resolve_point
 
+        pt = None
         fr = self.capture_client()
-        if fr is None:
-            return False
-        pt = resolve_point(fr.image, fr.client, name) or FALLBACK.get(name)
+        if fr is not None and not _blank(fr.image):
+            pt = resolve_point(fr.image, fr.client, name)
         if pt is None:
+            pt = FALLBACK.get(name)
+        if pt is None:
+            print(f"[menu-click] {name}: нет доли", flush=True)
             return False
-        sx, sy = fr.screen(*pt)
-        if hover:
-            return self.hover_screen(sx, sy, settle=min(settle, 0.4))
-        return self.click_screen(sx, sy, hold_ms=hold_ms, settle=settle)
+        return self._use_field(*pt, hover=hover, settle=settle)
+
+    def _use_field(self, fx: float, fy: float, *, hover: bool, settle: float) -> bool:
+        """Доля поля. За его край и на рамку окна курсор не ставится."""
+        inp = self._mi.game_input
+        fn = getattr(inp, "hover_field" if hover else "click_field", None)
+        if fn is None or not fn(fx, fy):
+            return False
+        time.sleep(min(settle, 0.4) if hover else settle)
+        return True
 
     def click_frac(self, fx: float, fy: float, *, hold_ms: int = 70, settle: float = 0.9) -> bool:
+        if getattr(self._mi.game_input, "click_field", None) is not None:
+            return self._use_field(fx, fy, hover=False, settle=settle)
+        if self._use_field(fx, fy, hover=False, settle=settle):
+            return True
         pt = self.frac_to_screen(fx, fy)
         if not pt:
             return False
         return self.click_screen(*pt, hold_ms=hold_ms, settle=settle)
 
+    def _sync_pointer_origin(self) -> None:
+        inp = self._mi.game_input
+        if not getattr(inp, "pointer_local", False):
+            return
+        rect = self.window_rect()
+        if rect:
+            inp.pointer_origin = (rect[0], rect[1])
+
     def click_screen(self, sx: int, sy: int, *, hold_ms: int = 70, settle: float = 0.9) -> bool:
         self._mi.focus()
-        move_abs(self._mi.game_input, sx, sy)
-        self._mi.game_input.mouse_click("left", hold_ms=hold_ms)
+        inp = self._mi.game_input
+        click_at = getattr(inp, "click_at_screen", None)
+        if click_at is not None and click_at(sx, sy):
+            time.sleep(settle)
+            return True
+        self._sync_pointer_origin()
+        move_abs(inp, sx, sy)
+        inp.mouse_click("left", hold_ms=hold_ms)
         time.sleep(settle)
         return True
 
     def hover_screen(self, sx: int, sy: int, *, settle: float = 0.35) -> bool:
         """Навести курсор в точку БЕЗ клика (для подсветки/подтверждения кнопки)."""
         self._mi.focus()
+        self._sync_pointer_origin()
         move_abs(self._mi.game_input, sx, sy)
         time.sleep(settle)
         return True
 
     def hover_frac(self, fx: float, fy: float, *, settle: float = 0.35) -> bool:
+        if getattr(self._mi.game_input, "hover_field", None) is not None:
+            return self._use_field(fx, fy, hover=True, settle=settle)
+        if self._use_field(fx, fy, hover=True, settle=settle):
+            return True
         pt = self.frac_to_screen(fx, fy)
         if not pt:
             return False

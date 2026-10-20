@@ -210,7 +210,17 @@ def classify(fingerprint: str, *, clicker=None, env: dict | None = None,
     # 2) яркость (vision) — для неизвестных окон
     modal = False
     ring = 0.0
-    if clicker is not None and env is not None:
+    if clicker is not None and hasattr(clicker, "capture_client"):
+        fr = clicker.capture_client()
+        if fr is not None:
+            img = fr.image.crop((
+                fr.client.left, fr.client.top,
+                fr.client.left + fr.client.width,
+                fr.client.top + fr.client.height,
+            ))
+            info = detect_modal(img)
+            modal, ring = info.present, info.ring_mean
+    elif clicker is not None and env is not None:
         clicker._mi.focus()
         rect = clicker.content_rect()
         if rect:
@@ -238,21 +248,19 @@ def hover_button(clicker, env: dict, btn: Button) -> dict:
 
     Доли — от игрового поля. Возвращает {screen, highlighted, luma_before, luma_after}.
     """
-    clicker._mi.focus()
     before = clicker.capture_client()
     if before is None:
         return {"screen": (0, 0), "luma_before": 0.0, "luma_after": 0.0, "highlighted": False}
     px, py = before.client.pixel(btn.fx, btn.fy)
-    sx, sy = before.screen(btn.fx, btn.fy)
     lb = _region_luma(before.image, px, py)
-    clicker.hover_screen(sx, sy)
+    clicker.hover_frac(btn.fx, btn.fy)
     after = clicker.capture_client()
     if after is None:
         la = 0.0
     else:
         la = _region_luma(after.image, *after.client.pixel(btn.fx, btn.fy))
     return {
-        "screen": (sx, sy),
+        "screen": (px, py),
         "luma_before": round(lb, 1),
         "luma_after": round(la, 1),
         "highlighted": (la - lb) >= HOVER_LUMA_DELTA,
@@ -400,8 +408,7 @@ def _detect_window(clicker, env: dict, reader_state_fn, registry) -> DetectResul
         if fp and fp in sig.fingerprints and not sig.is_clean:
             return DetectResult(True, "memory", sig=sig)
 
-    # 2) яркость (затемнение фона модалкой) — один кадр
-    clicker._mi.focus()
+    # 2) яркость (затемнение фона модалкой) — один кадр, без фокуса окна
     from cs2_menu.modal_vision import _client_view, _modal_on_client
     fr = _client_view(clicker)
     if fr is not None:

@@ -195,7 +195,6 @@ def _panel_dismiss(crop: Image.Image, panel: tuple[int, int, int, int]) -> tuple
 
 def is_modal_present(clicker, env: dict) -> bool:
     """Быстрая проверка: висит ли сейчас модальное окно (с фокусом окна CS2)."""
-    clicker._mi.focus()
     fr = _client_view(clicker)
     if fr is None:
         return False
@@ -229,7 +228,6 @@ def clear_modals(clicker, env: dict, *, max_rounds: int = 2, log=print) -> bool:
 
     closed = True
     for rnd in range(max_rounds):
-        clicker._mi.focus()
         fr = _client_view(clicker)
         if fr is None:
             log("[popup] окно CS2 не найдено")

@@ -557,6 +557,11 @@ def find_inspect_close(im: Image.Image, client: Client) -> tuple[float, float] |
     return client.frac(cx, cy)
 
 
+def _button_green(r: int, g: int, b: int) -> bool:
+    """Зелёная кнопка GO / CLAIM. Ненаведённая GO темнее, чем заливка выбранной карточки."""
+    return g > 100 and r < 130 and b < 170 and g > r + 40 and g > b + 15
+
+
 def find_green(im: Image.Image, client: Client) -> tuple[float, float] | None:
     """Самое большое зелёное пятно в нижней правой части — кнопка GO / Получить."""
     px = im.load()
@@ -572,7 +577,7 @@ def find_green(im: Image.Image, client: Client) -> tuple[float, float] | None:
             if (x, y) in seen:
                 continue
             r, g, b = px[x, y][:3]
-            if not (g > 140 and r < 110 and b < 150 and g > r + 40 and g > b + 20):
+            if not _button_green(r, g, b):
                 continue
             stack = [(x, y)]
             seen.add((x, y))
@@ -588,7 +593,7 @@ def find_green(im: Image.Image, client: Client) -> tuple[float, float] | None:
                     if nx < x0 or nx >= x1 or ny < y0 or ny >= y1 or (nx, ny) in seen:
                         continue
                     rr, gg, bb = px[nx, ny][:3]
-                    if gg > 140 and rr < 110 and bb < 150 and gg > rr + 40 and gg > bb + 20:
+                    if _button_green(rr, gg, bb):
                         seen.add((nx, ny))
                         stack.append((nx, ny))
             if n > best_n and (xb - xa) > 40 and (yb - ya) > 12:

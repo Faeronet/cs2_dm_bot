@@ -110,6 +110,39 @@ class MenuInput:
     def geometry(self) -> dict[str, int]:
         return dict(self._geo)
 
+    def decor_geometry(self) -> dict[str, int]:
+        """Рамка mutter вокруг gamescope. Само окно gamescope сдвинуто вниз относительно картинки."""
+        geo = self._geo
+        gw = geo.get("width", 0)
+        gh = geo.get("height", 0)
+        if gw < 100 or gh < 100:
+            return {}
+        cx = geo.get("x", 0) + gw // 2
+        cy = geo.get("y", 0) + gh // 2
+        candidates = self._window_ids("search", "--name", "Counter-Strike 2")
+        candidates += self._window_ids("search", "--class", "mutter-x11-frames")
+        best: dict[str, int] = {}
+        best_area = 10**12
+        for wid in candidates:
+            if not self._window_comm(wid).startswith("mutter-x11-fram"):
+                continue
+            frame = self._window_geometry(wid)
+            x, y = frame.get("x", 0), frame.get("y", 0)
+            w, h = frame.get("width", 0), frame.get("height", 0)
+            if w < gw or h < gh:
+                continue
+            if not (x <= cx <= x + w and y <= cy <= y + h):
+                continue
+            # Имя совпало — это рамка игры, а не чужое окно, которое её накрывает.
+            if self._xdo("getwindowname", str(wid)).strip() == "Counter-Strike 2":
+                return frame
+            if w > gw + 80 or h > gh + 120:
+                continue
+            area = w * h
+            if area < best_area:
+                best, best_area = frame, area
+        return best
+
     def _xdo_env(self) -> dict[str, str]:
         env = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")}
         if os.path.isdir(XDO_LIB):
@@ -138,24 +171,42 @@ class MenuInput:
         except (subprocess.TimeoutExpired, OSError):
             return ""
 
+    def _window_ids(self, *query: str) -> list[int]:
+        raw = self._xdo(*query)
+        found: list[int] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                found.append(int(line))
+        return found
+
+    def _window_comm(self, wid: int) -> str:
+        pid_s = self._xdo("getwindowpid", str(wid)).strip()
+        if not pid_s.isdigit():
+            return ""
+        try:
+            return open(f"/proc/{pid_s}/comm", encoding="utf-8").read().strip()
+        except OSError:
+            return ""
+
     def _find_window(self) -> int | None:
+        """Окно gamescope, а не рамка mutter с тем же заголовком."""
         if not os.path.isfile(XDOTOOL):
             return None
-        env = self._xdo_env()
-        for query in (("search", "--name", "Counter-Strike 2"), ("search", "--class", "cs2")):
-            try:
-                out = subprocess.run(
-                    [XDOTOOL, *query],
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=2.0,
-                )
-                raw = (out.stdout or "").strip()
-                if raw:
-                    return int(raw.splitlines()[0].strip())
-            except (subprocess.TimeoutExpired, OSError, ValueError):
-                continue
+        seen: set[int] = set()
+        for query in (
+            ("search", "--class", "gamescope"),
+            ("search", "--name", "Counter-Strike 2"),
+            ("search", "--class", "cs2"),
+        ):
+            for wid in self._window_ids(*query):
+                if wid in seen:
+                    continue
+                seen.add(wid)
+                # comm в /proc обрезан до 15 символов: mutter-x11-fram
+                if self._window_comm(wid).startswith("mutter-x11-fram"):
+                    continue
+                return wid
         return None
 
     def _window_geometry(self, wid: int) -> dict[str, int]:

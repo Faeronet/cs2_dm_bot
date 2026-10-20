@@ -45,7 +45,7 @@ def main() -> int:
     sub.add_parser("where", help="Где сейчас в меню (screen_id + геометрия)")
 
     sub.add_parser("probe", help="Провести курсором по точкам layout (без кликов)")
-
+с
     args = parser.parse_args()
     reader = Reader.from_live()
     if not reader:

@@ -121,12 +121,12 @@ class GameInput:
 
 class EvdevInput(GameInput):
     """
-    Мышь через uinput. Дельта, пришедшая за тик контроллера (40 Гц), не выстреливается одним
+    Мышь через uinput. Дельта, пришедшая за тик контроллера (до 600 Гц), не выстреливается одним
     событием, а размазывается фоновым потоком на под-шаги с частотой smooth_hz (как отчёты
     реальной мыши 500–1000 Гц) — иначе камера в игре при 144+ fps идёт «ступеньками» и трясётся.
     """
 
-    def __init__(self, *, quiet: bool = False, smooth_hz: float = 500.0) -> None:
+    def __init__(self, *, quiet: bool = False, smooth_hz: float = 600.0) -> None:
         from evdev import UInput, ecodes as e
 
         self._e = e

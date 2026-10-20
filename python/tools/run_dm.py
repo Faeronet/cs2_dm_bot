@@ -26,7 +26,8 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from cs2_control.input import create_input
+from cs2_control.ei_input import HybridInput
+from cs2_control.gamescope_session import ensure_gamescope
 from cs2_menu import MenuController
 from cs2_menu.driver import UIStateReader
 from cs2_menu.window_signatures import close_window
@@ -326,6 +327,7 @@ def run_bot_until_change(
     """
     cfg = NavConfig(
         tick_hz=hz,
+        enemies_poll_hz=600.0,
         duration=None,
         loop=True,
         verbose_log=not quiet,
@@ -421,7 +423,7 @@ def main() -> int:
         default=None,
         help="То же, что --match-time (старое имя)",
     )
-    parser.add_argument("--hz", type=float, default=40.0)
+    parser.add_argument("--hz", type=float, default=600.0, help="Частота тика управления (Гц)")
     parser.add_argument("--shots", action="store_true", help="Скриншоты шагов меню")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
@@ -457,14 +459,30 @@ def main() -> int:
             mesh_names = f"не читается ({exc})"
         log(f"навмеши: {MAPS_DIR} → {mesh_names}")
 
+        try:
+            ei_socket = ensure_gamescope(log)
+        except RuntimeError as exc:
+            log(str(exc))
+            return 1
+
         ensure_flat_accel()
-        reader = Reader.from_live()
+        reader = None
+        reader_deadline = time.monotonic() + 90
+        while time.monotonic() < reader_deadline:
+            reader = Reader.from_live()
+            if reader:
+                break
+            time.sleep(1.0)
         if not reader:
             log("CS2 не запущен")
             return 1
 
-        inp = create_input()
-        inp.prepare()
+        try:
+            inp = HybridInput(ei_socket)
+            inp.prepare()
+        except (OSError, TimeoutError) as exc:
+            log(f"виртуальная мышь gamescope не поднялась: {exc}")
+            return 1
         menu = MenuController(reader, game_input=inp, log=log)
         cache: dict[str, CoordinateMap] = {}
         match_time = args.duration if args.duration is not None else args.match_time

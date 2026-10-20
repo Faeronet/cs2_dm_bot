@@ -159,7 +159,7 @@ def _xxhash32_int(buf: int, seed: int) -> int:
 
 @dataclass
 class NavConfig:
-    tick_hz: float = 40.0
+    tick_hz: float = 600.0
     # --- камера
     look_ahead_min: float = 120.0
     look_ahead_max: float = 260.0
@@ -212,7 +212,7 @@ class NavConfig:
     precal_px: int = 16                      # px за тик, если precal_ticks > 0
     # --- мишени вокруг (LOS по карте + spotted, не конус камеры)
     engage_targets: bool = True              # смотреть на видимую вокруг мишень, продолжая идти по маршруту
-    enemies_poll_hz: float = 80.0            # фоновый скан видимости, тик наведения его не ждёт
+    enemies_poll_hz: float = 600.0           # фоновый скан врагов; ~607 Hz предел enemies() на Linux
     background_workers: bool = True          # скан мишеней, мир и маршрут — в отдельных потоках
     ladders_poll_hz: float = 0.5             # лестницы меняются редко — полный перебор entity list
     doors_poll_hz: float = 2.0               # двери: состояние open/closed меняется чаще

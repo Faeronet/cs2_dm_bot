@@ -1,0 +1,96 @@
+{
+  "clean_menu": {
+    "id": "clean_menu",
+    "description": "Чистое меню (окна нет)",
+    "is_clean": true,
+    "fingerprints": [],
+    "buttons": []
+  },
+  "error": {
+    "id": "error",
+    "description": "Disconnected / Unable to connect (gameserver)",
+    "is_clean": false,
+    "fingerprints": [
+      "c9a75157fb409bd3"
+    ],
+    "buttons": [
+      {
+        "label": "ok",
+        "fx": 0.612,
+        "fy": 0.552
+      },
+      {
+        "label": "ok",
+        "fx": 0.666,
+        "fy": 0.561
+      },
+      {
+        "label": "ok",
+        "fx": 0.5,
+        "fy": 0.561
+      }
+    ]
+  },
+  "prime_upsell": {
+    "id": "prime_upsell",
+    "description": "Prime / магазин upsell",
+    "is_clean": false,
+    "fingerprints": [],
+    "buttons": [
+      {
+        "label": "close",
+        "fx": 0.72,
+        "fy": 0.933
+      }
+    ]
+  },
+  "notification": {
+    "id": "notification",
+    "description": "Уведомление / toast",
+    "is_clean": false,
+    "fingerprints": [],
+    "buttons": [
+      {
+        "label": "close",
+        "fx": 0.72,
+        "fy": 0.933
+      }
+    ]
+  },
+  "community_servers": {
+    "id": "community_servers",
+    "description": "Диалог 'Community Servers' (never-show / OK / Cancel)",
+    "is_clean": false,
+    "fingerprints": [],
+    "buttons": [
+      {
+        "label": "dont_show",
+        "fx": 0.52,
+        "fy": 0.583
+      },
+      {
+        "label": "ok",
+        "fx": 0.627,
+        "fy": 0.583
+      },
+      {
+        "label": "close",
+        "fx": 0.664,
+        "fy": 0.583
+      }
+    ]
+  },
+  "fullscreen_sub": {
+    "id": "fullscreen_sub",
+    "description": "Под-экран инспекции/магазина (CLOSE справа-внизу)",
+    "is_clean": false,
+    "fingerprints": [],
+    "buttons": [
+      {
+        "label": "close",
+        "fx": 0.756,
+        "fy": 0.953
+      }
+    ]
+  }
+}
