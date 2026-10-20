@@ -597,7 +597,13 @@ class HybridInput(GameInput):
         x_move = int(round(x * 2 / 3))
         # Ниже верхней полосы клик садится на 18 px ниже центра кнопки.
         # PLAY этой полосы и так попадает — его не поднимаем.
-        y_move = y if y < 40 else max(0, y - 18)
+        # Deathmatch и GO после этого всё ещё на 15–20 px ниже.
+        lift = 18
+        if (abs(fx - 0.517) <= 0.06 and abs(fy - 0.118) <= 0.06) or (
+            abs(fx - 0.865) <= 0.05 and abs(fy - 0.956) <= 0.06
+        ):
+            lift = 36
+        y_move = y if y < 40 else max(0, y - lift)
         return self._xtest_from_origin(x_move, y_move, click=click)
 
     def _xtest_from_origin(self, x: int, y: int, *, click: bool) -> bool:
