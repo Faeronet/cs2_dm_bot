@@ -10,6 +10,7 @@
   python3 python/tools/run_dm.py --match-time 600
   python3 python/tools/run_dm.py --match-time 0    # без лимита
   python3 python/tools/run_dm.py --stop            # остановить уже запущенный бот
+  python3 python/tools/run_dm.py --gameoff         # остановить бота и закрыть игру
 
 Лимит считается только пока бот работает в матче (после спавна).
 Меню, очередь и поиск матча в это время не входят. Новый матч — новый отсчёт.
@@ -27,7 +28,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from cs2_control.ei_input import HybridInput
-from cs2_control.gamescope_session import ensure_gamescope
+from cs2_control.gamescope_session import close_game, ensure_gamescope
 from cs2_menu import MenuController
 from cs2_menu.driver import UIStateReader
 from cs2_menu.window_signatures import close_window
@@ -87,7 +88,7 @@ def _is_this_bot(pid: int) -> bool:
     if pid <= 0 or pid == os.getpid():
         return False
     args = _proc_args(pid)
-    if not args or "--stop" in args:
+    if not args or "--stop" in args or "--gameoff" in args:
         return False
     try:
         cwd = os.readlink(f"/proc/{pid}/cwd")
@@ -431,8 +432,17 @@ def main() -> int:
         action="store_true",
         help="Остановить уже запущенный этот же скрипт",
     )
+    parser.add_argument(
+        "--gameoff",
+        action="store_true",
+        help="Остановить уже запущенный скрипт и закрыть игру",
+    )
     args = parser.parse_args()
 
+    if args.gameoff:
+        stop_running()
+        close_game(log)
+        return 0
     if args.stop:
         return stop_running()
 
@@ -444,7 +454,8 @@ def main() -> int:
     if already:
         log(
             f"бот уже запущен (pid={already[0]}). "
-            "Остановить: python3 python/tools/run_dm.py --stop"
+            "Остановить: python3 python/tools/run_dm.py --stop. "
+            "Остановить и закрыть игру: python3 python/tools/run_dm.py --gameoff"
         )
         return 1
 

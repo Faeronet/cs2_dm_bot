@@ -238,21 +238,64 @@ def _relative_mouse(pid: int) -> bool:
 
 
 def _stop_pid(pid: int) -> None:
+    _stop_pids([pid])
+
+
+def _alive(pid: int) -> bool:
     try:
-        os.kill(pid, signal.SIGTERM)
+        os.kill(pid, 0)
     except OSError:
-        return
-    deadline = time.monotonic() + 8
-    while time.monotonic() < deadline:
+        return False
+    return True
+
+
+def _stop_pids(pids: list[int]) -> None:
+    pending = []
+    for pid in pids:
+        if not _alive(pid):
+            continue
+        pending.append(pid)
         try:
-            os.kill(pid, 0)
+            os.kill(pid, signal.SIGTERM)
         except OSError:
-            return
+            pass
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline and any(_alive(pid) for pid in pending):
         time.sleep(0.2)
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
+    for pid in pending:
+        if not _alive(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def close_game(log: Callable[[str], None]) -> None:
+    """Закрыть CS2 и окно gamescope, в котором она запущена.
+
+    Steam на рабочем столе, вне gamescope, не трогаем.
+    """
+    scopes: list[int] = []
+    game: list[int] = []
+    for pid in cs2_pids():
+        game.append(pid)
+        scope = gamescope_ancestor(pid)
+        if scope and scope not in scopes:
+            scopes.append(scope)
+    for pid in steam_pids():
+        scope = gamescope_ancestor(pid)
+        if scope is None:
+            continue
+        if scope not in scopes:
+            scopes.append(scope)
+        if pid not in game:
+            game.append(pid)
+    if not game and not scopes:
+        log("игра не запущена")
+        return
+    log("закрываю игру")
+    _stop_pids([*game, *scopes])
 
 
 def game_focused() -> bool:
