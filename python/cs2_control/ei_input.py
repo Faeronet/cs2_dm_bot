@@ -592,44 +592,63 @@ class HybridInput(GameInput):
         fy = min(1.0, max(0.0, float(fy)))
         x = min(width - 1, max(0, int(round(fx * (width - 1)))))
         y = min(height - 1, max(0, int(round(fy * (height - 1)))))
-        # Абсолютный mousemove под захватом курсора уносит указатель в угол.
-        # Весь остаток пути — одной командой, иначе десять коротких шагов
-        # с правого края так и остаются на правой половине окна.
-        # Клик только когда курсор уже на кнопке, не на соседней.
-        for _ in range(3):
-            pos = self._pointer_pos()
-            if pos is None:
-                print("[menu-click] курсор композита не читается", flush=True)
+        # Абсолютный mousemove и шаг больше ~40 px под захватом курсора
+        # прижимают указатель к правому краю и в нижний угол.
+        # Весь путь — одна команда из шагов по 40 px: так курсор доходит
+        # до верхней полосы. Крупную поправку вторым заходом не делаем.
+        pos = self._pointer_pos()
+        if pos is None:
+            print("[menu-click] курсор композита не читается", flush=True)
+            return False
+        if not self._rel_chain(x - pos[0], y - pos[1]):
+            return False
+        time.sleep(0.05)
+        end = self._pointer_pos()
+        if end is None:
+            return not click
+        dx, dy = x - end[0], y - end[1]
+        if abs(dx) > 16 or abs(dy) > 16:
+            if abs(dx) > 100 or abs(dy) > 100:
+                print(
+                    f"[menu-click] ({pos[0]},{pos[1]}) -> ({x},{y}), сейчас ({end[0]},{end[1]}) — клик отменён",
+                    flush=True,
+                )
                 return False
-            cx, cy = pos
-            dx, dy = x - cx, y - cy
-            if abs(dx) <= 16 and abs(dy) <= 16:
-                if not click:
-                    return True
-                out = self._inner_run("click", "1")
-                if out is None or out.returncode != 0:
-                    print("[menu-click] клик не вышел", flush=True)
-                    return False
-                return True
-            args: list[str] = []
-            step = 160
-            left, up = dx, dy
-            while left or up:
-                sx = max(-step, min(step, left))
-                sy = max(-step, min(step, up))
-                args += ["mousemove_relative", "--", str(sx), str(sy)]
-                left -= sx
-                up -= sy
-            out = self._inner_run(*args)
-            if out is None or out.returncode != 0:
-                err = "" if out is None else (out.stderr or out.stdout or "").strip()
-                print(f"[menu-click] сдвиг ({cx},{cy}) -> ({x},{y}) не вышел {err[:160]}", flush=True)
+            if not self._rel_chain(dx, dy):
                 return False
             time.sleep(0.05)
-        end = self._pointer_pos()
-        where = "?" if end is None else f"({end[0]},{end[1]})"
-        print(f"[menu-click] не дошёл до ({x},{y}), сейчас {where} — клик отменён", flush=True)
-        return False
+            end = self._pointer_pos()
+            if end is None or abs(end[0] - x) > 16 or abs(end[1] - y) > 16:
+                where = "?" if end is None else f"({end[0]},{end[1]})"
+                print(f"[menu-click] не дошёл до ({x},{y}), сейчас {where} — клик отменён", flush=True)
+                return False
+        if not click:
+            return True
+        out = self._inner_run("click", "1")
+        if out is None or out.returncode != 0:
+            print("[menu-click] клик не вышел", flush=True)
+            return False
+        return True
+
+    def _rel_chain(self, dx: int, dy: int) -> bool:
+        """Сдвиг относительными шагами по 40 px. Один большой шаг уходит в край окна."""
+        args: list[str] = []
+        step = 40
+        left, up = int(dx), int(dy)
+        while left or up:
+            sx = max(-step, min(step, left))
+            sy = max(-step, min(step, up))
+            args += ["mousemove_relative", "--", str(sx), str(sy)]
+            left -= sx
+            up -= sy
+        if not args:
+            return True
+        out = self._inner_run(*args)
+        if out is None or out.returncode != 0:
+            err = "" if out is None else (out.stderr or out.stdout or "").strip()
+            print(f"[menu-click] сдвиг на ({dx},{dy}) не вышел {err[:160]}", flush=True)
+            return False
+        return True
 
     def hover_field(self, fx: float, fy: float) -> bool:
         return self._field_pointer(fx, fy, click=False)
