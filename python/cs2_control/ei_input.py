@@ -592,10 +592,9 @@ class HybridInput(GameInput):
         fy = min(1.0, max(0.0, float(fy)))
         x = min(width - 1, max(0, int(round(fx * (width - 1)))))
         y = min(height - 1, max(0, int(round(fy * (height - 1)))))
-        # Под захватом курсора ось X сжата в правую половину: центр меню
-        # оказывается в центре правой части, левой половины словно нет.
-        # От левого верхнего угла шлём 2x − ширина, чтобы центр встал в центр.
-        x_move = 2 * x - (width - 1)
+        # Один отправленный пиксель по X сдвигается примерно на 1.5.
+        # Полная координата уезжала в правую половину, а 2x−ширина — в телевизор.
+        x_move = int(round(x * 2 / 3))
         return self._xtest_from_origin(x_move, y, click=click)
 
     def _xtest_from_origin(self, x: int, y: int, *, click: bool) -> bool:
