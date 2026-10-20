@@ -592,63 +592,77 @@ class HybridInput(GameInput):
         fy = min(1.0, max(0.0, float(fy)))
         x = min(width - 1, max(0, int(round(fx * (width - 1)))))
         y = min(height - 1, max(0, int(round(fy * (height - 1)))))
-        # Абсолютный mousemove и шаг больше ~40 px под захватом курсора
-        # прижимают указатель к правому краю и в нижний угол.
-        # Весь путь — одна команда из шагов по 40 px: так курсор доходит
-        # до верхней полосы. Крупную поправку вторым заходом не делаем.
-        pos = self._pointer_pos()
-        if pos is None:
-            print("[menu-click] курсор композита не читается", flush=True)
-            return False
-        if not self._rel_chain(x - pos[0], y - pos[1]):
-            return False
-        time.sleep(0.05)
-        end = self._pointer_pos()
-        if end is None:
-            return not click
-        dx, dy = x - end[0], y - end[1]
-        if abs(dx) > 16 or abs(dy) > 16:
-            if abs(dx) > 100 or abs(dy) > 100:
-                print(
-                    f"[menu-click] ({pos[0]},{pos[1]}) -> ({x},{y}), сейчас ({end[0]},{end[1]}) — клик отменён",
-                    flush=True,
-                )
-                return False
-            if not self._rel_chain(dx, dy):
-                return False
-            time.sleep(0.05)
-            end = self._pointer_pos()
-            if end is None or abs(end[0] - x) > 16 or abs(end[1] - y) > 16:
-                where = "?" if end is None else f"({end[0]},{end[1]})"
-                print(f"[menu-click] не дошёл до ({x},{y}), сейчас {where} — клик отменён", flush=True)
-                return False
-        if not click:
-            return True
-        out = self._inner_run("click", "1")
-        if out is None or out.returncode != 0:
-            print("[menu-click] клик не вышел", flush=True)
-            return False
-        return True
+        # xdotool на длинной цепочке обрывается по таймауту: курсор замирает
+        # справа посредине и в нижнем углу. Показание getmouselocation под
+        # захватом врёт, поэтому от левого верхнего угла идём сами.
+        return self._xtest_from_origin(x, y, click=click)
 
-    def _rel_chain(self, dx: int, dy: int) -> bool:
-        """Сдвиг относительными шагами по 40 px. Один большой шаг уходит в край окна."""
-        args: list[str] = []
-        step = 40
-        left, up = int(dx), int(dy)
-        while left or up:
-            sx = max(-step, min(step, left))
-            sy = max(-step, min(step, up))
-            args += ["mousemove_relative", "--", str(sx), str(sy)]
-            left -= sx
-            up -= sy
-        if not args:
+    def _xtest_from_origin(self, x: int, y: int, *, click: bool) -> bool:
+        """Прижать курсор в левый верх относительными шагами и дойти до (x, y)."""
+        import ctypes
+
+        env = self._inner_env()
+        x11 = ctypes.CDLL("libX11.so.6")
+        xtst = ctypes.CDLL("libXtst.so.6")
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XFlush.argtypes = [ctypes.c_void_p]
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        xtst.XTestFakeRelativeMotionEvent.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_ulong,
+        ]
+        xtst.XTestFakeRelativeMotionEvent.restype = ctypes.c_int
+        xtst.XTestFakeButtonEvent.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong,
+        ]
+        xtst.XTestFakeButtonEvent.restype = ctypes.c_int
+
+        old_display = os.environ.get("DISPLAY")
+        old_auth = os.environ.get("XAUTHORITY")
+        os.environ["DISPLAY"] = env["DISPLAY"]
+        if env.get("XAUTHORITY"):
+            os.environ["XAUTHORITY"] = env["XAUTHORITY"]
+        dpy = x11.XOpenDisplay(env["DISPLAY"].encode())
+        try:
+            if not dpy:
+                print(f"[menu-click] нет экрана {env['DISPLAY']}", flush=True)
+                return False
+
+            def rel(dx: int, dy: int) -> None:
+                step = 40
+                left, up = int(dx), int(dy)
+                n = 0
+                while left or up:
+                    sx = max(-step, min(step, left))
+                    sy = max(-step, min(step, up))
+                    xtst.XTestFakeRelativeMotionEvent(dpy, sx, sy, 0)
+                    left -= sx
+                    up -= sy
+                    n += 1
+                    if n % 8 == 0:
+                        x11.XFlush(dpy)
+                x11.XFlush(dpy)
+
+            rel(-2400, -2400)
+            rel(x, y)
+            if click:
+                xtst.XTestFakeButtonEvent(dpy, 1, 1, 0)
+                x11.XFlush(dpy)
+                time.sleep(0.03)
+                xtst.XTestFakeButtonEvent(dpy, 1, 0, 0)
+                x11.XFlush(dpy)
             return True
-        out = self._inner_run(*args)
-        if out is None or out.returncode != 0:
-            err = "" if out is None else (out.stderr or out.stdout or "").strip()
-            print(f"[menu-click] сдвиг на ({dx},{dy}) не вышел {err[:160]}", flush=True)
-            return False
-        return True
+        finally:
+            if dpy:
+                x11.XCloseDisplay(dpy)
+            if old_display is None:
+                os.environ.pop("DISPLAY", None)
+            else:
+                os.environ["DISPLAY"] = old_display
+            if old_auth is None:
+                os.environ.pop("XAUTHORITY", None)
+            elif old_auth is not None:
+                os.environ["XAUTHORITY"] = old_auth
 
     def hover_field(self, fx: float, fy: float) -> bool:
         return self._field_pointer(fx, fy, click=False)
