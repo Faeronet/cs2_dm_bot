@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from cs2_menu import MenuController
 from cs2_menu.driver import UIStateReader
-from cs2_menu.live_ui import menu_bar_visible
+from cs2_menu.live_ui import menu_fully_visible
 from cs2_menu.window_signatures import close_window
 from cs2_menu.xwl_pointer import ScreenClicker, ensure_flat_accel, root_shot
 from cs2_reader.reader import Reader
@@ -109,22 +109,30 @@ def _valid_map(name: str) -> bool:
 
 
 def wait_for_main_menu(clicker: ScreenClicker, log_fn=log, timeout: float = 150.0) -> bool:
-    """Не жать PLAY, пока на экране логотип Valve или загрузка.
+    """Не жать PLAY, пока меню не дорисовано.
 
-    Главное меню узнаём по белой полосе сверху. Пока её нет, клики по долям
-    попадают в логотип, а скрипт уже считает, что поиск матча пошёл.
+    Верхней светлой полосы мало: фон и логотип уже яркие, а ряд режимов
+    появляется позже. Клик до этого попадает в пустое место.
+    Два кадра подряд, чтобы одиночный блик не запускал кнопки.
     """
     deadline = time.monotonic() + timeout
     log_fn("жду главное меню, на логотипе кнопки не жму")
     next_note = time.monotonic() + 15.0
+    ready_frames = 0
     while time.monotonic() < deadline:
         fr = clicker.capture_visible()
-        if fr is not None and menu_bar_visible(fr.image, fr.client):
-            log_fn("главное меню на экране — жму кнопки")
-            return True
-        if time.monotonic() >= next_note:
-            log_fn("меню ещё не открылось, жду")
-            next_note = time.monotonic() + 15.0
+        ready = fr is not None and menu_fully_visible(fr.image, fr.client)
+        if ready:
+            ready_frames += 1
+            if ready_frames >= 2:
+                log_fn("главное меню на экране — жму кнопки")
+                return True
+            log_fn("меню появилось, жду пока дорисуются кнопки")
+        else:
+            ready_frames = 0
+            if time.monotonic() >= next_note:
+                log_fn("меню ещё не открылось, жду")
+                next_note = time.monotonic() + 15.0
         time.sleep(1.0)
     log_fn("главное меню так и не открылось")
     return False

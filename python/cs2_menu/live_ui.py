@@ -223,21 +223,49 @@ def menu_bar_visible(im: Image.Image, client: Client) -> bool:
     """Верхняя полоса главного меню. На логотипе Valve её нет — логотип в центре."""
     if find_nav(im, client):
         return True
-    px = im.load()
-    w, h = im.size
-    y0 = max(0, client.top + int(client.height * 0.008))
-    y1 = min(h, client.top + int(client.height * 0.08))
-    x0 = max(0, client.left + int(client.width * 0.20))
-    x1 = min(w, client.left + int(client.width * 0.80))
-    n = 0
-    for y in range(y0, y1, 2):
-        for x in range(x0, x1, 2):
-            r, g, b = px[x, y][:3]
-            if r > 180 and g > 180 and b > 180:
-                n += 1
-                if n >= 36:
-                    return True
-    return False
+    return _row_words(im, client, 0.012, 0.055) >= 3
+
+
+def _row_words(im: Image.Image, client: Client, y_lo: float, y_hi: float) -> int:
+    """Сколько отдельных надписей в горизонтальной полосе.
+
+    Одно светлое пятно (логотип, блик фона, заголовок окна) не считается рядом кнопок.
+    """
+    y0 = client.top + int(client.height * y_lo)
+    y1 = client.top + int(client.height * y_hi)
+    x0 = client.left + int(client.width * 0.18)
+    x1 = client.left + int(client.width * 0.82)
+    boxes: list[tuple[int, int, int, int]] = []
+    for pred in (_white, _gray_label, _blue):
+        boxes.extend(_clusters(im, y0, y1, x0, x1, pred))
+    boxes.sort(key=lambda b: b[0])
+    kept: list[tuple[int, int, int, int]] = []
+    for box in boxes:
+        if box[2] - box[0] < 10:
+            continue
+        if kept and box[0] - kept[-1][2] < 8:
+            prev = kept[-1]
+            kept[-1] = (prev[0], prev[1], max(prev[2], box[2]), prev[3])
+        else:
+            kept.append(box)
+    if len(kept) < 2:
+        return len(kept)
+    span = kept[-1][2] - kept[0][0]
+    if span < (x1 - x0) * 0.28:
+        return 1
+    return len(kept)
+
+
+def menu_fully_visible(im: Image.Image, client: Client) -> bool:
+    """Меню дорисовано: вкладки сверху и ряд под ними.
+
+    Светлого фона и верхней полосы мало — кнопки режимов появляются позже,
+    и клик до этого уходит в пустое место.
+    """
+    top = find_nav(im, client) or _row_words(im, client, 0.012, 0.055) >= 3
+    below = bool(find_modes(im, client)) or _row_words(im, client, 0.10, 0.145) >= 3
+    sub = bool(find_band(im, client, SUB_ORDER, 0.055, 0.105)) or _row_words(im, client, 0.055, 0.105) >= 2
+    return bool(top) and (below or sub)
 
 
 def find_nav(im: Image.Image, client: Client) -> dict[str, tuple[float, float]]:
