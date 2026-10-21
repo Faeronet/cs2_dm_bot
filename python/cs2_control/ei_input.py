@@ -602,13 +602,18 @@ class HybridInput(GameInput):
         if abs(fx - 0.517) <= 0.06 and abs(fy - 0.118) <= 0.06:
             lift = 36
         y_move = y if y < 40 else max(0, y - lift)
+        # Плитки карт: курсор на 100 px ниже и на 50 px правее.
+        # На экране один отправленный пиксель даёт примерно 1.5.
+        if abs(fy - 0.50) <= 0.08 and 0.20 <= fx <= 0.90:
+            x_move = max(0, x_move - 33)
+            y_move = max(0, y_move - 67)
         # У нижнего края тот же масштаб 1.5, что и по X. GO и так почти у низа,
         # поэтому минус 18, 36 или 86 пикселей всё равно упирает курсор в край.
-        # После двух третей GO оказывается на 50 px выше кнопки.
+        # После двух третей GO был на 50 px выше кнопки, затем ещё на 20.
         if y_move * 3 > (height - 1) * 2:
             y_move = int(round(y * 2 / 3))
             if abs(fx - 0.865) <= 0.05 and abs(fy - 0.956) <= 0.06:
-                y_move += 33
+                y_move += 46
         return self._xtest_from_origin(x_move, y_move, click=click)
 
     def _xtest_from_origin(self, x: int, y: int, *, click: bool) -> bool:
