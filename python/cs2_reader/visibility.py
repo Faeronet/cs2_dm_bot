@@ -35,15 +35,18 @@ def spotted_by_viewer(
     """
     Виден ли pawn локальному игроку (не радар, не «замечен кем-то»).
 
-    Только m_bSpottedByMask: бит (controller_index - 1) в uint32[2].
+    m_bSpottedByMask: бит наблюдателя в uint32[2]. На разных билдах встречаются
+    controller_index и controller_index-1 — проверяем оба.
     m_bSpotted намеренно не используем — он true за стеной / от радара.
     """
     if viewer_controller_index <= 0:
         return False
     state = pawn + entity_spotted_off
     m0, m1 = read_spotted_mask(backend, state, mask_off)
-    bit = viewer_controller_index - 1
-    return mask_has_bit(m0, m1, bit)
+    for bit in (viewer_controller_index - 1, viewer_controller_index):
+        if mask_has_bit(m0, m1, bit):
+            return True
+    return False
 
 
 def read_radar_spotted(

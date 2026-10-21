@@ -18,6 +18,60 @@ AIM_PART_KEYS: dict[str, str] = {
 AIM_PARTS_ORDER: tuple[str, ...] = ("head", "chest", "left_shoulder", "right_shoulder")
 
 
+def _layer_at_ref(
+    cmap: "CoordinateMap",
+    x: float,
+    y: float,
+    ref_z: float,
+) -> object | None:
+    """Ярус навмеша около ref_z (ступеньки, ящики, второй этаж)."""
+    node = cmap.layer_at(x, y, ref_z, dz_max=cmap.cfg.drop_height)
+    if node is not None:
+        return node
+    return cmap.nearest_node(x, y, ref_z, max_radius=max(48.0, cmap.cfg.cell * 2))
+
+
+def _trace_horizontal(
+    cmap: "CoordinateMap",
+    x: float,
+    y: float,
+    feet_z: float,
+    tx: float,
+    ty: float,
+    target_z: float,
+    *,
+    hull_radius: float,
+    target_body_radius: float,
+) -> bool:
+    """2.5D-трасс: ref_z интерполируется от стоп локального до цели (не «ползёт» по нижнему этажу)."""
+    dx, dy = tx - x, ty - y
+    d = math.hypot(dx, dy)
+    stop = d - (hull_radius + target_body_radius + 8.0)
+    if stop <= 0.0:
+        return True
+
+    steps = max(1, int(stop / 8.0))
+    max_gaps = max(3, steps // 5)
+    gap = 0
+    dz_step = cmap.cfg.drop_height
+
+    for i in range(1, steps + 1):
+        k = (i / steps) * (stop / d)
+        px = x + dx * k
+        py = y + dy * k
+        ref_z = feet_z + (target_z - feet_z) * k
+        node = cmap.layer_at(px, py, ref_z, dz_max=dz_step)
+        if node is None:
+            node = cmap.nearest_node(px, py, ref_z, max_radius=cmap.cfg.cell * 2.5)
+        if node is None:
+            gap += 1
+            if gap > max_gaps:
+                return False
+            continue
+        gap = 0
+    return True
+
+
 def los_clear(
     cmap: "CoordinateMap",
     x: float,
@@ -33,41 +87,33 @@ def los_clear(
 ) -> bool:
     """Прямая до кости не пересекает стену на карте (2D по навмешу + проверка по Z).
 
-    * Горизонталь — трасс по проходимым клеткам на высоте пола (не на высоте глаз:
-      иначе layer_at не находит ярус и всё кажется «за стеной»).
-    * Вертикаль — глаза и кость в одном пролёте (|tz − eyes| ≤ 168), лестница не прячет голову.
-    * Одна пустая клетка навмеша — не стена. Off-screen не учитывается.
+    * Горизонталь — ref_z вдоль луча от стоп стрелка к цели (мультиэтажные карты).
+    * Вертикаль — глаза и кость в одном пролёте (|tz − eyes| ≤ 168).
+    * Дырки навмеша (1–3 клетки) не считаются стеной. Off-screen OK.
     """
     eyes_z = feet_z + eye_z
     if abs(tz - eyes_z) > 168.0:
         return False
 
-    local_node = cmap.layer_at(x, y, feet_z)
-    if local_node is None:
-        local_node = cmap.nearest_node(x, y, feet_z, max_radius=48.0)
-    if local_node is None:
+    if _layer_at_ref(cmap, x, y, feet_z) is None and _layer_at_ref(cmap, x, y, feet_z + eye_z * 0.5) is None:
         return False
 
-    dx, dy = tx - x, ty - y
-    d = math.hypot(dx, dy)
-    stop = d - (hull_radius + target_body_radius + 8.0)
-    if stop <= 0.0:
+    # Цель: z стоп противника ≈ под костью; для головы — чуть ниже
+    target_feet_z = tz - min(eye_z, 72.0)
+
+    if _trace_horizontal(
+        cmap, x, y, feet_z, tx, ty, target_feet_z,
+        hull_radius=hull_radius, target_body_radius=target_body_radius,
+    ):
         return True
 
-    cz = local_node.z
-    steps = max(1, int(stop / 8.0))
-    gap = 0
-    for i in range(1, steps + 1):
-        k = (i / steps) * (stop / d)
-        node = cmap.layer_at(x + dx * k, y + dy * k, cz, dz_max=cmap.cfg.jump_height)
-        if node is None:
-            gap += 1
-            if gap > 1:
-                return False
-            continue
-        gap = 0
-        cz = node.z
-    return True
+    # Запасной проход: фиксированный ярус стоп стрелка (узкие мосты между ярусами)
+    if abs(target_feet_z - feet_z) > cmap.cfg.step_height:
+        return _trace_horizontal(
+            cmap, x, y, feet_z, tx, ty, feet_z,
+            hull_radius=hull_radius, target_body_radius=target_body_radius,
+        )
+    return False
 
 
 def visible_bone_parts(
