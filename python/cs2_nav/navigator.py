@@ -78,6 +78,17 @@ _KEY_DIRS: list[tuple[float, frozenset[str]]] = [
 ]
 _DIR_OF_KEYS: dict[frozenset[str], float] = {k: a for a, k in _KEY_DIRS}
 
+# Фильтры руки (ветер, дрейф скорости) сняты на шаге 40 Гц. На другом тике
+# тот же коэффициент за то же время, иначе дуга WindMouse превращается в дрожь.
+_FILTER_DT = 0.025
+
+
+def _decay_over(decay: float, dt: float) -> float:
+    if dt <= 0.0:
+        return decay
+    return decay ** (dt / _FILTER_DT)
+
+
 class _PendingAxis:
     """Градусы, отправленные мышью, но ещё не отразившиеся в памяти игры (задержка ввода 1–3 тика).
 
@@ -159,7 +170,7 @@ def _xxhash32_int(buf: int, seed: int) -> int:
 
 @dataclass
 class NavConfig:
-    tick_hz: float = 600.0
+    tick_hz: float = 40.0
     # --- камера
     look_ahead_min: float = 120.0
     look_ahead_max: float = 260.0
@@ -482,8 +493,11 @@ class Navigator:
         self._aim_head_world = (0.0, 0.0, 0.0)
         self._shot_miss: bool | None = None
         self._prev_mem = None  # (yaw, pitch)
-        self._pend_yaw = _PendingAxis()       # мышь «в полёте»: отправлено, в памяти ещё нет
-        self._pend_pitch = _PendingAxis()
+        # 5 тиков при 40 Гц = 125 мс. На более частом тике держим те же 125 мс,
+        # иначе движение ещё в полёте, а петля уже шлёт следующую поправку.
+        pend_ticks = max(5, int(round(0.125 * self.cfg.tick_hz)))
+        self._pend_yaw = _PendingAxis(expire_ticks=pend_ticks)
+        self._pend_pitch = _PendingAxis(expire_ticks=pend_ticks)
         self._cal_win: list[tuple[int, int, float, float]] = []
         self._mouse_dead_ticks = 0
         self._sign_flips_yaw = 0
@@ -1952,7 +1966,7 @@ class Navigator:
         Смещение держится внутри круга. Радиус круга — диапазон плюс погрешность xxHash.
         """
         cfg = self.cfg
-        wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay)
+        wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay, dt)
         self._rcs_wander[0] += wy * dt
         self._rcs_wander[1] += wp * 0.5 * dt
         r = max(0.06, self._rcs_cluster)
@@ -1966,7 +1980,7 @@ class Navigator:
         """Догоняем кривую отдачи. Вертикаль с тем же ускорением, что yaw: иначе пули уходят вверх."""
         cfg = self.cfg
         j = cfg.rcs_rate_jitter
-        decay = 0.92
+        decay = _decay_over(0.92, dt)
         kick = math.sqrt(max(0.0, 1.0 - decay * decay)) * j
         self._rcs_rate_var = self._rcs_rate_var * decay + (self._xx_u01() * 2.0 - 1.0) * kick
         self._rcs_rate_var = max(-j, min(j, self._rcs_rate_var))
@@ -4028,12 +4042,15 @@ class Navigator:
             mean = sum(a) / len(a)
             return mean >= 4 and (max(a) - min(a)) <= 0.35 * mean + 2
 
-        if abs(sum_dx) >= 60 and not steady([w[0] for w in self._cal_win]):
+        # Порог 60 px снят на окне 40 Гц. На частом тике в окне меньше пикселей,
+        # и оценка °/px замирала на старом числе — прицел не доезжал.
+        need_px = max(12.0, 60.0 * (40.0 / max(1.0, self.cfg.tick_hz)))
+        if abs(sum_dx) >= need_px and not steady([w[0] for w in self._cal_win]):
             sum_dx = 0
-        if abs(sum_dy) >= 60 and not steady([w[1] for w in self._cal_win]):
+        if abs(sum_dy) >= need_px and not steady([w[1] for w in self._cal_win]):
             sum_dy = 0
 
-        if abs(sum_dx) >= 60:
+        if abs(sum_dx) >= need_px:
             est = sum_yaw / sum_dx
             if abs(sum_yaw) < 0.3:
                 self._mouse_dead_ticks += 1
@@ -4058,7 +4075,7 @@ class Navigator:
                         # поэтому модуль pitch берём от yaw (знак — свой, см. ниже)
                         self.cfg.pitch_per_px = math.copysign(abs(self.cfg.yaw_per_px), self.cfg.pitch_per_px)
 
-        if abs(sum_dy) >= 60:
+        if abs(sum_dy) >= need_px:
             est = sum_pitch / sum_dy
             if 0.004 <= abs(est) <= 0.6:
                 if est * self.cfg.pitch_per_px < 0:
@@ -4288,7 +4305,7 @@ class Navigator:
         if wind:
             activity = min(1.0, (abs(self._yaw_rate) + abs(self._pitch_rate)) / 60.0)
             activity *= min(1.0, math.hypot(yaw_err, pitch_err) / 3.5)
-            wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay)
+            wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay, dt)
             d_yaw += wy * activity * dt
             d_pitch += wp * activity * 0.5 * dt
 
@@ -4340,8 +4357,9 @@ class Navigator:
 
     # --- «рука»: ветер и тремор как в WindMouse — инерционные случайные процессы, а не белый шум
 
-    def _wind_step(self, sigma: float, decay: float) -> tuple[float, float]:
+    def _wind_step(self, sigma: float, decay: float, dt: float) -> tuple[float, float]:
         """AR(1)-ветер (°/с) со стационарным σ: W ← W·decay + N(0, σ·√(1−decay²))."""
+        decay = _decay_over(decay, dt)
         k = sigma * math.sqrt(max(0.0, 1.0 - decay * decay))
         self._wind[0] = self._wind[0] * decay + self.rng.gauss(0.0, k)
         self._wind[1] = self._wind[1] * decay + self.rng.gauss(0.0, k)
@@ -4359,7 +4377,7 @@ class Navigator:
         if mag < 5.0:
             return 0.0, 0.0
         fade = min(1.0, (mag - 5.0) / 8.0)
-        wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay)
+        wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay, dt)
         activity = min(1.0, (abs(self._yaw_rate) + abs(self._pitch_rate)) / 60.0)
         activity *= min(1.0, mag / 3.5)
         nav = max(80.0, cfg.yaw_rate_max)
@@ -4430,11 +4448,11 @@ class Navigator:
         self._chase_jerk = max(800.0, self._xx_band(cfg.aim_chase_jerk, cfg.aim_chase_jerk_err))
         self._chase_motion_ready = True
 
-    def _aim_speed_step(self) -> float:
+    def _aim_speed_step(self, dt: float) -> float:
         """AR(1)-плавание множителя в ±jitter; шум — xxHash, не gauss из random."""
         cfg = self.cfg
         j = max(0.0, cfg.aim_speed_jitter)
-        decay = 0.93
+        decay = _decay_over(0.93, dt)
         kick = math.sqrt(max(0.0, 1.0 - decay * decay)) * j
         self._aim_speed_var = self._aim_speed_var * decay + (self._xx_u01() * 2.0 - 1.0) * kick
         self._aim_speed_var = max(-j, min(j, self._aim_speed_var))
@@ -4890,7 +4908,7 @@ class Navigator:
         Наводка с текущей скорости камеры: разворот и преследование набирают свою
         конечную скорость по S-кривой, а не прыжком. Ошибка — с учётом мыши «в полёте».
         """
-        self._aim_speed_step()
+        self._aim_speed_step(dt)
         return self._aim_step_inner(
             now, dt,
             yaw_err - self._pend_yaw.value(),
@@ -5652,7 +5670,10 @@ class Navigator:
     def tick(self) -> dict:
         cfg = self.cfg
         now = self._now()
-        dt = 1.0 / cfg.tick_hz if self._last_t is None else max(0.005, min(0.1, now - self._last_t))
+        # Пол 5 мс годился для тика 40 Гц. На 600 Гц каждый шаг короче 5 мс,
+        # и прицел интегрировал движение втрое быстрее, чем шло время.
+        floor = min(0.005, 0.5 / max(1.0, cfg.tick_hz))
+        dt = 1.0 / cfg.tick_hz if self._last_t is None else max(floor, min(0.1, now - self._last_t))
         self._last_t = now
         self._tick_no += 1
         self._ensure_workers()

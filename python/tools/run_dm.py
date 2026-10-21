@@ -424,7 +424,7 @@ def main() -> int:
         default=None,
         help="То же, что --match-time (старое имя)",
     )
-    parser.add_argument("--hz", type=float, default=600.0, help="Частота тика управления (Гц)")
+    parser.add_argument("--hz", type=float, default=40.0, help="Частота тика управления (Гц)")
     parser.add_argument("--shots", action="store_true", help="Скриншоты шагов меню")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
