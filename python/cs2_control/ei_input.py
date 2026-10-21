@@ -609,11 +609,11 @@ class HybridInput(GameInput):
             y_move = max(0, y_move - 67)
         # У нижнего края тот же масштаб 1.5, что и по X. GO и так почти у низа,
         # поэтому минус 18, 36 или 86 пикселей всё равно упирает курсор в край.
-        # После двух третей GO был на 50 px выше кнопки, затем ещё на 20.
+        # После двух третей GO был выше кнопки: 50, потом ещё 20, потом ещё 50.
         if y_move * 3 > (height - 1) * 2:
             y_move = int(round(y * 2 / 3))
             if abs(fx - 0.865) <= 0.05 and abs(fy - 0.956) <= 0.06:
-                y_move += 46
+                y_move += 79
         return self._xtest_from_origin(x_move, y_move, click=click)
 
     def _xtest_from_origin(self, x: int, y: int, *, click: bool) -> bool:
