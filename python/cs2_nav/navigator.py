@@ -371,7 +371,7 @@ class NavConfig:
     # --- перезарядка / осмотр / нож / дальние тапы
     habits_enabled: bool = True
     habit_clear_dist: float = 380.0          # u: «рядом нет мишеней»
-    long_tap_dist: float = 1100.0            # u: дальше автомат бьёт парами, не зажимом
+    long_tap_dist: float = 500.0             # u: дальше автомат бьёт парами, не зажимом
     long_tap_burst: int = 2                  # пуль в одной дальней очереди-тапе
     long_spray_chance: float = 0.20          # шанс зажима на дистанции
     combat_reload_chance: float = 0.045      # редко перезарядиться, даже если мишень рядом
@@ -2530,6 +2530,11 @@ class Navigator:
                     pt[1] + (hp[1] - pt[1]) * t,
                     pt[2] + (hp[2] - pt[2]) * t,
                 )
+        # голова прочиталась плохо и села на ноги (бывает в анимации после перезарядки) —
+        # не целимся в ступни, поднимаем точку на уровень головы над ногами
+        feet = target.get("feet")
+        if feet is not None and pt[2] - feet[2] < 24.0:
+            pt = (pt[0], pt[1], feet[2] + self._eye_z)
         return pt
 
     def _offset_world(
