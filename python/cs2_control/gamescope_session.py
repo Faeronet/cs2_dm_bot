@@ -11,20 +11,16 @@
 from __future__ import annotations
 
 import os
-import re
 import signal
 import subprocess
 import time
 from collections.abc import Callable
 
 GAMESCOPE = "/usr/games/gamescope"
+APP_URL = "steam://rungameid/730"
 LOG_PATH = "/tmp/cs2-gamescope.log"
 WIDTH = 1280
 HEIGHT = 800
-GAME_WIDTH = 1920
-GAME_HEIGHT = 1080
-# В cs2_video.txt: 0 = 4:3, 1 = 16:9, 2 = 16:10.
-ASPECT_16_9 = "1"
 
 
 def _cmdline(pid: int) -> list[str]:
@@ -207,109 +203,16 @@ def _shutdown_desktop_steam(log: Callable[[str], None]) -> None:
         time.sleep(0.4)
 
 
-def _steam_cmd() -> list[str]:
-    """Видео самой CS2 — 16:9 1920×1080. Окно gamescope от этого не зависит."""
-    return [
-        "snap", "run", "steam", "-noshaders",
-        "-applaunch", "730",
-        "-w", str(GAME_WIDTH), "-h", str(GAME_HEIGHT), "-fullscreen",
-    ]
-
-
-def _video_paths() -> list[str]:
-    home = os.path.expanduser("~")
-    roots = [
-        os.path.join(home, "snap", "steam", "common", ".local", "share", "Steam"),
-        os.path.join(home, "snap", "steam", "common", ".steam", "steam"),
-        os.path.join(home, ".steam", "steam"),
-        os.path.join(home, ".steam", "debian-installation"),
-        os.path.join(home, ".local", "share", "Steam"),
-        os.path.join(home, ".var", "app", "com.valvesoftware.Steam", ".local", "share", "Steam"),
-    ]
-    found: list[str] = []
-    seen: set[str] = set()
-    for root in roots:
-        userdata = os.path.join(root, "userdata")
-        if not os.path.isdir(userdata):
-            continue
-        try:
-            names = os.listdir(userdata)
-        except OSError:
-            continue
-        for name in names:
-            account = os.path.join(userdata, name, "730")
-            if not os.path.isdir(account):
-                continue
-            cfg = os.path.join(account, "local", "cfg")
-            try:
-                os.makedirs(cfg, exist_ok=True)
-            except OSError:
-                continue
-            path = os.path.join(cfg, "cs2_video.txt")
-            if path in seen:
-                continue
-            seen.add(path)
-            found.append(path)
-    return found
-
-
-def _upsert_video_key(text: str, key: str, value: str) -> str:
-    pattern = re.compile(rf'("{re.escape(key)}")\s+"[^"]*"')
-    replacement = rf'\1\t\t"{value}"'
-    if pattern.search(text):
-        return pattern.sub(replacement, text, count=1)
-    line = f'\t"{key}"\t\t"{value}"\n'
-    stripped = text.rstrip()
-    if stripped.endswith("}"):
-        return stripped[: stripped.rfind("}")] + line + "}\n"
-    if not stripped:
-        return (
-            '"video.cfg"\n{\n'
-            + line
-            + "}\n"
-        )
-    return text.rstrip() + "\n" + line
-
-
-def apply_video_mode(log: Callable[[str], None]) -> None:
-    """Записать в клиент CS2 16:9 и 1920×1080, не затирая остальные пункты видео."""
-    paths = _video_paths()
-    if not paths:
-        log(f"видео CS2: 16:9 {GAME_WIDTH}×{GAME_HEIGHT}, файл настроек появится после входа в Steam")
-        return
-    keys = {
-        "setting.defaultres": str(GAME_WIDTH),
-        "setting.defaultresheight": str(GAME_HEIGHT),
-        "setting.aspectratiomode": ASPECT_16_9,
-        "setting.fullscreen": "1",
-        "setting.nowindowborder": "0",
-    }
-    for path in paths:
-        try:
-            text = open(path, encoding="utf-8").read() if os.path.isfile(path) else ""
-        except OSError:
-            text = ""
-        for key, value in keys.items():
-            text = _upsert_video_key(text, key, value)
-        try:
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(text)
-        except OSError as exc:
-            log(f"не записал {path}: {exc}")
-            continue
-    log(f"видео CS2: 16:9 {GAME_WIDTH}×{GAME_HEIGHT}")
-
-
 def _launch_gamescope(log: Callable[[str], None]) -> None:
     if not os.path.isfile(GAMESCOPE):
         raise RuntimeError(f"нет {GAMESCOPE}")
-    log(f"запускаю gamescope {WIDTH}×{HEIGHT}, видео CS2 {GAME_WIDTH}×{GAME_HEIGHT}, окно шейдеров Vulkan пропускается")
+    log("запускаю gamescope и CS2, окно шейдеров Vulkan пропускается")
     log_file = open(LOG_PATH, "ab", buffering=0)
     subprocess.Popen(
         [
             GAMESCOPE, "-W", str(WIDTH), "-H", str(HEIGHT),
             "--backend", "sdl", "--force-grab-cursor", "--",
-            *_steam_cmd(),
+            "snap", "run", "steam", "-noshaders", APP_URL,
         ],
         env=_session_env(),
         stdout=log_file,
@@ -319,9 +222,9 @@ def _launch_gamescope(log: Callable[[str], None]) -> None:
 
 
 def _launch_app(log: Callable[[str], None]) -> None:
-    log(f"gamescope уже работает — открываю CS2 {GAME_WIDTH}×{GAME_HEIGHT}, шейдеры пропускаются")
+    log("gamescope уже работает — открываю CS2 в нём, шейдеры пропускаются")
     subprocess.Popen(
-        _steam_cmd(),
+        ["snap", "run", "steam", "-noshaders", APP_URL],
         env=_session_env(),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -332,20 +235,6 @@ def _launch_app(log: Callable[[str], None]) -> None:
 def _relative_mouse(pid: int) -> bool:
     """Во вложенном gamescope относительная камера есть только с этим флагом."""
     return "--force-grab-cursor" in _cmdline(pid)
-
-
-def _flag_value(cmd: list[str], flag: str) -> str | None:
-    for index, item in enumerate(cmd):
-        if item == flag and index + 1 < len(cmd):
-            return cmd[index + 1]
-        if item.startswith(flag + "="):
-            return item.split("=", 1)[1]
-    return None
-
-
-def _window_size(pid: int) -> bool:
-    cmd = _cmdline(pid)
-    return _flag_value(cmd, "-W") == str(WIDTH) and _flag_value(cmd, "-H") == str(HEIGHT)
 
 
 def _stop_pid(pid: int) -> None:
@@ -454,9 +343,7 @@ def focus_game() -> None:
 def ensure_gamescope(log: Callable[[str], None]) -> str:
     """Вернуть сокет libei. Без относительной мыши gamescope перезапускается:
     иначе прицел — это курсор, он упирается в край окна и возвращается назад.
-    Окно композита остаётся 1280×800. Другой размер тоже перезапускается.
     """
-    apply_video_mode(log)
     running = cs2_pids()
     if running:
         scope = gamescope_ancestor(running[0])
@@ -465,28 +352,17 @@ def ensure_gamescope(log: Callable[[str], None]) -> str:
                 "CS2 запущена обычным окном, не через gamescope. "
                 "Закрой её и запусти скрипт снова: вторую копию не стартую."
             )
-        if _relative_mouse(scope) and _window_size(scope):
+        if _relative_mouse(scope):
             sock = _ei_socket(scope)
             if not sock:
                 raise RuntimeError("CS2 в gamescope, но сокет виртуального ввода не найден")
-            log(f"CS2 уже в gamescope {WIDTH}×{HEIGHT} (pid {scope})")
+            log(f"CS2 уже в gamescope (pid {scope})")
             return sock
-        if not _relative_mouse(scope):
-            log("gamescope без относительной мыши — перезапускаю, иначе прицел упирается в край окна")
-        else:
-            log(f"окно gamescope не {WIDTH}×{HEIGHT} — перезапускаю композитор")
+        log("gamescope без относительной мыши — перезапускаю, иначе прицел упирается в край окна")
         _stop_pid(scope)
         deadline = time.monotonic() + 15
-        while time.monotonic() < deadline and (cs2_pids() or _alive(scope)):
+        while time.monotonic() < deadline and cs2_pids():
             time.sleep(0.3)
-
-    for pid in _pids():
-        if not _is_gamescope(_cmdline(pid)):
-            continue
-        if _relative_mouse(pid) and _window_size(pid):
-            continue
-        log(f"закрываю старый gamescope, дальше окно {WIDTH}×{HEIGHT}")
-        _stop_pid(pid)
 
     if _steam_outside():
         _shutdown_desktop_steam(log)
