@@ -175,11 +175,11 @@ class NavConfig:
     look_ahead_min: float = 120.0
     look_ahead_max: float = 260.0
     look_ahead_speed_gain: float = 0.55      # + скорость × gain
-    yaw_gain: float = 7.9                    # ×1.75: скорость поворота = gain × ошибка
-    yaw_rate_max: float = 455.0              # ×1.75 °/с стоя (с cam_pace ±15% это 1.5–2× прежних 260)
-    yaw_rate_max_moving: float = 333.0       # ×1.75 °/с на бегу
-    yaw_accel_max: float = 2450.0            # ×1.75 °/с²: до нового потолка за то же время
-    yaw_jerk_max: float = 24500.0            # ×1.75 °/с³: S-кривая, без рывка в потолок
+    yaw_gain: float = 11.85                  # ×1.5 к навигации: скорость поворота = gain × ошибка
+    yaw_rate_max: float = 683.0              # ×1.5 °/с стоя
+    yaw_rate_max_moving: float = 500.0       # ×1.5 °/с на бегу
+    yaw_accel_max: float = 3675.0            # ×1.5 °/с²: до нового потолка за то же время
+    yaw_jerk_max: float = 36750.0            # ×1.5 °/с³: S-кривая, без рывка в потолок
     yaw_deadband: float = 0.6                # мягкая зона: скорость ∝ err·|err|/(|err|+deadband)
     yaw_wander: float = 2.5                  # ° медленное блуждание прицела
     cam_warm_s: float = 0.70                 # с: после старта взгляд разгоняется как на маршруте, без рывка
@@ -191,8 +191,8 @@ class NavConfig:
     tremor_sigma: float = 0.0                # °/тик: σ тремора при удержании (0 = прицел стоит; ≥0.01 — видно ±1 px)
     flick_curve_frac: float = 0.012          # слабее дуга — меньше увод с центра в конце маха
     flick_wind_frac: float = 0.006
-    pitch_gain: float = 4.4                  # ×1.75
-    pitch_rate_max: float = 88.0             # ×1.75
+    pitch_gain: float = 6.6                  # ×1.5 к навигации
+    pitch_rate_max: float = 132.0            # ×1.5 к навигации
     pitch_base: float = 3.0                  # чуть ниже горизонта, как у игрока
     pitch_slope_gain: float = 0.5            # смотреть вниз на спуске / вверх на подъёме
     # --- движение
@@ -272,37 +272,37 @@ class NavConfig:
     aim_far_boost: float = 4.32              # ÷1.5 к 6.48
     aim_speed_jitter: float = 0.12           # ± доля: плавание уже выбранной скорости (xxHash)
     aim_accel_span: tuple[float, float] = (0.84, 1.18)  # запасной множитель, если фаза без своего диапазона
-    # наведение: те же диапазон+погрешность xxHash, потолок ещё ×1.5
-    aim_aim_rate: tuple[float, float] = (4641.0, 8262.0)
-    aim_aim_rate_err: tuple[float, float] = (230.0, 816.0)
+    # наведение: те же диапазон+погрешность xxHash, скорости ещё ×2
+    aim_aim_rate: tuple[float, float] = (9282.0, 16524.0)
+    aim_aim_rate_err: tuple[float, float] = (460.0, 1632.0)
     # разворот: старт — скорость камеры навигации
-    aim_turn_rate: tuple[float, float] = (5253.0, 9359.0)      # °/с конечная скорость разворота
-    aim_turn_rate_err: tuple[float, float] = (255.0, 918.0)    # °/с погрешность к выбранной скорости
-    aim_turn_accel: tuple[float, float] = (4335.0, 9486.0)     # °/с² сила набора
-    aim_turn_accel_err: tuple[float, float] = (281.0, 918.0)
-    aim_turn_jerk: tuple[float, float] = (28050.0, 63750.0)    # °/с³ скорость набора ускорения
-    aim_turn_jerk_err: tuple[float, float] = (1403.0, 5355.0)
+    aim_turn_rate: tuple[float, float] = (10506.0, 18718.0)    # °/с конечная скорость разворота
+    aim_turn_rate_err: tuple[float, float] = (510.0, 1836.0)   # °/с погрешность к выбранной скорости
+    aim_turn_accel: tuple[float, float] = (8670.0, 18972.0)    # °/с² сила набора
+    aim_turn_accel_err: tuple[float, float] = (562.0, 1836.0)
+    aim_turn_jerk: tuple[float, float] = (56100.0, 127500.0)   # °/с³ скорость набора ускорения
+    aim_turn_jerk_err: tuple[float, float] = (2806.0, 10710.0)
     # преследование: старт — скорость в момент входа (0, если прицел уже стоял)
-    aim_chase_rate: tuple[float, float] = (2678.0, 5687.0)
-    aim_chase_rate_err: tuple[float, float] = (179.0, 689.0)
-    aim_chase_accel: tuple[float, float] = (2805.0, 6324.0)
-    aim_chase_accel_err: tuple[float, float] = (179.0, 638.0)
-    aim_chase_jerk: tuple[float, float] = (19890.0, 47430.0)
-    aim_chase_jerk_err: tuple[float, float] = (1020.0, 4080.0)
+    aim_chase_rate: tuple[float, float] = (5356.0, 11374.0)
+    aim_chase_rate_err: tuple[float, float] = (358.0, 1378.0)
+    aim_chase_accel: tuple[float, float] = (5610.0, 12648.0)
+    aim_chase_accel_err: tuple[float, float] = (358.0, 1276.0)
+    aim_chase_jerk: tuple[float, float] = (39780.0, 94860.0)
+    aim_chase_jerk_err: tuple[float, float] = (2040.0, 8160.0)
     flick_ramp: float = 0.12                 # с: набор к профилю флика (короче — быстрее подхват)
     flick_min_deg: float = 4.0               # меньше — без флика, сразу коррекция
     flick_base_time: float = 0.012           # ×1.5 к 0.008
     flick_per_deg: float = 0.0003            # ×1.5: 90° ≈ 39 мс, 180° ≈ 66 мс
-    flick_rate_max: float = 4800.0           # ÷1.5 к 7200
+    flick_rate_max: float = 9600.0           # ×2 к наведению
     flick_undershoot: float = 0.0            # без недовода: овал головы маленький
     flick_error_frac: float = 0.004
     flick_error_min: float = 0.05            # °
     aim_correct_delay: tuple[float, float] = (0.0, 0.0)  # без паузы между фликом и выстрелом
     aim_lock_gain: float = 240.0             # дожим в центр кости, без ползания рядом
-    aim_lock_rate: float = 3468.0            # потолок дожима; вблизи ещё режется в _aim_lock
+    aim_lock_rate: float = 6936.0            # ×2; потолок дожима, вблизи ещё режется в _aim_lock
     aim_correct_gain: float = 88.0           # ÷1.5
     aim_correct_rate: float = 1360.0         # ÷1.5
-    aim_max_px_per_tick: int = 5100          # в скоупе градус стоит больше пикселей — иначе разворот обрезается
+    aim_max_px_per_tick: int = 10200         # ×2; в скоупе градус стоит больше пикселей — иначе разворот обрезается
     aim_chase_speed: tuple[float, float] = (3.0, 4.5)  # xxHash: ведение ходящей мишени в 2–3 раза быстрее
     aim_chase_move: float = 70.0             # u/s: ходьба тоже считается движением, не только бег
     aim_chase_strafe: float = 40.0           # u/s поперёк луча
@@ -311,7 +311,7 @@ class NavConfig:
     aim_track_pace: tuple[float, float] = (0.90, 1.12)  # xxHash: то чуть быстрее, то чуть медленнее
     aim_overshoot_u: tuple[float, float] = (0.4, 1.2)   # u: микро-упреждение по стрейфу (было (2.2,5.5))
     aim_overshoot_s: tuple[float, float] = (0.08, 0.16)  # с: вдвое короче окно перевода
-    aim_miss_chance: float = 0.015           # xxHash: редкий промах (было 10%, теперь 1.5%)
+    aim_miss_chance: float = 0.0             # промахов нет — наводка максимально точная
     aim_miss_u: tuple[float, float] = (0.8, 2.2)   # u: если и мимо — то едва мимо овала
     aim_chest_chance: float = 0.10           # xxHash: туловище, если видны и голова, и грудь
     aim_chest_chance_awp: float = 0.65       # xxHash: AWP чаще в туловище, чем в голову
@@ -347,20 +347,23 @@ class NavConfig:
     # --- скоуп снайперок без хипфайр-прицела (AWP/SSG/автоснайпер)
     scope_noscope_chance: float = 0.30       # xxHash: автоснайперы
     scope_noscope_awp: float = 0.003         # xxHash: AWP почти всегда в скоупе
-    scope_noscope_ssg: float = 0.15          # xxHash: половина прежних 30%
-    scope_noscope_close: float = 450.0       # u: SSG без скоупа
-    scope_noscope_awp_close: float = 160.0   # u: AWP без скоупа только в упор
+    scope_noscope_ssg: float = 0.03          # xxHash: SSG почти всегда в скоупе — так точнее
+    scope_noscope_close: float = 140.0       # u: SSG без скоупа только в упор
+    scope_noscope_awp_close: float = 140.0   # u: AWP без скоупа только в упор
     scope_enter_deg: tuple[float, float] = (1.8, 4.6)   # °: радиус прицела, чтобы войти в скоуп
     scope_enter_u: tuple[float, float] = (14.0, 34.0)   # u: мировой промах около мишени (не тот же, что °)
     scope_settle: tuple[float, float] = (0.0, 0.0)      # на точке — выстрел сразу, без паузы после скоупа
+    sniper_stop_speed: float = 6.0           # u/s: AWP и SSG стреляют первым только почти без движения
+    sniper_fire_oval_frac: float = 0.34      # снайперка в скоупе — овал стрельбы туже обычного
     # --- антиотдача: ведём линию мышью, не телепортируем прицел на точку пули
     rcs_enabled: bool = True
     rcs_rate: float = 140.0                  # °/с: догон паттерна, чтобы пуля не уходила из круга
     rcs_rate_jitter: float = 0.020           # ± доля скорости xxHash
     rcs_gain: float = 26.0                   # 1/с: догон линии отдачи
     rcs_wind_sigma: float = 0.20             # не используется: кривая — тот же WindMouse, что на маршруте
-    rcs_cluster: tuple[float, float] = (0.10, 0.24)      # °: тесный круг попаданий
-    rcs_cluster_err: tuple[float, float] = (0.015, 0.05) # °: погрешность радиуса, xxHash
+    rcs_cluster: tuple[float, float] = (0.06, 0.16)      # °: очень тесный круг попаданий
+    rcs_cluster_err: tuple[float, float] = (0.012, 0.045)  # °: погрешность радиуса, xxHash
+    rcs_center_tau: float = 0.35             # с: мягкое притяжение дрейфа к центру круга (не залипать на краю)
     rcs_return_mul: tuple[float, float] = (0.92, 1.32)  # xxHash: скорость возврата от скорости RCS
     rcs_return_done: float = 0.65            # °: считаем, что вернулись
     rcs_break_deg: float = 5.5               # °: сошли с линии слишком далеко — отпускаем зажим
@@ -436,13 +439,13 @@ class Navigator:
         self._aim_speed_mul = 1.0
         self._aim_accel_mul = 1.0             # xxHash на вход в фазу: насколько быстро добираем скорость
         self._chase_rise = 0.08
-        self._aim_rate = 4590.0
-        self._turn_rate = 5100.0
-        self._turn_acc = 4080.0
-        self._turn_jerk = 25500.0
-        self._chase_rate = 2040.0
-        self._chase_acc = 2805.0
-        self._chase_jerk = 20400.0
+        self._aim_rate = 9180.0
+        self._turn_rate = 10200.0
+        self._turn_acc = 8160.0
+        self._turn_jerk = 51000.0
+        self._chase_rate = 4080.0
+        self._chase_acc = 5610.0
+        self._chase_jerk = 40800.0
         self._chase_motion_ready = False
 
         self.route: Route | None = None
@@ -465,6 +468,7 @@ class Navigator:
         # «рука»: ветер (инерционная случайная скорость), тремор, дрейф точки прицеливания,
         # дробный остаток пикселей (без него мелкие повороты дребезжат ±1 px)
         self._wind = [0.0, 0.0]
+        self._rcs_wind = [0.0, 0.0]          # отдельный WindMouse для дуги антиотдачи (не мешает маршруту)
         self._tremor = [0.0, 0.0]
         self._aim_drift = [0.0, 0.0]
         self._px_carry = [0.0, 0.0]
@@ -1459,8 +1463,9 @@ class Navigator:
         self._rcs_pitch_boost = 1.0
         self._rcs_arc = (self._xx_u01() - 0.5) * 0.04
         self._rcs_rate_var = (self._xx_u01() - 0.5) * self.cfg.rcs_rate_jitter
-        self._rcs_cluster = max(0.06, self._xx_band(self.cfg.rcs_cluster, self.cfg.rcs_cluster_err))
+        self._rcs_cluster = max(0.03, self._xx_band(self.cfg.rcs_cluster, self.cfg.rcs_cluster_err))
         self._rcs_wander = [0.0, 0.0]
+        self._rcs_wind = [0.0, 0.0]
         self._rcs_sampled = True
 
     def _rcs_reset(self) -> None:
@@ -1469,6 +1474,7 @@ class Navigator:
         self._rcs_shot_t = 0.0
         self._spray_t0 = None
         self._rcs_wander = [0.0, 0.0]
+        self._rcs_wind = [0.0, 0.0]
 
     def _spray_shots(self, now: float) -> int:
         """Пули в текущем зажиме. Память и цикл оружия — одно и то же для винтовок и ПП.
@@ -1963,13 +1969,20 @@ class Navigator:
     def _rcs_wander_step(self, dt: float) -> tuple[float, float]:
         """Кривая вокруг линии отдачи: тот же WindMouse, что панорама маршрута.
 
-        Смещение держится внутри круга. Радиус круга — диапазон плюс погрешность xxHash.
+        Дрейф держится внутри очень малого круга. Радиус — диапазон плюс погрешность
+        xxHash. Мягкая пружина тянет точку к центру, поэтому дрейф не ведёт в одну
+        точку пули и не залипает на краю круга, а плавно гуляет по дуге.
         """
         cfg = self.cfg
-        wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay, dt)
+        # собственный ветер антиотдачи с теми же σ и decay, что у панорамы навигации
+        wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay, dt, state=self._rcs_wind)
         self._rcs_wander[0] += wy * dt
         self._rcs_wander[1] += wp * 0.5 * dt
-        r = max(0.06, self._rcs_cluster)
+        # пружина к центру (постоянная времени rcs_center_tau)
+        pull = min(1.0, dt / max(0.05, cfg.rcs_center_tau))
+        self._rcs_wander[0] -= self._rcs_wander[0] * pull
+        self._rcs_wander[1] -= self._rcs_wander[1] * pull
+        r = max(0.03, self._rcs_cluster)
         mag = math.hypot(self._rcs_wander[0], self._rcs_wander[1])
         if mag > r:
             self._rcs_wander[0] *= r / mag
@@ -2173,7 +2186,7 @@ class Navigator:
                 ex, ey, _ = e["position"]
                 self._sample_scope(e["index"], math.hypot(ex - x, ey - y))
             self._awp_watch = None
-            self._awp_first_stop = self._sniper_kind() == "awp"
+            self._awp_first_stop = self._sniper_kind() in ("awp", "ssg")
             if self._pend_kill_step:
                 self._pend_kill_step = False
                 self._begin_kill_sidestep(e["index"], "После убийства")
@@ -2272,6 +2285,14 @@ class Navigator:
                     return e
             return None
 
+        def first_immune_visible() -> dict | None:
+            """Первая видимая, но ещё под защитой — на неё держим прицел и ждём."""
+            for i in self._engage_q:
+                e = by_id.get(i)
+                if e is not None and not shootable(e):
+                    return e
+            return None
+
         def acquire(e: dict, fast: bool) -> None:
             if self._target is not None and self._target["index"] == e["index"]:
                 self._target = dict(e)
@@ -2299,18 +2320,22 @@ class Navigator:
                 self._engage_q.insert(0, same["index"])
             enqueue_new()
             self._engage_q = [i for i in self._engage_q if i == same["index"] or i in by_id]
-            if shootable(same):
-                # выше по списку кто-то вышел из защиты — сначала добиваем текущую
+            nxt = next_shootable()
+            if nxt is not None:
+                # всегда ведём самую приоритетную цель, которую уже можно убить.
+                # Неуязвимая вышла из защиты выше по списку — переключаемся и бьём сразу.
+                if nxt["index"] == same["index"]:
+                    self._target = dict(same)
+                    self._target_last_seen = now
+                else:
+                    drop("выше по списку цель вышла из защиты", 0.0, unscope_knife=False, keep_in_queue=True)
+                    acquire(nxt, True)
+                self._target_visible_now = True
+            else:
+                # стрелять пока некого — стоим с прицелом на неуязвимой и ждём, когда снимут защиту
                 self._target = dict(same)
                 self._target_last_seen = now
-            else:
-                nxt = next_shootable()
-                if nxt is not None:
-                    drop("неуязвима, дальше по списку", 0.0, unscope_knife=False, keep_in_queue=True)
-                    acquire(nxt, True)
-                    self._target_visible_now = True
-                else:
-                    drop("неуязвима", 0.0, unscope_knife=True, keep_in_queue=True)
+                self._target_visible_now = True
         elif cur is not None:
             if self._target_lost_at is None:
                 self._target_lost_at = now
@@ -2348,12 +2373,22 @@ class Navigator:
             if nxt is not None:
                 acquire(nxt, False)
                 self._target_visible_now = True
+            else:
+                # все видимые пока под защитой — встаём и целимся в первую, ждём снятия
+                wait_t = first_immune_visible()
+                if wait_t is not None:
+                    acquire(wait_t, False)
+                    self._target_visible_now = True
         else:
             self._engage_q = []
             self._target_lost_at = None
 
         t = self._target
         if t is None:
+            return None
+        # защита не снимается слишком долго (мишень зависла под иммунитетом) — бросаем, не стоим вечно
+        if not t.get("vulnerable", True) and now > self._target_engage_until:
+            drop("защита не снимается — идём дальше", cfg.target_cooldown, unscope_knife=True)
             return None
         # задержка реакции: мишень уже «в памяти», но взгляд ещё не перенесён
         if now - self._target_seen_at < self._target_reaction:
@@ -3684,6 +3719,7 @@ class Navigator:
         self._next_route = None
         self._next_goal_id = None
         self._prefetch_busy = False
+        self._scan_published = False          # первый тик после спавна делает полный LOS-скан, цели видны сразу
         self.done = False
         self._pause_until = 0.0
         self._cam_warm_t0 = None
@@ -4391,13 +4427,20 @@ class Navigator:
 
     # --- «рука»: ветер и тремор как в WindMouse — инерционные случайные процессы, а не белый шум
 
-    def _wind_step(self, sigma: float, decay: float, dt: float) -> tuple[float, float]:
-        """AR(1)-ветер (°/с) со стационарным σ: W ← W·decay + N(0, σ·√(1−decay²))."""
+    def _wind_step(
+        self, sigma: float, decay: float, dt: float, state: list[float] | None = None
+    ) -> tuple[float, float]:
+        """AR(1)-ветер (°/с) со стационарным σ: W ← W·decay + N(0, σ·√(1−decay²)).
+
+        state — свой вектор ветра. По умолчанию общий (маршрут/наведение); антиотдача
+        передаёт собственный, чтобы кривые не делили одно состояние и не дрались.
+        """
+        w = self._wind if state is None else state
         decay = _decay_over(decay, dt)
         k = sigma * math.sqrt(max(0.0, 1.0 - decay * decay))
-        self._wind[0] = self._wind[0] * decay + self.rng.gauss(0.0, k)
-        self._wind[1] = self._wind[1] * decay + self.rng.gauss(0.0, k)
-        return self._wind[0], self._wind[1]
+        w[0] = w[0] * decay + self.rng.gauss(0.0, k)
+        w[1] = w[1] * decay + self.rng.gauss(0.0, k)
+        return w[0], w[1]
 
     def _aim_wind(self, dt: float, yaw_err: float, pitch_err: float) -> tuple[float, float]:
         """Дуга наведения: тот же WindMouse, что на маршруте (σ и decay).
@@ -4811,9 +4854,9 @@ class Navigator:
                 r = min(r, 70.0)
                 acc = min(acc, 700.0)
             else:
-                g = 480.0 if self._chase_on else 320.0
-                r = min(r, 1080.0 if self._chase_on else 630.0)
-                acc = min(acc, 4200.0)
+                g = 960.0 if self._chase_on else 640.0
+                r = min(r, 2160.0 if self._chase_on else 1260.0)
+                acc = min(acc, 8400.0)
                 phase = self._chase_rate if self._chase_on else self._aim_rate
                 r = min(phase, max(r, abs(wy), abs(wp)))
             jerk = min(jerk, cfg.yaw_jerk_max)
@@ -5347,6 +5390,9 @@ class Navigator:
         cfg = self.cfg
         d = max(1.0, dist)
         frac = cfg.fire_oval_frac
+        # снайперка со скоупа: туже овал, одиночный точный выстрел, а не «в габариты»
+        if self._scoped_now and self._sniper_kind() in ("awp", "ssg"):
+            frac = cfg.sniper_fire_oval_frac
         half_w = max(cfg.fire_tolerance_deg, math.degrees(math.atan2(cfg.fire_target_half_width, d)) * frac)
         half_h = max(cfg.fire_tolerance_pitch_deg, math.degrees(math.atan2(cfg.fire_target_up_margin, d)) * frac)
         ny = yaw_err / half_w
@@ -5506,13 +5552,13 @@ class Navigator:
         self.log(f"{why}: шаг {'A' if side < 0 else 'D'} на {dist:.0f}u")
 
     def _awp_stop_blocks(self) -> bool:
-        """Первый выстрел AWP только после контрстрейфа хода."""
-        if not self._awp_first_stop or self._sniper_kind() != "awp":
+        """Первый выстрел AWP/SSG только после остановки: движение сильно сбивает снайперку."""
+        if not self._awp_first_stop or self._sniper_kind() not in ("awp", "ssg"):
             return False
-        return self._move_speed > 18.0
+        return self._move_speed > self.cfg.sniper_stop_speed
 
     def _note_awp_shot(self, target: dict, now: float) -> None:
-        if self._sniper_kind() != "awp":
+        if self._sniper_kind() not in ("awp", "ssg"):
             return
         self._awp_first_stop = False
         self._awp_watch = {
@@ -5523,9 +5569,9 @@ class Navigator:
         }
 
     def _awp_miss_tick(self, now: float, target: dict | None) -> None:
-        """Промах AWP: с тем же шансом и дистанцией, что шаг после убийства, потом контрстрейф."""
+        """Промах AWP/SSG: с тем же шансом и дистанцией, что шаг после убийства, потом контрстрейф."""
         w = self._awp_watch
-        if w is None or w.get("done") or self._sniper_kind() != "awp":
+        if w is None or w.get("done") or self._sniper_kind() not in ("awp", "ssg"):
             return
         if target is None or target.get("index") != w["index"]:
             w["done"] = True
@@ -6332,8 +6378,10 @@ class Navigator:
         elif self.firing:
             st = self._combat_strafe
             sidestep_go = bool(st and st.get("kill_step") and st.get("phase") == "go")
-            if self._awp_first_stop and self._sniper_kind() == "awp" and not sidestep_go:
-                keys = self._counter_strafe_keys(v.x, v.y, speed, yaw_next, min_speed=8.0)
+            if self._awp_first_stop and self._sniper_kind() in ("awp", "ssg") and not sidestep_go:
+                keys = self._counter_strafe_keys(
+                    v.x, v.y, speed, yaw_next, min_speed=self.cfg.sniper_stop_speed
+                )
             else:
                 strafe_keys = self._combat_strafe_keys(v.x, v.y, speed, yaw_next)
                 if strafe_keys is not None:
@@ -6359,7 +6407,11 @@ class Navigator:
             self._brake = False            # остановились, но не дошли — дошагиваем
         if goal_d < brake_d and speed > 60.0 and not cfg.loop:
             self._brake = True
-        awp_stopping = self._awp_first_stop and self._sniper_kind() == "awp" and speed > 8.0
+        awp_stopping = (
+            self._awp_first_stop
+            and self._sniper_kind() in ("awp", "ssg")
+            and speed > self.cfg.sniper_stop_speed
+        )
         if (self._brake or hold) and self._ladder is None and not awp_stopping and not jiggling:
             keys = set()
 
