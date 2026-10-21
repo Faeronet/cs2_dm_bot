@@ -228,10 +228,10 @@ class NavConfig:
     ladders_poll_hz: float = 0.5             # лестницы меняются редко — полный перебор entity list
     doors_poll_hz: float = 2.0               # двери: состояние open/closed меняется чаще
     door_block_margin: float = 20.0          # запас вокруг запертой двери при обходе
-    door_use_dist: float = 128.0             # u: +use достаёт, жмём на ходу
-    door_use_approach: float = 160.0         # u: дверь впереди по маршруту
+    door_use_dist: float = 160.0             # u: +use достаёт, E держим пока дверь закрыта
+    door_use_approach: float = 220.0         # u: дверь впереди по маршруту
     door_use_hold: tuple[float, float] = (0.20, 0.36)
-    door_use_retry: float = 0.55             # с: повтор, если всё ещё закрыта
+    door_use_retry: float = 0.55             # с: как часто писать в лог, пока E зажата
     breakables_poll_hz: float = 1.0          # решётки/окна: hp меняется реже дверей
     breakable_block_margin: float = 16.0     # запас вокруг целой решётки, если её нельзя прострелить
     breakable_engage_dist: float = 340.0     # u: решётка на маршруте впереди — начинаем наводку
@@ -272,23 +272,23 @@ class NavConfig:
     aim_far_boost: float = 4.32              # ÷1.5 к 6.48
     aim_speed_jitter: float = 0.12           # ± доля: плавание уже выбранной скорости (xxHash)
     aim_accel_span: tuple[float, float] = (0.84, 1.18)  # запасной множитель, если фаза без своего диапазона
-    # наведение: те же диапазон+погрешность xxHash, потолок ×1.7 — до точки быстрее
-    aim_aim_rate: tuple[float, float] = (3094.0, 5508.0)
-    aim_aim_rate_err: tuple[float, float] = (153.0, 544.0)
+    # наведение: те же диапазон+погрешность xxHash, потолок ещё ×1.5
+    aim_aim_rate: tuple[float, float] = (4641.0, 8262.0)
+    aim_aim_rate_err: tuple[float, float] = (230.0, 816.0)
     # разворот: старт — скорость камеры навигации
-    aim_turn_rate: tuple[float, float] = (3502.0, 6239.0)      # °/с конечная скорость разворота
-    aim_turn_rate_err: tuple[float, float] = (170.0, 612.0)    # °/с погрешность к выбранной скорости
-    aim_turn_accel: tuple[float, float] = (2890.0, 6324.0)     # °/с² сила набора
-    aim_turn_accel_err: tuple[float, float] = (187.0, 612.0)
-    aim_turn_jerk: tuple[float, float] = (18700.0, 42500.0)    # °/с³ скорость набора ускорения
-    aim_turn_jerk_err: tuple[float, float] = (935.0, 3570.0)
+    aim_turn_rate: tuple[float, float] = (5253.0, 9359.0)      # °/с конечная скорость разворота
+    aim_turn_rate_err: tuple[float, float] = (255.0, 918.0)    # °/с погрешность к выбранной скорости
+    aim_turn_accel: tuple[float, float] = (4335.0, 9486.0)     # °/с² сила набора
+    aim_turn_accel_err: tuple[float, float] = (281.0, 918.0)
+    aim_turn_jerk: tuple[float, float] = (28050.0, 63750.0)    # °/с³ скорость набора ускорения
+    aim_turn_jerk_err: tuple[float, float] = (1403.0, 5355.0)
     # преследование: старт — скорость в момент входа (0, если прицел уже стоял)
-    aim_chase_rate: tuple[float, float] = (1785.0, 3791.0)
-    aim_chase_rate_err: tuple[float, float] = (119.0, 459.0)
-    aim_chase_accel: tuple[float, float] = (1870.0, 4216.0)
-    aim_chase_accel_err: tuple[float, float] = (119.0, 425.0)
-    aim_chase_jerk: tuple[float, float] = (13260.0, 31620.0)
-    aim_chase_jerk_err: tuple[float, float] = (680.0, 2720.0)
+    aim_chase_rate: tuple[float, float] = (2678.0, 5687.0)
+    aim_chase_rate_err: tuple[float, float] = (179.0, 689.0)
+    aim_chase_accel: tuple[float, float] = (2805.0, 6324.0)
+    aim_chase_accel_err: tuple[float, float] = (179.0, 638.0)
+    aim_chase_jerk: tuple[float, float] = (19890.0, 47430.0)
+    aim_chase_jerk_err: tuple[float, float] = (1020.0, 4080.0)
     flick_ramp: float = 0.12                 # с: набор к профилю флика (короче — быстрее подхват)
     flick_min_deg: float = 4.0               # меньше — без флика, сразу коррекция
     flick_base_time: float = 0.012           # ×1.5 к 0.008
@@ -299,10 +299,10 @@ class NavConfig:
     flick_error_min: float = 0.05            # °
     aim_correct_delay: tuple[float, float] = (0.0, 0.0)  # без паузы между фликом и выстрелом
     aim_lock_gain: float = 240.0             # дожим в центр кости, без ползания рядом
-    aim_lock_rate: float = 2312.0            # потолок дожима; вблизи ещё режется в _aim_lock
+    aim_lock_rate: float = 3468.0            # потолок дожима; вблизи ещё режется в _aim_lock
     aim_correct_gain: float = 88.0           # ÷1.5
     aim_correct_rate: float = 1360.0         # ÷1.5
-    aim_max_px_per_tick: int = 3400          # в скоупе градус стоит больше пикселей — иначе разворот обрезается
+    aim_max_px_per_tick: int = 5100          # в скоупе градус стоит больше пикселей — иначе разворот обрезается
     aim_chase_speed: tuple[float, float] = (3.0, 4.5)  # xxHash: ведение ходящей мишени в 2–3 раза быстрее
     aim_chase_move: float = 70.0             # u/s: ходьба тоже считается движением, не только бег
     aim_chase_strafe: float = 40.0           # u/s поперёк луча
@@ -436,13 +436,13 @@ class Navigator:
         self._aim_speed_mul = 1.0
         self._aim_accel_mul = 1.0             # xxHash на вход в фазу: насколько быстро добираем скорость
         self._chase_rise = 0.08
-        self._aim_rate = 3060.0
-        self._turn_rate = 3400.0
-        self._turn_acc = 2720.0
-        self._turn_jerk = 17000.0
-        self._chase_rate = 1360.0
-        self._chase_acc = 1870.0
-        self._chase_jerk = 13600.0
+        self._aim_rate = 4590.0
+        self._turn_rate = 5100.0
+        self._turn_acc = 4080.0
+        self._turn_jerk = 25500.0
+        self._chase_rate = 2040.0
+        self._chase_acc = 2805.0
+        self._chase_jerk = 20400.0
         self._chase_motion_ready = False
 
         self.route: Route | None = None
@@ -2689,14 +2689,7 @@ class Navigator:
 
     # ------------------------------------------------------------ planning
 
-    def _door_xyz(self, door: dict) -> tuple[float, float, float] | None:
-        box = self._object_aabb(door, 0.0)
-        if box is not None:
-            return (
-                (box[0] + box[3]) * 0.5,
-                (box[1] + box[4]) * 0.5,
-                (box[2] + box[5]) * 0.5,
-            )
+    def _door_pos(self, door: dict) -> tuple[float, float, float] | None:
         pos = door.get("position")
         if not isinstance(pos, dict):
             return None
@@ -2704,6 +2697,34 @@ class Navigator:
             return float(pos["x"]), float(pos["y"]), float(pos["z"])
         except (KeyError, TypeError, ValueError):
             return None
+
+    def _door_world_box(self, door: dict) -> tuple[float, float, float, float, float, float] | None:
+        """Габарит в мире. Локальный ящик коллизии сдвинут к точке двери, иначе E не жмётся."""
+        box = self._object_aabb(door, 0.0)
+        pos = self._door_pos(door)
+        if box is None:
+            return None
+        if pos is None:
+            return box
+        cx = (box[0] + box[3]) * 0.5
+        cy = (box[1] + box[4]) * 0.5
+        cz = (box[2] + box[5]) * 0.5
+        if math.hypot(cx - pos[0], cy - pos[1]) <= 160.0 and abs(cz - pos[2]) <= 160.0:
+            return box
+        return (
+            box[0] + pos[0], box[1] + pos[1], box[2] + pos[2],
+            box[3] + pos[0], box[4] + pos[1], box[5] + pos[2],
+        )
+
+    def _door_xyz(self, door: dict) -> tuple[float, float, float] | None:
+        box = self._door_world_box(door)
+        if box is not None:
+            return (
+                (box[0] + box[3]) * 0.5,
+                (box[1] + box[4]) * 0.5,
+                (box[2] + box[5]) * 0.5,
+            )
+        return self._door_pos(door)
 
     def _door_blocks_route(self, door: dict) -> bool:
         """Закрытую дверь не обходим: подходим и жмём использовать."""
@@ -2717,12 +2738,12 @@ class Navigator:
 
     def _door_gap(self, door: dict, x: float, y: float) -> float:
         """Расстояние до полотна, не до петли. Иначе бот проходит мимо и не жмёт E."""
-        box = self._object_aabb(door, 0.0)
+        box = self._door_world_box(door)
         if box is not None:
             dx = 0.0 if box[0] <= x <= box[3] else min(abs(x - box[0]), abs(x - box[3]))
             dy = 0.0 if box[1] <= y <= box[4] else min(abs(y - box[1]), abs(y - box[4]))
             return math.hypot(dx, dy)
-        pt = self._door_xyz(door)
+        pt = self._door_pos(door)
         if pt is None:
             return 1e9
         return math.hypot(pt[0] - x, pt[1] - y)
@@ -2753,11 +2774,27 @@ class Navigator:
             dist = self._door_gap(door, x, y)
             if dist < best_d:
                 best, best_d = door, dist
-        return best
+        if best is not None:
+            return best
+        # Маршрут мог пройти мимо ящика коллизии. Закрытая дверь под ногами всё равно открывается.
+        near = None
+        near_d = self.cfg.door_use_dist
+        for door in self.doors:
+            if not self._door_needs_open(door):
+                continue
+            pt = self._door_xyz(door)
+            if pt is None or abs(pt[2] - z) > 120.0:
+                continue
+            dist = self._door_gap(door, x, y)
+            if dist <= near_d:
+                near, near_d = door, dist
+        return near
 
     def _door_look(self, x: float, y: float, z: float) -> tuple[float, float] | None:
         door = self._door_ahead
-        if door is None or self.engaged:
+        if door is None or self._fire_held:
+            return None
+        if self.engaged and self._door_gap(door, x, y) > self.cfg.door_use_dist:
             return None
         pt = self._door_xyz(door)
         if pt is None:
@@ -2768,19 +2805,16 @@ class Navigator:
         return yaw, max(-25.0, min(30.0, pitch))
 
     def _door_use(self, now: float, x: float, y: float) -> None:
-        """Короткое E на ходу. Клавиши движения не трогаем."""
+        """Держать E, пока закрытая дверь в радиусе +use. Короткий тап отпускался раньше, чем прицел доезжал."""
         door = self._door_ahead
-        if door is None:
-            return
-        if self._door_gap(door, x, y) > self.cfg.door_use_dist:
+        if door is None or self._door_gap(door, x, y) > self.cfg.door_use_dist:
             return
         idx = int(door.get("index") or 0)
+        self._extra_key_until["e"] = now + 0.2
         if now < self._door_use_at.get(idx, 0.0):
             return
-        lo, hi = self.cfg.door_use_hold
-        self._pulse_key("e", now, lo + self._xx_u01() * (hi - lo))
-        self._door_use_at[idx] = now + self.cfg.door_use_retry
-        self.log(f"Дверь закрыта — открываю на ходу ({door.get('state') or 'closed'})")
+        self._door_use_at[idx] = now + 1.2
+        self.log(f"Дверь закрыта — держу E ({door.get('state') or 'closed'})")
 
     def _obstacle_circles(self) -> list[Obstacle]:
         """Круглые препятствия: видимые мишени."""
@@ -4778,8 +4812,8 @@ class Navigator:
                 acc = min(acc, 700.0)
             else:
                 g = 480.0 if self._chase_on else 320.0
-                r = min(r, 720.0 if self._chase_on else 420.0)
-                acc = min(acc, 2800.0)
+                r = min(r, 1080.0 if self._chase_on else 630.0)
+                acc = min(acc, 4200.0)
                 phase = self._chase_rate if self._chase_on else self._aim_rate
                 r = min(phase, max(r, abs(wy), abs(wp)))
             jerk = min(jerk, cfg.yaw_jerk_max)
