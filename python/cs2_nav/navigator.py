@@ -730,12 +730,8 @@ class Navigator:
         if any(e.get(f"{part}_visible") for part in parts):
             e["visible"] = True
             return
-        if e.get("dormant"):
-            e["visible"] = False
+        if not e.get("spotted") or e.get("dormant"):
             return
-        if not e.get("spotted"):
-            return
-        # Движок: прямая видимость (m_bSpottedByMask), навмеш мог ошибиться на ярусах/ступеньках
         for part, key in _AIM_PART_KEYS.items():
             if e.get(key) is not None:
                 e[f"{part}_visible"] = True
@@ -3094,11 +3090,23 @@ class Navigator:
         if enemies is None:
             return
         with self._scan_lock:
+            prev = {e["index"]: e for e in self._scan_enemies}
+        parts = ("head", "chest", "left_shoulder", "right_shoulder")
+        for e in enemies:
+            old = prev.get(e["index"])
+            if old is not None:
+                for part in parts:
+                    e[f"{part}_visible"] = bool(old.get(f"{part}_visible"))
+                e["visible"] = bool(old.get("visible"))
+            self._sync_visible_from_bones(e)
+            e["_scanned"] = True
+        with self._scan_lock:
             self._scan_enemies = enemies
+            self._scan_visible = [e for e in enemies if e.get("visible") or e.get("spotted")]
             self._scan_published = True
 
     def _scan_los_budget(self, budget_s: float) -> None:
-        """LOS для всех мишеней за проход (координаты уже свежие из _scan_positions)."""
+        """Несколько костей за проход. Полный обход всех мишеней не блокирует новые координаты."""
         try:
             p = self.reader.local_position()
         except Exception:
@@ -3115,13 +3123,12 @@ class Navigator:
             enemies = list(self._scan_enemies)
         if not enemies:
             return
-        deadline = time.monotonic() + max(budget_s, 0.012)
+        deadline = time.monotonic() + budget_s
         n = len(enemies)
-        idx = self._los_cursor % max(1, n)
         steps = 0
-        while steps < n and time.monotonic() < deadline:
-            e = enemies[idx]
-            idx = (idx + 1) % n
+        while time.monotonic() < deadline and steps < n:
+            e = enemies[self._los_cursor % n]
+            self._los_cursor += 1
             steps += 1
             apply_los_visibility(
                 e, self.map, x, y, z,
@@ -3132,10 +3139,8 @@ class Navigator:
             self._sync_visible_from_bones(e)
             e["_scanned"] = True
             e["_vis_pos"] = (round(x), round(y), round(z))
-        self._los_cursor = idx
         with self._scan_lock:
-            self._scan_enemies = enemies
-            self._scan_visible = [e for e in enemies if e.get("visible") or e.get("spotted")]
+            self._scan_visible = [e for e in self._scan_enemies if e.get("visible") or e.get("spotted")]
 
     def _scan_once(self) -> None:
         """Полный проход: спавн и первый тик, когда фоновый список ещё пуст."""
@@ -3235,18 +3240,7 @@ class Navigator:
             enemies = [dict(e) for e in self._scan_enemies]
         self.all_enemies = enemies
         self._refresh_enemy_poses(self.all_enemies)
-        if pos is not None:
-            x, y, z = pos
-        else:
-            try:
-                lp = self.reader.local_position()
-                x, y, z = float(lp.x), float(lp.y), float(lp.z)
-            except Exception:
-                x = y = z = 0.0
-        for e in self.all_enemies:
-            self._apply_los_visibility(e, x, y, z)
-            self._sync_visible_from_bones(e)
-        self.visible_enemies = [e for e in self.all_enemies if e.get("visible") or e.get("spotted")]
+        self.visible_enemies = [e for e in enemies if e.get("visible") or e.get("spotted")]
         alive_ids = {e["index"] for e in enemies}
         for e in enemies:
             idx = e["index"]
