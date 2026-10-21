@@ -272,37 +272,37 @@ class NavConfig:
     aim_far_boost: float = 4.32              # ÷1.5 к 6.48
     aim_speed_jitter: float = 0.12           # ± доля: плавание уже выбранной скорости (xxHash)
     aim_accel_span: tuple[float, float] = (0.84, 1.18)  # запасной множитель, если фаза без своего диапазона
-    # наведение: те же диапазон+погрешность xxHash, скорости ещё ×2
-    aim_aim_rate: tuple[float, float] = (9282.0, 16524.0)
-    aim_aim_rate_err: tuple[float, float] = (460.0, 1632.0)
+    # наведение: те же диапазон+погрешность xxHash, скорости ×1.4 (×2 давало перелёт на средней/дальней)
+    aim_aim_rate: tuple[float, float] = (6498.0, 11567.0)
+    aim_aim_rate_err: tuple[float, float] = (322.0, 1142.0)
     # разворот: старт — скорость камеры навигации
-    aim_turn_rate: tuple[float, float] = (10506.0, 18718.0)    # °/с конечная скорость разворота
-    aim_turn_rate_err: tuple[float, float] = (510.0, 1836.0)   # °/с погрешность к выбранной скорости
-    aim_turn_accel: tuple[float, float] = (8670.0, 18972.0)    # °/с² сила набора
-    aim_turn_accel_err: tuple[float, float] = (562.0, 1836.0)
-    aim_turn_jerk: tuple[float, float] = (56100.0, 127500.0)   # °/с³ скорость набора ускорения
-    aim_turn_jerk_err: tuple[float, float] = (2806.0, 10710.0)
+    aim_turn_rate: tuple[float, float] = (7354.0, 13103.0)     # °/с конечная скорость разворота
+    aim_turn_rate_err: tuple[float, float] = (357.0, 1285.0)   # °/с погрешность к выбранной скорости
+    aim_turn_accel: tuple[float, float] = (6069.0, 13280.0)    # °/с² сила набора
+    aim_turn_accel_err: tuple[float, float] = (393.0, 1285.0)
+    aim_turn_jerk: tuple[float, float] = (39270.0, 89250.0)    # °/с³ скорость набора ускорения
+    aim_turn_jerk_err: tuple[float, float] = (1964.0, 7497.0)
     # преследование: старт — скорость в момент входа (0, если прицел уже стоял)
-    aim_chase_rate: tuple[float, float] = (5356.0, 11374.0)
-    aim_chase_rate_err: tuple[float, float] = (358.0, 1378.0)
-    aim_chase_accel: tuple[float, float] = (5610.0, 12648.0)
-    aim_chase_accel_err: tuple[float, float] = (358.0, 1276.0)
-    aim_chase_jerk: tuple[float, float] = (39780.0, 94860.0)
-    aim_chase_jerk_err: tuple[float, float] = (2040.0, 8160.0)
+    aim_chase_rate: tuple[float, float] = (3749.0, 7962.0)
+    aim_chase_rate_err: tuple[float, float] = (251.0, 965.0)
+    aim_chase_accel: tuple[float, float] = (3927.0, 8854.0)
+    aim_chase_accel_err: tuple[float, float] = (251.0, 893.0)
+    aim_chase_jerk: tuple[float, float] = (27846.0, 66402.0)
+    aim_chase_jerk_err: tuple[float, float] = (1428.0, 5712.0)
     flick_ramp: float = 0.12                 # с: набор к профилю флика (короче — быстрее подхват)
     flick_min_deg: float = 4.0               # меньше — без флика, сразу коррекция
     flick_base_time: float = 0.012           # ×1.5 к 0.008
     flick_per_deg: float = 0.0003            # ×1.5: 90° ≈ 39 мс, 180° ≈ 66 мс
-    flick_rate_max: float = 9600.0           # ×2 к наведению
+    flick_rate_max: float = 6720.0           # ×1.4 к наведению
     flick_undershoot: float = 0.0            # без недовода: овал головы маленький
     flick_error_frac: float = 0.004
     flick_error_min: float = 0.05            # °
     aim_correct_delay: tuple[float, float] = (0.0, 0.0)  # без паузы между фликом и выстрелом
     aim_lock_gain: float = 240.0             # дожим в центр кости, без ползания рядом
-    aim_lock_rate: float = 6936.0            # ×2; потолок дожима, вблизи ещё режется в _aim_lock
+    aim_lock_rate: float = 4855.0            # ×1.4; потолок дожима, вблизи ещё режется в _aim_lock
     aim_correct_gain: float = 88.0           # ÷1.5
     aim_correct_rate: float = 1360.0         # ÷1.5
-    aim_max_px_per_tick: int = 10200         # ×2; в скоупе градус стоит больше пикселей — иначе разворот обрезается
+    aim_max_px_per_tick: int = 7140          # ×1.4; в скоупе градус стоит больше пикселей — иначе разворот обрезается
     aim_chase_speed: tuple[float, float] = (3.0, 4.5)  # xxHash: ведение ходящей мишени в 2–3 раза быстрее
     aim_chase_move: float = 70.0             # u/s: ходьба тоже считается движением, не только бег
     aim_chase_strafe: float = 40.0           # u/s поперёк луча
@@ -313,8 +313,8 @@ class NavConfig:
     aim_overshoot_s: tuple[float, float] = (0.08, 0.16)  # с: вдвое короче окно перевода
     aim_miss_chance: float = 0.0             # промахов нет — наводка максимально точная
     aim_miss_u: tuple[float, float] = (0.8, 2.2)   # u: если и мимо — то едва мимо овала
-    aim_chest_chance: float = 0.10           # xxHash: туловище, если видны и голова, и грудь
-    aim_chest_chance_awp: float = 0.65       # xxHash: AWP чаще в туловище, чем в голову
+    aim_chest_chance: float = 0.03           # xxHash: почти всегда голова, туловище редко
+    aim_chest_chance_awp: float = 0.25       # xxHash: AWP тоже чаще в голову
     aim_head_radius: tuple[float, float] = (1.1, 2.4)         # u: круг на голове
     aim_head_radius_err: tuple[float, float] = (0.12, 0.40)
     aim_chest_radius: tuple[float, float] = (2.2, 4.6)        # u: круг на туловище
@@ -439,13 +439,13 @@ class Navigator:
         self._aim_speed_mul = 1.0
         self._aim_accel_mul = 1.0             # xxHash на вход в фазу: насколько быстро добираем скорость
         self._chase_rise = 0.08
-        self._aim_rate = 9180.0
-        self._turn_rate = 10200.0
-        self._turn_acc = 8160.0
-        self._turn_jerk = 51000.0
-        self._chase_rate = 4080.0
-        self._chase_acc = 5610.0
-        self._chase_jerk = 40800.0
+        self._aim_rate = 6426.0
+        self._turn_rate = 7140.0
+        self._turn_acc = 5712.0
+        self._turn_jerk = 35700.0
+        self._chase_rate = 2856.0
+        self._chase_acc = 3927.0
+        self._chase_jerk = 28560.0
         self._chase_motion_ready = False
 
         self.route: Route | None = None
@@ -604,6 +604,7 @@ class Navigator:
         self._awp_watch: dict | None = None      # выстрел AWP: жива ли мишень (промах)
         self._move_speed = 0.0
         self._immune_seen: set[int] = set()      # видели spawn-защиту
+        self._vuln_latch: set[int] = set()       # раз стала уязвимой — держим как уязвимую, прицел не прыгает
         self._vuln_ready_at: dict[int, float] = {}  # index → когда можно стрелять после уязвимости
         self._tick_no = 0
         self._target_visible_now = False         # мишень в списке видимых на этом тике (стреляем только тогда)
@@ -2275,7 +2276,12 @@ class Navigator:
                 self._engage_q.append(e["index"])
 
         def shootable(e: dict) -> bool:
-            return bool(e.get("vulnerable", True))
+            # как только мишень стала уязвимой, защёлкиваем: дрожание флага иммунитета
+            # больше не перебрасывает прицел между этой и соседней целью
+            if bool(e.get("vulnerable", True)):
+                self._vuln_latch.add(e["index"])
+                return True
+            return e["index"] in self._vuln_latch
 
         def next_shootable() -> dict | None:
             """Первый в списке, кого уже можно убить. Неуязвимые место не теряют."""
@@ -2691,11 +2697,15 @@ class Navigator:
             kind = self._climb_kind(cz - here.z)
             if kind is not None:
                 return kind
-        above = self.map.higher_layer(x, y, here.z, cjmp + 2.0)
-        if above is not None:
-            kind = self._climb_kind(above.z - here.z)
-            if kind is not None:
-                return kind
+        # Слой над головой сам по себе не повод прыгать: иначе бот прыгает без остановки,
+        # просто идя под платформой или рядом с возвышением. Прыгаем, только если
+        # морковка маршрута действительно уходит вверх (route ascends).
+        if cz is not None and (cz - here.z) > step:
+            above = self.map.higher_layer(x, y, here.z, cjmp + 2.0)
+            if above is not None:
+                kind = self._climb_kind(above.z - here.z)
+                if kind is not None:
+                    return kind
         if dist < 8.0:
             land = self.map.higher_layer(cx, cy, here.z, cjmp + 2.0)
             if land is None:
@@ -3245,6 +3255,7 @@ class Navigator:
                 continue
             forgotten.append(self._known.pop(idx))
             self._immune_seen.discard(idx)
+            self._vuln_latch.discard(idx)
             self._vuln_ready_at.pop(idx, None)
         if forgotten:
             for e in forgotten:
@@ -3694,6 +3705,7 @@ class Navigator:
         self._target_cooldown.clear()
         self._given_up.clear()
         self._immune_seen.clear()
+        self._vuln_latch.clear()
         self._vuln_ready_at.clear()
         self._flick = None
         self._flick_pending = False
@@ -4459,7 +4471,8 @@ class Navigator:
         activity *= min(1.0, mag / 3.5)
         nav = max(80.0, cfg.yaw_rate_max)
         rate = max(nav, math.hypot(self._yaw_rate, self._pitch_rate))
-        scale = rate / nav
+        # потолок масштаба: на быстрой наводке ветер не должен раскачивать прицел из стороны в сторону
+        scale = min(1.6, rate / nav)
         return wy * scale * activity * fade * dt, wp * scale * activity * fade * 0.5 * dt
 
     def _tremor_step(self) -> tuple[float, float]:
@@ -4854,9 +4867,9 @@ class Navigator:
                 r = min(r, 70.0)
                 acc = min(acc, 700.0)
             else:
-                g = 960.0 if self._chase_on else 640.0
-                r = min(r, 2160.0 if self._chase_on else 1260.0)
-                acc = min(acc, 8400.0)
+                g = 672.0 if self._chase_on else 448.0
+                r = min(r, 1512.0 if self._chase_on else 882.0)
+                acc = min(acc, 5880.0)
                 phase = self._chase_rate if self._chase_on else self._aim_rate
                 r = min(phase, max(r, abs(wy), abs(wp)))
             jerk = min(jerk, cfg.yaw_jerk_max)
@@ -5812,6 +5825,7 @@ class Navigator:
                 e = self._known[idx]
                 forgotten.append(self._known.pop(idx))
                 self._immune_seen.discard(idx)
+                self._vuln_latch.discard(idx)
                 self._vuln_ready_at.pop(idx, None)
             if forgotten:
                 self.known_targets = list(self._known.values())
@@ -6239,6 +6253,14 @@ class Navigator:
                 else:
                     self._hunt_look_hold = None
                     look_mode = "route"
+            # смотреть туда, куда идём: не даём взгляду уходить от направления движения
+            # дальше узкого конуса, иначе бот долго шагает боком/задом, пока камера в стороне
+            if look_mode == "route" and math.hypot(cx_ - x, cy_ - y) > 36.0:
+                travel_yaw = yaw_to_target(x, y, cx_, cy_)
+                off = shortest_yaw_err(look_yaw, travel_yaw)
+                cone = cfg.forward_only_deg
+                if abs(off) > cone:
+                    look_yaw = shortest_yaw_err(travel_yaw + (cone if off > 0 else -cone), 0.0)
             rate_cap = None
             gain = None
         if look_mode == "aim":
