@@ -272,23 +272,23 @@ class NavConfig:
     aim_far_boost: float = 4.32              # ÷1.5 к 6.48
     aim_speed_jitter: float = 0.12           # ± доля: плавание уже выбранной скорости (xxHash)
     aim_accel_span: tuple[float, float] = (0.84, 1.18)  # запасной множитель, если фаза без своего диапазона
-    # наведение: те же диапазон+погрешность xxHash, потолок выше — до точки быстрее
-    aim_aim_rate: tuple[float, float] = (1820.0, 3240.0)
-    aim_aim_rate_err: tuple[float, float] = (90.0, 320.0)
+    # наведение: те же диапазон+погрешность xxHash, потолок ×1.7 — до точки быстрее
+    aim_aim_rate: tuple[float, float] = (3094.0, 5508.0)
+    aim_aim_rate_err: tuple[float, float] = (153.0, 544.0)
     # разворот: старт — скорость камеры навигации
-    aim_turn_rate: tuple[float, float] = (2060.0, 3670.0)      # °/с конечная скорость разворота
-    aim_turn_rate_err: tuple[float, float] = (100.0, 360.0)    # °/с погрешность к выбранной скорости
-    aim_turn_accel: tuple[float, float] = (1700.0, 3720.0)     # °/с² сила набора
-    aim_turn_accel_err: tuple[float, float] = (110.0, 360.0)
-    aim_turn_jerk: tuple[float, float] = (11000.0, 25000.0)    # °/с³ скорость набора ускорения
-    aim_turn_jerk_err: tuple[float, float] = (550.0, 2100.0)
+    aim_turn_rate: tuple[float, float] = (3502.0, 6239.0)      # °/с конечная скорость разворота
+    aim_turn_rate_err: tuple[float, float] = (170.0, 612.0)    # °/с погрешность к выбранной скорости
+    aim_turn_accel: tuple[float, float] = (2890.0, 6324.0)     # °/с² сила набора
+    aim_turn_accel_err: tuple[float, float] = (187.0, 612.0)
+    aim_turn_jerk: tuple[float, float] = (18700.0, 42500.0)    # °/с³ скорость набора ускорения
+    aim_turn_jerk_err: tuple[float, float] = (935.0, 3570.0)
     # преследование: старт — скорость в момент входа (0, если прицел уже стоял)
-    aim_chase_rate: tuple[float, float] = (1050.0, 2230.0)
-    aim_chase_rate_err: tuple[float, float] = (70.0, 270.0)
-    aim_chase_accel: tuple[float, float] = (1100.0, 2480.0)
-    aim_chase_accel_err: tuple[float, float] = (70.0, 250.0)
-    aim_chase_jerk: tuple[float, float] = (7800.0, 18600.0)
-    aim_chase_jerk_err: tuple[float, float] = (400.0, 1600.0)
+    aim_chase_rate: tuple[float, float] = (1785.0, 3791.0)
+    aim_chase_rate_err: tuple[float, float] = (119.0, 459.0)
+    aim_chase_accel: tuple[float, float] = (1870.0, 4216.0)
+    aim_chase_accel_err: tuple[float, float] = (119.0, 425.0)
+    aim_chase_jerk: tuple[float, float] = (13260.0, 31620.0)
+    aim_chase_jerk_err: tuple[float, float] = (680.0, 2720.0)
     flick_ramp: float = 0.12                 # с: набор к профилю флика (короче — быстрее подхват)
     flick_min_deg: float = 4.0               # меньше — без флика, сразу коррекция
     flick_base_time: float = 0.012           # ×1.5 к 0.008
@@ -299,7 +299,7 @@ class NavConfig:
     flick_error_min: float = 0.05            # °
     aim_correct_delay: tuple[float, float] = (0.0, 0.0)  # без паузы между фликом и выстрелом
     aim_lock_gain: float = 240.0             # дожим в центр кости, без ползания рядом
-    aim_lock_rate: float = 1360.0            # потолок дожима; вблизи ещё режется в _aim_lock
+    aim_lock_rate: float = 2312.0            # потолок дожима; вблизи ещё режется в _aim_lock
     aim_correct_gain: float = 88.0           # ÷1.5
     aim_correct_rate: float = 1360.0         # ÷1.5
     aim_max_px_per_tick: int = 3400          # в скоупе градус стоит больше пикселей — иначе разворот обрезается
@@ -436,13 +436,13 @@ class Navigator:
         self._aim_speed_mul = 1.0
         self._aim_accel_mul = 1.0             # xxHash на вход в фазу: насколько быстро добираем скорость
         self._chase_rise = 0.08
-        self._aim_rate = 1800.0
-        self._turn_rate = 2000.0
-        self._turn_acc = 1600.0
-        self._turn_jerk = 10000.0
-        self._chase_rate = 800.0
-        self._chase_acc = 1100.0
-        self._chase_jerk = 8000.0
+        self._aim_rate = 3060.0
+        self._turn_rate = 3400.0
+        self._turn_acc = 2720.0
+        self._turn_jerk = 17000.0
+        self._chase_rate = 1360.0
+        self._chase_acc = 1870.0
+        self._chase_jerk = 13600.0
         self._chase_motion_ready = False
 
         self.route: Route | None = None
