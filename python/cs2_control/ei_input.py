@@ -548,7 +548,7 @@ class HybridInput(GameInput):
         found = self._inner_window()
         if found is not None:
             return found[3], found[4]
-        return 1920, 1080
+        return 1280, 800
 
     def grab_field(self, path: str) -> tuple[int, int] | None:
         """Снимок поля gamescope. Верхняя рамка окна сюда не попадает."""
@@ -592,27 +592,28 @@ class HybridInput(GameInput):
         fy = min(1.0, max(0.0, float(fy)))
         x = min(width - 1, max(0, int(round(fx * (width - 1)))))
         y = min(height - 1, max(0, int(round(fy * (height - 1)))))
-        # На поле 1280 один пиксель уезжал в 1920/1280 раз. На 1920×1080 уезда нет.
-        fit = width / 1920.0 if width else 2 / 3
-        x_move = int(round(x * fit))
-        # Ниже верхней полосы клик садится ниже центра кнопки.
+        # Один отправленный пиксель по X сдвигается примерно на 1.5.
+        # Полная координата уезжала в правую половину, а 2x−ширина — в телевизор.
+        x_move = int(round(x * 2 / 3))
+        # Ниже верхней полосы клик садится на 18 px ниже центра кнопки.
         # PLAY этой полосы и так попадает — его не поднимаем.
-        # Deathmatch после этого ещё на столько же ниже.
-        y_k = height / 800.0 if height else 1.0
-        lift = int(round(18 * y_k))
+        # Deathmatch после этого ещё на 18 px ниже.
+        lift = 18
         if abs(fx - 0.517) <= 0.06 and abs(fy - 0.118) <= 0.06:
-            lift = int(round(36 * y_k))
-        y_move = y if y < int(round(40 * y_k)) else max(0, y - lift)
-        # Плитки карт: на поле 1280×800 это 50 px влево и 100 px вверх.
+            lift = 36
+        y_move = y if y < 40 else max(0, y - lift)
+        # Плитки карт: курсор на 100 px ниже и на 50 px правее.
+        # На экране один отправленный пиксель даёт примерно 1.5.
         if abs(fy - 0.50) <= 0.08 and 0.20 <= fx <= 0.90:
-            x_move = max(0, x_move - int(round(50 * (width / 1280.0) * fit)))
-            y_move = max(0, y_move - int(round(100 * y_k * fit)))
-        # У нижнего края тот же масштаб, что и по X. На 1920×1080 он равен 1,
-        # и GO остаётся на своей доле экрана. На 1280 две трети и сдвиг вниз.
-        if fit < 0.9 and y_move > (height - 1) * fit:
-            y_move = int(round(y * fit))
+            x_move = max(0, x_move - 33)
+            y_move = max(0, y_move - 67)
+        # У нижнего края тот же масштаб 1.5, что и по X. GO и так почти у низа,
+        # поэтому минус 18, 36 или 86 пикселей всё равно упирает курсор в край.
+        # После двух третей GO был выше кнопки: 50, потом ещё 20, потом ещё 50.
+        if y_move * 3 > (height - 1) * 2:
+            y_move = int(round(y * 2 / 3))
             if abs(fx - 0.865) <= 0.05 and abs(fy - 0.956) <= 0.06:
-                y_move += int(round(79 * fit / (2 / 3)))
+                y_move += 79
         return self._xtest_from_origin(x_move, y_move, click=click)
 
     def _xtest_from_origin(self, x: int, y: int, *, click: bool) -> bool:

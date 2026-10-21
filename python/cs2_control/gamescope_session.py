@@ -19,8 +19,10 @@ from collections.abc import Callable
 
 GAMESCOPE = "/usr/games/gamescope"
 LOG_PATH = "/tmp/cs2-gamescope.log"
-WIDTH = 1920
-HEIGHT = 1080
+WIDTH = 1280
+HEIGHT = 800
+GAME_WIDTH = 1920
+GAME_HEIGHT = 1080
 # В cs2_video.txt: 0 = 4:3, 1 = 16:9, 2 = 16:10.
 ASPECT_16_9 = "1"
 
@@ -206,11 +208,11 @@ def _shutdown_desktop_steam(log: Callable[[str], None]) -> None:
 
 
 def _steam_cmd() -> list[str]:
-    """CS2 сразу в 16:9. Параметры Steam Launch Options не трогаем."""
+    """Видео самой CS2 — 16:9 1920×1080. Окно gamescope от этого не зависит."""
     return [
         "snap", "run", "steam", "-noshaders",
         "-applaunch", "730",
-        "-w", str(WIDTH), "-h", str(HEIGHT), "-fullscreen",
+        "-w", str(GAME_WIDTH), "-h", str(GAME_HEIGHT), "-fullscreen",
     ]
 
 
@@ -273,11 +275,11 @@ def apply_video_mode(log: Callable[[str], None]) -> None:
     """Записать в клиент CS2 16:9 и 1920×1080, не затирая остальные пункты видео."""
     paths = _video_paths()
     if not paths:
-        log(f"видео CS2: 16:9 {WIDTH}×{HEIGHT}, файл настроек появится после входа в Steam")
+        log(f"видео CS2: 16:9 {GAME_WIDTH}×{GAME_HEIGHT}, файл настроек появится после входа в Steam")
         return
     keys = {
-        "setting.defaultres": str(WIDTH),
-        "setting.defaultresheight": str(HEIGHT),
+        "setting.defaultres": str(GAME_WIDTH),
+        "setting.defaultresheight": str(GAME_HEIGHT),
         "setting.aspectratiomode": ASPECT_16_9,
         "setting.fullscreen": "1",
         "setting.nowindowborder": "0",
@@ -295,13 +297,13 @@ def apply_video_mode(log: Callable[[str], None]) -> None:
         except OSError as exc:
             log(f"не записал {path}: {exc}")
             continue
-    log(f"видео CS2: 16:9 {WIDTH}×{HEIGHT}")
+    log(f"видео CS2: 16:9 {GAME_WIDTH}×{GAME_HEIGHT}")
 
 
 def _launch_gamescope(log: Callable[[str], None]) -> None:
     if not os.path.isfile(GAMESCOPE):
         raise RuntimeError(f"нет {GAMESCOPE}")
-    log(f"запускаю gamescope {WIDTH}×{HEIGHT} и CS2, окно шейдеров Vulkan пропускается")
+    log(f"запускаю gamescope {WIDTH}×{HEIGHT}, видео CS2 {GAME_WIDTH}×{GAME_HEIGHT}, окно шейдеров Vulkan пропускается")
     log_file = open(LOG_PATH, "ab", buffering=0)
     subprocess.Popen(
         [
@@ -317,7 +319,7 @@ def _launch_gamescope(log: Callable[[str], None]) -> None:
 
 
 def _launch_app(log: Callable[[str], None]) -> None:
-    log(f"gamescope уже работает — открываю CS2 {WIDTH}×{HEIGHT}, шейдеры пропускаются")
+    log(f"gamescope уже работает — открываю CS2 {GAME_WIDTH}×{GAME_HEIGHT}, шейдеры пропускаются")
     subprocess.Popen(
         _steam_cmd(),
         env=_session_env(),
@@ -341,7 +343,7 @@ def _flag_value(cmd: list[str], flag: str) -> str | None:
     return None
 
 
-def _video_size(pid: int) -> bool:
+def _window_size(pid: int) -> bool:
     cmd = _cmdline(pid)
     return _flag_value(cmd, "-W") == str(WIDTH) and _flag_value(cmd, "-H") == str(HEIGHT)
 
@@ -452,7 +454,7 @@ def focus_game() -> None:
 def ensure_gamescope(log: Callable[[str], None]) -> str:
     """Вернуть сокет libei. Без относительной мыши gamescope перезапускается:
     иначе прицел — это курсор, он упирается в край окна и возвращается назад.
-    Окно не 1920×1080 тоже перезапускается: иначе в игре остаётся старое видео.
+    Окно композита остаётся 1280×800. Другой размер тоже перезапускается.
     """
     apply_video_mode(log)
     running = cs2_pids()
@@ -463,7 +465,7 @@ def ensure_gamescope(log: Callable[[str], None]) -> str:
                 "CS2 запущена обычным окном, не через gamescope. "
                 "Закрой её и запусти скрипт снова: вторую копию не стартую."
             )
-        if _relative_mouse(scope) and _video_size(scope):
+        if _relative_mouse(scope) and _window_size(scope):
             sock = _ei_socket(scope)
             if not sock:
                 raise RuntimeError("CS2 в gamescope, но сокет виртуального ввода не найден")
@@ -472,7 +474,7 @@ def ensure_gamescope(log: Callable[[str], None]) -> str:
         if not _relative_mouse(scope):
             log("gamescope без относительной мыши — перезапускаю, иначе прицел упирается в край окна")
         else:
-            log(f"gamescope не {WIDTH}×{HEIGHT} — перезапускаю, чтобы видео стало 16:9")
+            log(f"окно gamescope не {WIDTH}×{HEIGHT} — перезапускаю композитор")
         _stop_pid(scope)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline and (cs2_pids() or _alive(scope)):
@@ -481,7 +483,7 @@ def ensure_gamescope(log: Callable[[str], None]) -> str:
     for pid in _pids():
         if not _is_gamescope(_cmdline(pid)):
             continue
-        if _relative_mouse(pid) and _video_size(pid):
+        if _relative_mouse(pid) and _window_size(pid):
             continue
         log(f"закрываю старый gamescope, дальше окно {WIDTH}×{HEIGHT}")
         _stop_pid(pid)

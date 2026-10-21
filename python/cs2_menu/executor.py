@@ -42,7 +42,7 @@ class UIExecutor:
             if not self.refresh_window():
                 return None
             geo = self._menu.geometry()
-        cw, ch = (1920, 1080)
+        cw, ch = (1280, 800)
         if state and state.window_memory[0] > 0:
             cw, ch = state.window_memory
         return WindowLayout.from_executor_geo(geo, client_w=cw, client_h=ch)
