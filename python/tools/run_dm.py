@@ -6,6 +6,7 @@
 * После спавна — бот по навмешу ТЕКУЩЕЙ карты (data/maps/<карта>.nav.json).
 * Смена карты — выгрузить бота, собрать координатную карту новой карты, идти по ней.
 * Смерть на той же карте бота не останавливает.
+* Ранг этого аккаунта вырос на следующий — бот выходит с сервера и останавливается.
 
   python3 python/tools/run_dm.py --match-time 600
   python3 python/tools/run_dm.py --match-time 0    # без лимита
@@ -311,6 +312,27 @@ def load_coord_map(map_name: str, cache: dict[str, CoordinateMap]) -> Coordinate
     return cmap
 
 
+def leave_server(menu: MenuController, reader: Reader, inp) -> None:
+    """Выйти из матча: Esc и disconnect. Бот после этого заново в очередь не встаёт."""
+    try:
+        inp.release_all()
+    except Exception:
+        pass
+    log("отключаюсь от сервера")
+    try:
+        menu.run("disconnect", timeout=25.0)
+    except Exception as exc:  # noqa: BLE001
+        log(f"сценарий выхода не прошёл ({exc})")
+    deadline = time.monotonic() + 12.0
+    while time.monotonic() < deadline:
+        sig = _signals(reader)
+        if not sig["map_loaded"]:
+            log("сервер покинут")
+            return
+        time.sleep(0.4)
+    log("карта всё ещё загружена — команда disconnect уже отправлена")
+
+
 def run_bot_until_change(
     reader: Reader,
     inp,
@@ -324,7 +346,7 @@ def run_bot_until_change(
     """Крутить бота, пока карта та же и мы не в меню.
 
     match_time — секунды работы бота именно в этом матче (меню не считается).
-    Возвращает 'menu' | 'map:<name>' | 'limit' | 'done' | 'retry'.
+    Возвращает 'menu' | 'map:<name>' | 'limit' | 'done' | 'retry' | 'rank'.
     """
     cfg = NavConfig(
         tick_hz=hz,
@@ -357,6 +379,22 @@ def run_bot_until_change(
         return "retry"
     if match_time:
         log(f"лимит матча: {match_time:.0f}с — только пока бот в матче, меню не считается")
+    pr = reader.profile_rank()
+    if pr.valid:
+        log(
+            f"profile rank {pr.rank}: xp {pr.xp}/{pr.xp_per_rank} "
+            f"(до след. {pr.xp_to_next}) src={pr.source}"
+        )
+    acc = reader.local_account()
+    if acc.valid:
+        log(f"account id {acc.account_id} (steam {acc.steam_id64})")
+    # Ранг на старте матча — база. Выход только если у ЭТОГО account id он стал на 1 выше
+    # и это подтвердилось вторым чтением: одиночный сбой памяти выход не запускает.
+    base_account = [acc.account_id if acc.valid else 0]
+    base_rank = [pr.rank if pr.valid and acc.valid else 0]
+    pending_rank = [0]
+    rank_poll_at = [0.0]
+    rank_up = [False]
     log(
         f"бот на {map_name}: ({pos.x:.0f},{pos.y:.0f},{pos.z:.0f}) → "
         f"цель id={nav.goal_id}, {route.length:.0f}u"
@@ -369,7 +407,43 @@ def run_bot_until_change(
     # (имя, с какого момента оно стабильно отличается от текущей карты)
     other_since: list[tuple[str, float] | None] = [None]
 
+    def rank_rose() -> bool:
+        now = time.monotonic()
+        if now < rank_poll_at[0]:
+            return False
+        rank_poll_at[0] = now + 1.0
+        cur = reader.profile_rank()
+        who = reader.local_account()
+        if not cur.valid or not who.valid or cur.rank < 1:
+            return False
+        if base_account[0] != who.account_id or base_rank[0] < 1:
+            base_account[0] = who.account_id
+            base_rank[0] = cur.rank
+            pending_rank[0] = 0
+            log(f"слежу за рангом account {who.account_id}: сейчас {cur.rank}")
+            return False
+        if cur.rank == base_rank[0]:
+            pending_rank[0] = 0
+            return False
+        if cur.rank != base_rank[0] + 1:
+            return False
+        if pending_rank[0] != cur.rank:
+            pending_rank[0] = cur.rank
+            log(
+                f"ранг {base_rank[0]} → {cur.rank} у account {who.account_id}, "
+                f"xp {cur.xp}/{cur.xp_per_rank} — жду подтверждение"
+            )
+            return False
+        log(
+            f"ранг {base_rank[0]} → {cur.rank} у account {who.account_id} — "
+            "выхожу с сервера"
+        )
+        rank_up[0] = True
+        return True
+
     def should_stop() -> bool:
+        if rank_rose():
+            return True
         now = time.monotonic()
         dt = now - last_tick[0]
         last_tick[0] = now
@@ -397,6 +471,8 @@ def run_bot_until_change(
         return now - empty_since[0] >= 3.0
 
     reason = nav.run(duration=None, should_stop=should_stop)
+    if rank_up[0]:
+        return "rank"
     if hit_limit[0]:
         return "limit"
     sig = _signals(reader)
@@ -515,6 +591,10 @@ def main() -> int:
                 reader, inp, cmap, map_name,
                 match_time=match_time, hz=args.hz, quiet=args.quiet,
             )
+            if outcome == "rank":
+                leave_server(menu, reader, inp)
+                log("ранг поднялся — отключился от сервера, стоп")
+                return 0
             if outcome == "limit":
                 log("лимит времени в матче — стоп")
                 return 0

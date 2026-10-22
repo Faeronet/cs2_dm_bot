@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 import math
 
 from cs2_reader.life import LocalLifeInfo
+from cs2_reader.account import LocalAccountInfo
+from cs2_reader.profile_rank import ProfileRankInfo
 
 
 @dataclass
@@ -41,6 +43,8 @@ class PlayerInfo:
     controller: int = 0
     pawn: int = 0
     name: str = ""
+    steam_id64: int = 0
+    account_id: int = 0
     team: int = 0
     health: int = 0
     armor: int = 0
@@ -152,6 +156,8 @@ class GameSnapshot:
     ladders: list = field(default_factory=list)  # list[LadderInfo]
     doors: list = field(default_factory=list)  # list[DoorInfo]
     breakables: list = field(default_factory=list)  # list[BreakableInfo]
+    profile_rank: ProfileRankInfo = field(default_factory=ProfileRankInfo)
+    local_account: LocalAccountInfo = field(default_factory=LocalAccountInfo)
     errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -189,6 +195,8 @@ class GameSnapshot:
             return {
                 "index": p.index,
                 "name": p.name,
+                "steam_id64": str(p.steam_id64) if p.steam_id64 else "",
+                "account_id": p.account_id,
                 "team": p.team,
                 "health": p.health,
                 "armor": p.armor,
@@ -237,5 +245,7 @@ class GameSnapshot:
             "ladders": [lad.to_dict() for lad in self.ladders],
             "doors": [door.to_dict() for door in self.doors],
             "breakables": [br.to_dict() for br in self.breakables],
+            "profile_rank": self.profile_rank.to_dict(),
+            "local_account": self.local_account.to_dict(),
             "errors": self.errors,
         }

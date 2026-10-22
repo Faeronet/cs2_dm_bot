@@ -50,6 +50,8 @@ from cs2_reader.aim import (
     yaw_to_target,
 )
 from cs2_reader.game_state import Vec3
+from cs2_reader.account import LocalAccountInfo
+from cs2_reader.profile_rank import ProfileRankInfo
 from cs2_reader.weapons import (
     default_clip,
     is_gun,
@@ -412,6 +414,8 @@ class _PoseSource:
     def ladders(self): ...
     def local_on_ladder(self): ...
     def doors(self): ...
+    def profile_rank(self) -> ProfileRankInfo: ...
+    def local_account(self) -> LocalAccountInfo: ...
 
 
 class Navigator:
@@ -607,6 +611,11 @@ class Navigator:
         self._vuln_latch: set[int] = set()       # раз стала уязвимой — держим как уязвимую, прицел не прыгает
         self._vuln_ready_at: dict[int, float] = {}  # index → когда можно стрелять после уязвимости
         self._tick_no = 0
+        self.profile_rank = ProfileRankInfo()
+        self._profile_rank_key: tuple[int, int] | None = None
+        self._profile_rank_log_at = 0.0
+        self.local_account = LocalAccountInfo()
+        self._local_account_id: int | None = None
         self._target_visible_now = False         # мишень в списке видимых на этом тике (стреляем только тогда)
         self._eye_z = self.cfg.eye_height        # высота глаз над ногами (обновляется из памяти)
         self._mem_shots = 0                      # m_iShotsFired
@@ -5794,6 +5803,35 @@ class Navigator:
         mem_yaw, mem_pitch = ang.y, ang.x
         self.weapon = self._read_weapon()
         self.life = self._read_life()
+        pr_fn = getattr(self.reader, "profile_rank", None)
+        if callable(pr_fn):
+            try:
+                self.profile_rank = pr_fn()
+            except Exception:
+                pass
+            if self.profile_rank.valid:
+                key = (self.profile_rank.rank, self.profile_rank.xp)
+                if key != self._profile_rank_key or now - self._profile_rank_log_at >= 60.0:
+                    self._profile_rank_key = key
+                    self._profile_rank_log_at = now
+                    self.log(
+                        f"Profile rank {self.profile_rank.rank} "
+                        f"xp {self.profile_rank.xp}/{self.profile_rank.xp_per_rank} "
+                        f"(до след. {self.profile_rank.xp_to_next}) "
+                        f"src={self.profile_rank.source}"
+                    )
+        acc_fn = getattr(self.reader, "local_account", None)
+        if callable(acc_fn):
+            try:
+                self.local_account = acc_fn()
+            except Exception:
+                pass
+            if self.local_account.valid and self.local_account.account_id != self._local_account_id:
+                self._local_account_id = self.local_account.account_id
+                self.log(
+                    f"Account id {self.local_account.account_id} "
+                    f"(steam {self.local_account.steam_id64})"
+                )
         self._ensure_spawn_primary(now)
         self._mem_shots = self._read_shots_fired()
         self._scoped_now = self._read_scoped()
@@ -6503,6 +6541,8 @@ class Navigator:
                 "shot": shot,
                 "shots_on_target": self._shots_on_target if target is not None else 0,
                 "fire_held": self._fire_held,
+                "profile_rank": self.profile_rank.to_dict() if self.profile_rank.valid else None,
+                "local_account": self.local_account.to_dict() if self.local_account.valid else None,
             }
         )
         return info

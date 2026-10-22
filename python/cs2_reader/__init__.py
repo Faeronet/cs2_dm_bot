@@ -1,6 +1,8 @@
 """CS2 memory reader — live process and dump file support."""
 
 from cs2_reader.game_state import BombInfo, EnemyInfo, GameSnapshot, PlayerInfo, Vec3, ViewMatrix, WeaponInfo
+from cs2_reader.account import LocalAccountInfo
+from cs2_reader.profile_rank import ProfileRankInfo
 from cs2_reader.breakables import BreakableInfo
 from cs2_reader.doors import DoorInfo
 from cs2_reader.ladders import LadderInfo
@@ -22,4 +24,6 @@ __all__ = [
     "LadderInfo",
     "DoorInfo",
     "BreakableInfo",
+    "ProfileRankInfo",
+    "LocalAccountInfo",
 ]

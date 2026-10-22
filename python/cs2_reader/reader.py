@@ -54,6 +54,8 @@ from cs2_reader.life import (
     LocalLifeUpdate,
     is_playable,
 )
+from cs2_reader.account import LocalAccountInfo, is_valid_steam_id64, steam_account_id
+from cs2_reader.profile_rank import ProfileRankInfo, ProfileRankReader
 from cs2_reader.schema import Schema
 from cs2_reader.visibility import read_radar_spotted, spotted_by_viewer
 from cs2_reader.vulnerability import read_pawn_vulnerability
@@ -115,6 +117,7 @@ class Reader:
         self._breakable_cache: list[BreakableInfo] = []
         self._breakable_cache_at = 0.0
         self._breakable_map = ""
+        self._profile_rank_reader = ProfileRankReader(self.backend, self.schema)
 
     @classmethod
     def from_pid(cls, pid: int) -> "Reader":
@@ -580,6 +583,11 @@ class Reader:
         if name_ptr:
             player.name = self.backend.read_string(name_ptr, 64)
 
+        steam_id64 = self.backend.read_u64(controller + self.schema.m_steam_id)
+        if is_valid_steam_id64(steam_id64):
+            player.steam_id64 = steam_id64
+            player.account_id = steam_account_id(steam_id64)
+
         coords = self.backend.read_vec3(pawn + self.schema.m_v_old_origin)
         if coords:
             player.position = Vec3(*coords)
@@ -803,6 +811,24 @@ class Reader:
         self._breakable_map = map_name
         return out
 
+    def profile_rank(self) -> ProfileRankInfo:
+        """Profile Rank 1–40 и XP прогресс (weekly drop rank)."""
+        return self._profile_rank_reader.read(self.local_controller())
+
+    def local_account(self) -> LocalAccountInfo:
+        """Steam ID64 и 32-bit account ID локального игрока."""
+        controller = self.local_controller()
+        if not controller:
+            return LocalAccountInfo()
+        steam_id64 = self.backend.read_u64(controller + self.schema.m_steam_id)
+        if not is_valid_steam_id64(steam_id64):
+            return LocalAccountInfo()
+        return LocalAccountInfo(
+            steam_id64=steam_id64,
+            account_id=steam_account_id(steam_id64),
+            valid=True,
+        )
+
     def bomb_info(self) -> BombInfo | None:
         client = self._client_base()
         if not client or not self.offsets.client.dw_planted_c4:
@@ -857,6 +883,8 @@ class Reader:
         snap.ladders = self.ladders()
         snap.doors = self.doors()
         snap.breakables = self.breakables()
+        snap.profile_rank = self.profile_rank()
+        snap.local_account = self.local_account()
         return snap
 
     def _read_build_number(self, engine: int) -> int:

@@ -19,6 +19,7 @@ class Schema:
     m_h_player_pawn: int
     m_b_pawn_is_alive: int
     m_s_sanitized_player_name: int
+    m_steam_id: int
     m_armor_value: int
     m_ang_eye_angles: int
     m_vec_view_offset: int
@@ -30,6 +31,11 @@ class Schema:
     m_i_shots_fired: int = 0
     m_b_is_defusing: int = 0
     m_i_ping: int = 0
+    m_p_inventory_services: int = 0
+    m_n_persona_data_public_level: int = 0
+    m_n_persona_data_xp_trail_level: int = 0
+    m_i_competitive_ranking: int = 0
+    m_i_competitive_rank_type: int = 0
     m_f_flags: int = 0
     m_vec_velocity: int = 0
     m_p_weapon_services: int = 0
@@ -96,6 +102,7 @@ class Schema:
             m_h_player_pawn=field("CCSPlayerController", "m_hPlayerPawn"),
             m_b_pawn_is_alive=field("CCSPlayerController", "m_bPawnIsAlive"),
             m_s_sanitized_player_name=field("CCSPlayerController", "m_sSanitizedPlayerName"),
+            m_steam_id=field("CBasePlayerController", "m_steamID"),
             m_armor_value=field("C_CSPlayerPawn", "m_ArmorValue"),
             m_ang_eye_angles=field("C_CSPlayerPawn", "m_angEyeAngles"),
             m_vec_view_offset=field("C_BaseModelEntity", "m_vecViewOffset"),
@@ -107,6 +114,15 @@ class Schema:
             m_i_shots_fired=field("C_CSPlayerPawn", "m_iShotsFired"),
             m_b_is_defusing=field("C_CSPlayerPawn", "m_bIsDefusing"),
             m_i_ping=field("CCSPlayerController", "m_iPing"),
+            m_p_inventory_services=field("CCSPlayerController", "m_pInventoryServices"),
+            m_n_persona_data_public_level=field(
+                "CCSPlayerController_InventoryServices", "m_nPersonaDataPublicLevel"
+            ),
+            m_n_persona_data_xp_trail_level=field(
+                "CCSPlayerController_InventoryServices", "m_nPersonaDataXpTrailLevel"
+            ),
+            m_i_competitive_ranking=field("CCSPlayerController", "m_iCompetitiveRanking"),
+            m_i_competitive_rank_type=field("CCSPlayerController", "m_iCompetitiveRankType"),
             m_f_flags=field("C_BaseEntity", "m_fFlags"),
             m_vec_velocity=field("C_BaseEntity", "m_vecVelocity"),
             m_p_weapon_services=field("C_BasePlayerPawn", "m_pWeaponServices"),
