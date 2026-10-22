@@ -312,25 +312,89 @@ def load_coord_map(map_name: str, cache: dict[str, CoordinateMap]) -> Coordinate
     return cmap
 
 
+def _on_server(reader: Reader) -> bool:
+    return bool(_signals(reader)["map_loaded"])
+
+
+def _pause_leave_point(clicker) -> tuple[float, float]:
+    """Нижняя белая надпись левой колонки паузы. Нет кадра — записанная доля."""
+    fallback = (0.16, 0.62)
+    cap = getattr(clicker, "capture_visible", None)
+    fr = cap() if cap is not None else None
+    if fr is None:
+        fr = clicker.capture_client()
+    if fr is None:
+        return fallback
+    from cs2_menu.live_ui import _white_ink
+
+    im, client = fr.image, fr.client
+    px = im.load()
+    x0 = client.left + int(client.width * 0.03)
+    x1 = client.left + int(client.width * 0.32)
+    y0 = client.top + int(client.height * 0.30)
+    y1 = client.top + int(client.height * 0.86)
+    rows: list[tuple[int, int, int]] = []
+    y = y0
+    while y < y1:
+        xs = [x for x in range(x0, x1, 2) if _white_ink(px[x, y][:3])]
+        if len(xs) >= 10:
+            rows.append((y, xs[0], xs[-1]))
+            y += 5
+        else:
+            y += 2
+    bands: list[list[tuple[int, int, int]]] = []
+    for row in rows:
+        if bands and row[0] - bands[-1][-1][0] <= 12:
+            bands[-1].append(row)
+        else:
+            bands.append([row])
+    wide = [
+        band for band in bands
+        if max(r[2] for r in band) - min(r[1] for r in band) > client.width * 0.05
+    ]
+    if not wide:
+        log("надпись выхода на кадре не нашёл, жму записанную точку")
+        return fallback
+    band = wide[-1]
+    cy = (band[0][0] + band[-1][0]) // 2
+    cx = (min(r[1] for r in band) + max(r[2] for r in band)) // 2
+    return client.frac(cx, cy)
+
+
 def leave_server(menu: MenuController, reader: Reader, inp) -> None:
-    """Выйти из матча: Esc и disconnect. Бот после этого заново в очередь не встаёт."""
+    """Выйти из матча клавишей Esc и кликом по кнопке в поле gamescope.
+
+    Старый сценарий слал «Escape»/«Return» — таких имён в раскладке нет, игра
+    их пропускала, а клик шёл в курсор рабочего стола.
+    """
+    from cs2_menu.xwl_pointer import ScreenClicker
+
     try:
         inp.release_all()
     except Exception:
         pass
-    log("отключаюсь от сервера")
-    try:
-        menu.run("disconnect", timeout=25.0)
-    except Exception as exc:  # noqa: BLE001
-        log(f"сценарий выхода не прошёл ({exc})")
+    time.sleep(0.2)
+    log("открываю паузу (Esc)")
+    inp.key_tap("escape", hold_ms=90)
+    time.sleep(0.9)
+    clicker = ScreenClicker(menu.executor.menu_input, env=menu.executor._xdo_env())
+    fx, fy = _pause_leave_point(clicker)
+    # Курсор поля поднимает точку на 18 px. Компенсация возвращает клик на надпись.
+    fy_hit = min(0.66, fy + 18.0 / 800.0)
+    log(f"кнопка выхода @({fx:.3f},{fy:.3f})")
+    clicker.act_client(fx, fy_hit, settle=0.9)
+    if _on_server(reader):
+        log("подтверждаю выход")
+        inp.key_tap("return", hold_ms=70)
+        time.sleep(0.35)
+        clicker.act_client(0.58, 0.58, settle=0.6)
     deadline = time.monotonic() + 12.0
     while time.monotonic() < deadline:
-        sig = _signals(reader)
-        if not sig["map_loaded"]:
+        if not _on_server(reader):
             log("сервер покинут")
             return
         time.sleep(0.4)
-    log("карта всё ещё загружена — команда disconnect уже отправлена")
+    log("карта всё ещё загружена — Esc и клик выхода уже отправлены")
 
 
 def run_bot_until_change(
