@@ -45,9 +45,36 @@ def grab_rect(env: dict, rect: tuple[int, int, int, int], out: str) -> bool:
     return proc.returncode == 0 and Path(out).exists()
 
 
-def root_shot(env: dict, out: str, *, size: tuple[int, int] = (SCREEN_W, SCREEN_H)) -> bool:
+def _xdotool() -> str:
+    root = Path(__file__).resolve().parents[2]
+    cand = root / "tools" / "xdotool" / "usr" / "bin" / "xdotool"
+    return str(cand) if cand.is_file() else "xdotool"
+
+
+def host_size(env: dict) -> tuple[int, int]:
+    """Реальный размер экрана. Жёсткие 1920×1200 на другом мониторе дают пустой кадр."""
+    try:
+        proc = subprocess.run(
+            [_xdotool(), "getdisplaygeometry"],
+            env=env, capture_output=True, text=True, timeout=2,
+        )
+        parts = (proc.stdout or "").split()
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            width, height = int(parts[0]), int(parts[1])
+            if width >= 320 and height >= 240:
+                return width, height
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return SCREEN_W, SCREEN_H
+
+
+def root_shot(env: dict, out: str, *, size: tuple[int, int] | None = None) -> bool:
     disp = env.get("DISPLAY", ":1")
-    w, h = size
+    host_w, host_h = host_size(env)
+    if size is None:
+        w, h = host_w, host_h
+    else:
+        w, h = min(size[0], host_w), min(size[1], host_h)
     try:
         proc = subprocess.run(
             ["ffmpeg", "-y", "-f", "x11grab", "-video_size", f"{w}x{h}",

@@ -515,21 +515,31 @@ def close_window(clicker, env: dict, *, reader_state_fn=None, max_rounds: int = 
     return closed_any
 
 
+def _menu_frame(clicker):
+    """Кадр, на котором видно меню. Поле gamescope часто чёрное — тогда берётся окно на столе."""
+    cap = getattr(clicker, "capture_visible", None)
+    if cap is not None:
+        fr = cap()
+        if fr is not None:
+            return fr
+    return clicker.capture_client()
+
+
 def review_store_drop(clicker, log=print) -> bool:
     """Открыть магазин, прокликать предметы дропа, окна закрыть, на «получить» только навестись."""
     from cs2_menu.live_ui import find_drop_cards, find_inspect_close, find_nav, find_team_select
 
     clicker._mi.focus()
-    fr = clicker.capture_client()
+    fr = _menu_frame(clicker)
     if fr is None:
-        log("[drop] окно CS2 не найдено")
+        log("[drop] кадр меню не снялся")
         return False
     nav = find_nav(fr.image, fr.client)
     teams = find_team_select(fr.image, fr.client)
     if "cancel" in teams and "store" not in nav:
         log("[drop] открыт выбор стороны — выхожу в меню")
         clicker.click_live("cancel", settle=1.3)
-    fr = clicker.capture_client()
+    fr = _menu_frame(clicker)
     on_store = False
     if fr is not None:
         from cs2_menu.live_ui import find_band
@@ -540,7 +550,7 @@ def review_store_drop(clicker, log=print) -> bool:
     if not on_store:
         clicker.click_live("store", settle=1.1)
     clicker.click_live("store_home", settle=1.0)
-    fr = clicker.capture_client()
+    fr = _menu_frame(clicker)
     cards = find_drop_cards(fr.image, fr.client) if fr else []
     if len(cards) != 4 and fr is not None and "store" in find_nav(fr.image, fr.client):
         from cs2_menu.live_ui import find_green
@@ -566,7 +576,7 @@ def _close_drop_view(clicker, log) -> None:
     from cs2_menu.live_ui import find_inspect_close, find_nav
     from cs2_menu.modal_vision import clear_modals
 
-    fr = clicker.capture_client()
+    fr = _menu_frame(clicker)
     if fr is None:
         return
     if find_nav(fr.image, fr.client):
@@ -577,7 +587,7 @@ def _close_drop_view(clicker, log) -> None:
     except Exception as exc:  # noqa: BLE001
         log(f"[drop]   ESC не отправился ({exc})")
     time.sleep(0.7)
-    fr = clicker.capture_client()
+    fr = _menu_frame(clicker)
     if fr is not None and find_nav(fr.image, fr.client):
         log("[drop]   окно предмета закрыто")
         return
