@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import threading
 import time
@@ -21,6 +22,20 @@ _CAP_SCROLL = 16
 _CAP_BUTTON = 32
 
 _BTN = {"left": 0x110, "right": 0x111}  # BTN_LEFT, BTN_RIGHT
+
+# AnyDesk принимает прямой сеанс на этом порту. Слушающий сокет в ESTABLISHED
+# значит, что смотрят именно этот компьютер, а не что отсюда открыт просмотр.
+_ANYDESK_PORT = 7070
+_INCOMING_MARKERS = (
+    "incoming connection",
+    "incoming session",
+    "accepting incoming",
+)
+_SESSION_END_MARKERS = (
+    "processing done",
+    "session closed",
+    "net socket closed",
+)
 
 
 def _libei():
@@ -260,20 +275,41 @@ class EiInput(GameInput):
         period = 1.0 / self._smooth_hz
         while self._running:
             time.sleep(period)
-            step_x = step_y = 0
-            with self._seg_lock:
-                seg = self._seg
-                if seg is None:
-                    continue
-                dx, dy, t0, t1, ex, ey = seg
-                frac = min(1.0, (time.monotonic() - t0) / max(1e-6, t1 - t0))
-                want_x = int(round(dx * frac))
-                want_y = int(round(dy * frac))
-                step_x, step_y = want_x - ex, want_y - ey
-                seg[4], seg[5] = want_x, want_y
-                if frac >= 1.0:
-                    self._seg = None
-            self._emit_rel(step_x, step_y)
+            self._emit_rel(*self._pop_mouse_step(period))
+
+    def _pop_mouse_step(self, period: float) -> tuple[int, int]:
+        """Один квант сглаживания. Опоздавший поток не выплёвывает весь отрезок сразу.
+
+        AnyDesk грузит процессор, sleep на 500 Гц просыпается пачкой, и без
+        потолка один пакет уносит прицел. В срок шаг меньше потолка и не меняется.
+        """
+        with self._seg_lock:
+            seg = self._seg
+            if seg is None:
+                return 0, 0
+            dx, dy, t0, t1, ex, ey = seg
+            dur = max(1e-6, t1 - t0)
+            frac = min(1.0, (time.monotonic() - t0) / dur)
+            step_x = int(round(dx * frac)) - ex
+            step_y = int(round(dy * frac)) - ey
+            span = math.hypot(dx, dy)
+            cap = max(1.0, span * period / dur * 3.0)
+            mag = math.hypot(step_x, step_y)
+            if mag > cap:
+                scale = cap / mag
+                sx = int(round(step_x * scale))
+                sy = int(round(step_y * scale))
+                if sx == 0 and step_x:
+                    sx = 1 if step_x > 0 else -1
+                if sy == 0 and step_y:
+                    sy = 1 if step_y > 0 else -1
+                step_x, step_y = sx, sy
+            ex += step_x
+            ey += step_y
+            seg[4], seg[5] = ex, ey
+            if ex == dx and ey == dy:
+                self._seg = None
+            return step_x, step_y
 
     def set_mouse_spread(self, seconds: float) -> None:
         self._spread = max(0.002, float(seconds))
@@ -361,19 +397,241 @@ class EiInput(GameInput):
                 self._ei = None
 
 
+def _anydesk_running() -> bool:
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            comm = open(f"/proc/{entry}/comm", encoding="utf-8").read().strip().lower()
+        except OSError:
+            continue
+        if comm == "anydesk" or comm.startswith("anydesk"):
+            return True
+    return False
+
+
+def _tcp_local_established(port: int) -> bool:
+    """Есть принятое TCP-соединение на локальный порт (входящий сеанс)."""
+    needle = f":{port:04X}"
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with lines:
+            next(lines, None)
+            for line in lines:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                local = parts[1].upper()
+                if local.endswith(needle) and parts[3] == "01":
+                    return True
+    return False
+
+
+class _AnyDeskWatch:
+    """Входящий просмотр. Исходящий AnyDesk (смотрим чужой экран) сюда не входит."""
+
+    def __init__(self) -> None:
+        self._logs = (
+            "/var/log/anydesk.trace",
+            os.path.expanduser("~/.anydesk/anydesk.trace"),
+        )
+        self._pos: dict[str, int] = {}
+        self._hosting = False
+
+    def hosting(self) -> bool:
+        if not _anydesk_running():
+            self._hosting = False
+            return False
+        # Старые строки журнала не перечитываем: там чужие сеансы.
+        # Уже открытый прямой просмотр виден по принятому TCP на 7070.
+        self._pump()
+        return _tcp_local_established(_ANYDESK_PORT) or self._hosting
+
+    def _pump(self) -> None:
+        for path in self._logs:
+            try:
+                fh = open(path, "rb")
+            except OSError:
+                continue
+            with fh:
+                if path not in self._pos:
+                    fh.seek(0, os.SEEK_END)
+                    self._pos[path] = fh.tell()
+                    continue
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                if size < self._pos[path]:
+                    self._pos[path] = 0
+                fh.seek(self._pos[path])
+                data = fh.read()
+                self._pos[path] = fh.tell()
+            if not data:
+                continue
+            for raw in data.splitlines():
+                self._fold(raw.decode("utf-8", "replace").lower())
+
+    def _fold(self, line: str) -> None:
+        if any(mark in line for mark in _INCOMING_MARKERS):
+            self._hosting = True
+            return
+        if self._hosting and any(mark in line for mark in _SESSION_END_MARKERS):
+            self._hosting = False
+
+
+class _HostPointerShield:
+    """Пока AnyDesk смотрит этот стол, его мышь не крутит камеру.
+
+    --force-grab-cursor отдаёт gamescope каждое движение хост-курсора как
+    поворот. Просмотр как раз двигает и деформирует этот курсор, поэтому
+    наводка рвётся. Захват указателя забирает эти события себе. Камера бота
+    идёт через libei и от захвата не зависит. Без входящего сеанса стол не трогаем.
+    """
+
+    def __init__(self) -> None:
+        self._watch = _AnyDeskWatch()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._announced = False
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        lib = ctypes.CDLL("libX11.so.6")
+        lib.XInitThreads.restype = ctypes.c_int
+        lib.XInitThreads()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="anydesk-pointer", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(1.5)
+        self._thread = None
+
+    def _loop(self) -> None:
+        x11 = ctypes.CDLL("libX11.so.6")
+        vp = ctypes.c_void_p
+        x11.XOpenDisplay.restype = vp
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        x11.XDefaultRootWindow.argtypes = [vp]
+        x11.XCreateWindow.restype = ctypes.c_ulong
+        x11.XCreateWindow.argtypes = [
+            vp, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+            ctypes.c_uint, ctypes.c_int, ctypes.c_uint, vp, ctypes.c_ulong, ctypes.c_void_p,
+        ]
+        x11.XMapWindow.argtypes = [vp, ctypes.c_ulong]
+        x11.XDestroyWindow.argtypes = [vp, ctypes.c_ulong]
+        x11.XFlush.argtypes = [vp]
+        x11.XGrabPointer.restype = ctypes.c_int
+        x11.XGrabPointer.argtypes = [
+            vp, ctypes.c_ulong, ctypes.c_int, ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+            ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+        ]
+        x11.XUngrabPointer.argtypes = [vp, ctypes.c_ulong]
+        x11.XSetInputFocus.argtypes = [vp, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        x11.XPending.restype = ctypes.c_int
+        x11.XPending.argtypes = [vp]
+        x11.XNextEvent.argtypes = [vp, ctypes.c_void_p]
+        x11.XCloseDisplay.argtypes = [vp]
+
+        class _XSWA(ctypes.Structure):
+            _fields_ = [
+                ("background_pixmap", ctypes.c_ulong),
+                ("background_pixel", ctypes.c_ulong),
+                ("border_pixmap", ctypes.c_ulong),
+                ("border_pixel", ctypes.c_ulong),
+                ("bit_gravity", ctypes.c_int),
+                ("win_gravity", ctypes.c_int),
+                ("backing_store", ctypes.c_int),
+                ("backing_planes", ctypes.c_ulong),
+                ("backing_pixel", ctypes.c_ulong),
+                ("save_under", ctypes.c_int),
+                ("event_mask", ctypes.c_long),
+                ("do_not_propagate_mask", ctypes.c_long),
+                ("override_redirect", ctypes.c_int),
+                ("colormap", ctypes.c_ulong),
+                ("cursor", ctypes.c_ulong),
+            ]
+
+        from cs2_control.gamescope_session import _session_env
+
+        display = _session_env().get("DISPLAY", ":1").encode()
+        dpy = x11.XOpenDisplay(display)
+        if not dpy:
+            return
+        root = x11.XDefaultRootWindow(dpy)
+        attr = _XSWA()
+        attr.override_redirect = 1
+        attr.event_mask = 4 | 8 | 64
+        mask = (1 << 9) | (1 << 11)
+        win = x11.XCreateWindow(dpy, root, -2, -2, 1, 1, 0, 0, 1, None, mask, ctypes.byref(attr))
+        x11.XMapWindow(dpy, win)
+        x11.XFlush(dpy)
+        event = ctypes.create_string_buffer(256)
+        held = False
+        try:
+            while not self._stop.is_set():
+                if not self._watch.hosting():
+                    if held:
+                        x11.XUngrabPointer(dpy, 0)
+                        x11.XFlush(dpy)
+                        held = False
+                    self._stop.wait(0.4)
+                    continue
+                status = x11.XGrabPointer(dpy, win, 0, 4 | 8 | 64, 1, 1, 0, 0, 0)
+                if status != 0:
+                    # Gamescope уже держит курсор: пока окно в фокусе, захват не отдают.
+                    x11.XSetInputFocus(dpy, win, 2, 0)
+                    x11.XFlush(dpy)
+                    self._stop.wait(0.02)
+                    status = x11.XGrabPointer(dpy, win, 0, 4 | 8 | 64, 1, 1, 0, 0, 0)
+                if status == 0:
+                    held = True
+                    if not self._announced:
+                        self._announced = True
+                        print("Камера: мышь AnyDesk отрезана от прицела")
+                    drained = 0
+                    while drained < 200 and x11.XPending(dpy):
+                        x11.XNextEvent(dpy, event)
+                        drained += 1
+                    self._stop.wait(0.05)
+                else:
+                    self._stop.wait(0.05)
+        finally:
+            if held:
+                x11.XUngrabPointer(dpy, 0)
+            x11.XDestroyWindow(dpy, win)
+            x11.XFlush(dpy)
+            x11.XCloseDisplay(dpy)
+
+
 class HybridInput(GameInput):
     """Клавиши и камера — виртуальная мышь gamescope. Курсор рабочего стола не двигается.
 
     Хост-мышь до композита не доходит, поэтому взгляд шлётся в тот же сокет,
     что и клавиши, и не зависит от того, какое окно сейчас наверху.
+    Пока этот стол смотрят через AnyDesk, его курсор ещё и забирается себе:
+    иначе --force-grab-cursor прибавляет чужие рывки к прицелу.
     """
 
     def __init__(self, socket_path: str) -> None:
         self._ei = EiInput(socket_path)
         self._announced = False
+        self._shield = _HostPointerShield()
 
     def prepare(self) -> None:
         self._ei.prepare()
+        self._shield.start()
         if self._announced:
             return
         self._announced = True
@@ -691,5 +949,6 @@ class HybridInput(GameInput):
         return self._field_pointer(fx, fy, click=True)
 
     def close(self) -> None:
+        self._shield.stop()
         self._ei.close()
 

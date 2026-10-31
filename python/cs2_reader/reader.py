@@ -59,6 +59,7 @@ from cs2_reader.account import LocalAccountInfo, is_valid_steam_id64, steam_acco
 from cs2_reader.profile_rank import ProfileRankInfo, ProfileRankReader
 from cs2_reader.schema import Schema
 from cs2_reader.visibility import read_radar_spotted, spotted_by_viewer
+from cs2_reader.enemy_calibration import calibrate_enemy_offsets
 from cs2_reader.vulnerability import read_pawn_vulnerability
 from cs2_reader.weapons import is_healthshot, weapon_name
 
@@ -120,6 +121,9 @@ class Reader:
         self._breakable_map = ""
         self._profile_rank_reader = ProfileRankReader(self.backend, self.schema)
         self._mm_offsets = load_module_offsets("libmatchmaking.so")
+        self._bone_array_in_model_state = BONE_ARRAY_IN_MODEL_STATE
+        self._enemy_calibrate_at = 0.0
+        self._enemy_calibrate_log: list[str] = []
 
     @classmethod
     def from_pid(cls, pid: int) -> "Reader":
@@ -409,7 +413,9 @@ class Reader:
         scene = self.backend.read_u64(pawn + self.schema.m_p_game_scene_node)
         if not scene:
             return None
-        bone_array = self.backend.read_u64(scene + self.schema.m_model_state + BONE_ARRAY_IN_MODEL_STATE)
+        bone_array = self.backend.read_u64(
+            scene + self.schema.m_model_state + self._bone_array_in_model_state
+        )
         if not bone_array:
             return None
         coords = self.backend.read_vec3(bone_array + bone * BONE_STRIDE)
@@ -720,6 +726,8 @@ class Reader:
         return player
 
     def players(self) -> list[PlayerInfo]:
+        if self.local_pawn():
+            calibrate_enemy_offsets(self)
         local_idx = self.local_index()
         local_pawn = self.local_pawn()
         local_team = 0
@@ -955,6 +963,10 @@ class Reader:
         snap.map_name = self.map_name()
         snap.in_game = bool(snap.map_name) and snap.map_name not in ("<empty>", "")
         snap.in_match = bool(self.local_pawn())
+        if snap.in_match:
+            fixes = calibrate_enemy_offsets(self)
+            if fixes:
+                self._enemy_calibrate_log = fixes[-8:]
         snap.build_number = self._read_build_number(engine)
         snap.screen_width = float(self.backend.read_i32(engine + self.offsets.engine.dw_window_width) or 0)
         snap.screen_height = float(self.backend.read_i32(engine + self.offsets.engine.dw_window_height) or 0)
