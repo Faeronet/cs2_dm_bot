@@ -36,6 +36,7 @@ from cs2_reader.offsets import (
     GLOBAL_VARS_MAP_NAME_WINDOWS,
     MAX_PLAYERS,
     Offsets,
+    load_module_offsets,
 )
 from cs2_reader.platform import Platform, client_module_name, detect_platform, engine_module_name
 from cs2_reader.breakables import (
@@ -118,6 +119,7 @@ class Reader:
         self._breakable_cache_at = 0.0
         self._breakable_map = ""
         self._profile_rank_reader = ProfileRankReader(self.backend, self.schema)
+        self._mm_offsets = load_module_offsets("libmatchmaking.so")
 
     @classmethod
     def from_pid(cls, pid: int) -> "Reader":
@@ -225,19 +227,40 @@ class Reader:
             self.schema.m_b_spotted,
         )
 
-    def map_name(self) -> str:
+    def _global_vars_base(self) -> int:
         client = self._client_base()
         if not client:
-            return ""
-        global_vars = self.backend.read_u64(client + self.offsets.client.dw_global_vars)
+            return 0
+        slot = client + self.offsets.client.dw_global_vars
+        gv = self.backend.read_u64(slot) or 0
+        if not gv:
+            return 0
+        if self._map_name_from_global_base(gv):
+            return gv
+        inner = self.backend.read_u64(gv) or 0
+        if inner and 0x10000 < inner <= 0x00007FFFFFFFFFFF:
+            if self._map_name_from_global_base(inner):
+                return inner
+        return gv
+
+    def _map_name_from_global_base(self, global_vars: int) -> str:
         if not global_vars:
             return ""
-
-        # Несколько оффсетов: первый «непустой» часто мусор (не имя карты).
-        # Берём только id вида de_dust2 и предпочитаем оффсет текущей платформы.
         found: list[tuple[int, str]] = []
         seen: set[int] = set()
-        for off in (self._map_name_off, GLOBAL_VARS_MAP_NAME, GLOBAL_VARS_MAP_NAME_WINDOWS, 0x180, 0x188, 0x198):
+        for off in (
+            self._map_name_off,
+            GLOBAL_VARS_MAP_NAME,
+            GLOBAL_VARS_MAP_NAME_WINDOWS,
+            0x170,
+            0x178,
+            0x180,
+            0x188,
+            0x190,
+            0x198,
+            0x1A0,
+            0x1B8,
+        ):
             if off in seen:
                 continue
             seen.add(off)
@@ -249,6 +272,27 @@ class Reader:
             if off == self._map_name_off:
                 return token
         return found[0][1] if found else ""
+
+    def _map_name_from_matchmaking(self) -> str:
+        base = self.backend.module_base("libmatchmaking.so")
+        off = self._mm_offsets.get("dwGameTypes_mapName", 0)
+        if not base or not off:
+            return ""
+        ptr = self.backend.read_u64(base + off) or 0
+        if not ptr or ptr < 0x10000 or ptr > 0x00007FFFFFFFFFFF:
+            return ""
+        raw = self.backend.read_string(ptr, 64)
+        if not raw or "<empty>" in raw:
+            return ""
+        return _map_id(raw)
+
+    def map_name(self) -> str:
+        gv = self._global_vars_base()
+        if gv:
+            name = self._map_name_from_global_base(gv)
+            if name:
+                return name
+        return self._map_name_from_matchmaking()
 
     def view_matrix(self) -> ViewMatrix | None:
         client = self._client_base()

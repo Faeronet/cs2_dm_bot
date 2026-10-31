@@ -145,11 +145,29 @@ def launch_until_spawn(
     shots: bool = False,
     log_fn=log,
 ) -> int:
-    """Меню → официальный DM (группа Alpha) → выбор команды → спавн.
+    """Меню → официальный DM (группа Alpha) → выбор команды → spавн.
 
     0 — заспавнился, 2 — карта не загрузилась, 3 — команда/спавн не случились.
     Меню не закрывает: вызывающий владеет MenuController и вводом.
     """
+    sig0 = _signals(reader)
+    if sig0["map_loaded"]:
+        log_fn(f"уже на карте {normalize_map(sig0['map'])!r} — меню и GO не трогаю")
+        return wait_spawn(reader, menu, shots=shots, log_fn=log_fn)
+    if sig0["pawn"] and sig0["health"] > 0 and sig0["life_state"] == 0:
+        log_fn(
+            "pawn уже в игре, но map_name пустой — не жму GO, жду имя карты из памяти "
+            "(если долго: scripts/update_offsets.py при запущенном CS2)"
+        )
+        wait_map = time.monotonic() + 90.0
+        while time.monotonic() < wait_map:
+            sig = _signals(reader)
+            if sig["map_loaded"]:
+                return wait_spawn(reader, menu, shots=shots, log_fn=log_fn)
+            time.sleep(1.0)
+        log_fn("map_name так и не появился — обнови offsets")
+        return 2
+
     driver = UIStateReader(reader)
     env = menu.executor._xdo_env()
     clicker = ScreenClicker(menu.executor.menu_input, env=env)

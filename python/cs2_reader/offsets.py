@@ -100,6 +100,15 @@ def _parse_module_offsets(module_data: dict | list) -> dict[str, int]:
     return module_data
 
 
+def load_module_offsets(module: str, path: Path | None = None) -> dict[str, int]:
+    path = path or offsets_file()
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    data = raw.get(module, [])
+    if isinstance(data, list):
+        return {item["name"]: item["value"] for item in data}
+    return data if isinstance(data, dict) else {}
+
+
 ENTITY_LIST_ENTRY_SIZE = 0x70
 ENTITY_LIST_CHUNK_OFFSET = 0x0  # Linux native: dwEntityList == GES+0x10
 ENTITY_LIST_CHUNK_OFFSET_WINDOWS = 0x10

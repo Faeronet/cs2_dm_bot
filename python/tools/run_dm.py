@@ -272,6 +272,23 @@ def ensure_spawned(reader: Reader, menu: MenuController, *, shots: bool) -> str 
     if sig["map_loaded"] and sig["alive_fast"]:
         log(f"уже в бою: {normalize_map(sig['map'])}")
         return normalize_map(sig["map"])
+    if sig["pawn"] and sig["health"] > 0 and sig["life_state"] == 0 and not sig["map_loaded"]:
+        log(
+            "pawn в матче, map_name не читается — жду до 90с "
+            "(офсеты: scripts/update_offsets.py при запущенном CS2)"
+        )
+        deadline = time.monotonic() + 90.0
+        while time.monotonic() < deadline:
+            sig = _signals(reader)
+            if sig["map_loaded"] and sig["alive_fast"]:
+                return normalize_map(sig["map"])
+            if sig["map_loaded"]:
+                code = wait_spawn(reader, menu, shots=shots, log_fn=log)
+                if code == 0:
+                    return normalize_map(_signals(reader)["map"])
+            time.sleep(1.0)
+        log("map_name так и не появился — обнови data/offsets.json")
+        return None
     if sig["map_loaded"]:
         log(f"карта {normalize_map(sig['map'])} загружена — ждём команду/спавн")
         code = wait_spawn(reader, menu, shots=shots, log_fn=log)
