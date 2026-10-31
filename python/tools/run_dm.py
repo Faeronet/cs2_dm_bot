@@ -272,23 +272,32 @@ def ensure_spawned(reader: Reader, menu: MenuController, *, shots: bool) -> str 
     if sig["map_loaded"] and sig["alive_fast"]:
         log(f"уже в бою: {normalize_map(sig['map'])}")
         return normalize_map(sig["map"])
-    if sig["pawn"] and sig["health"] > 0 and sig["life_state"] == 0 and not sig["map_loaded"]:
-        log(
-            "pawn в матче, map_name не читается — жду до 90с "
-            "(офсеты: scripts/update_offsets.py при запущенном CS2)"
-        )
-        deadline = time.monotonic() + 90.0
+    if sig["in_world"] or sig["map_loaded"]:
+        if sig["in_world"] and not sig["map_loaded"]:
+            log("уже в матче — поиск не запускаю, читаю карту")
+        deadline = time.monotonic() + 25.0
         while time.monotonic() < deadline:
             sig = _signals(reader)
             if sig["map_loaded"] and sig["alive_fast"]:
                 return normalize_map(sig["map"])
             if sig["map_loaded"]:
-                code = wait_spawn(reader, menu, shots=shots, log_fn=log)
-                if code == 0:
-                    return normalize_map(_signals(reader)["map"])
-            time.sleep(1.0)
-        log("map_name так и не появился — обнови data/offsets.json")
-        return None
+                break
+            if not sig["in_world"]:
+                break
+            time.sleep(0.5)
+        sig = _signals(reader)
+        if sig["map_loaded"]:
+            log(f"карта {normalize_map(sig['map'])} загружена — ждём команду/спавн")
+            code = wait_spawn(reader, menu, shots=shots, log_fn=log)
+            sig = _signals(reader)
+            if code == 0 and sig["map_loaded"]:
+                return normalize_map(sig["map"])
+            if sig["map_loaded"]:
+                log("на карте, но ещё не заспавнился — не трогаю меню, повтор ожидания")
+                return None
+        if sig["in_world"]:
+            log("в матче, имя карты пустое — поиск не жму, повтор через паузу")
+            return None
     if sig["map_loaded"]:
         log(f"карта {normalize_map(sig['map'])} загружена — ждём команду/спавн")
         code = wait_spawn(reader, menu, shots=shots, log_fn=log)

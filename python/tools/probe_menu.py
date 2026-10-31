@@ -121,7 +121,10 @@ def read_menu_state(reader: Reader) -> dict:
     win_w = win_h = 0
     if eng:
         # offsets из data/offsets.json (актуальны для текущего дампа)
-        win_w = b.read_u32(eng + 10490208) or 0
+        from cs2_reader.offsets import load_module_offsets
+
+        eng_off = load_module_offsets("libengine2.so")
+        win_w = b.read_u32(eng + eng_off.get("dwWindowWidth", 0)) or 0
         win_h = b.read_u32(eng + 10490212) or 0
 
     snap = reader.capture()

@@ -278,6 +278,10 @@ class Reader:
         off = self._mm_offsets.get("dwGameTypes_mapName", 0)
         if not base or not off:
             return ""
+        # В дампе это часто сама строка в модуле, а не указатель.
+        inline = _map_id(self.backend.read_string(base + off, 64))
+        if inline:
+            return inline
         ptr = self.backend.read_u64(base + off) or 0
         if not ptr or ptr < 0x10000 or ptr > 0x00007FFFFFFFFFFF:
             return ""
@@ -292,7 +296,32 @@ class Reader:
             name = self._map_name_from_global_base(gv)
             if name:
                 return name
-        return self._map_name_from_matchmaking()
+        name = self._map_name_from_matchmaking()
+        if name:
+            return name
+        # Широкий поиск только с pawn: в меню в объекте остаётся имя прошлой карты.
+        if gv and self.local_pawn():
+            return self._scan_map_name(gv)
+        return ""
+
+    def _scan_map_name(self, global_vars: int) -> str:
+        """Имя карты сдвинулось внутри CGlobalVars — один проход по объекту, оффсет запоминается."""
+        cached = getattr(self, "_map_scan_off", None)
+        if isinstance(cached, int):
+            token = _map_id(self.backend.read_cstring_ptr(global_vars + cached))
+            if token:
+                return token
+        now = time.monotonic()
+        if now < getattr(self, "_map_scan_next", 0.0):
+            return ""
+        self._map_scan_next = now + 1.0
+        for off in range(0x100, 0x280, 8):
+            token = _map_id(self.backend.read_cstring_ptr(global_vars + off))
+            if not token:
+                continue
+            self._map_scan_off = off
+            return token
+        return ""
 
     def view_matrix(self) -> ViewMatrix | None:
         client = self._client_base()
@@ -340,13 +369,37 @@ class Reader:
     def local_on_ladder(self) -> bool:
         return self.local_move_type() in (8, 9)
 
+    @staticmethod
+    def _plausible_eye_angles(pitch: float, yaw: float, roll: float) -> bool:
+        if not (-89.0 <= pitch <= 89.0 and -360.0 <= yaw <= 360.0 and abs(roll) <= 45.0):
+            return False
+        # Сломанная схема часто даёт мусор около (0, 0, ±0.5).
+        if abs(pitch) < 1.5 and abs(yaw) < 1.5 and abs(roll) < 1.0:
+            return False
+        return True
+
     def local_eye_angles(self) -> Vec3:
         """pitch=X, yaw=Y, roll=Z (m_angEyeAngles)."""
         pawn = self.local_pawn()
         if not pawn:
             return Vec3()
-        eye = self.backend.read_vec3(pawn + self.schema.m_ang_eye_angles)
-        return Vec3(*eye) if eye else Vec3()
+        base = self.schema.m_ang_eye_angles
+        for delta in (0, -16, 16, -32, 32):
+            off = base + delta
+            if off < 0:
+                continue
+            eye = self.backend.read_vec3(pawn + off)
+            if not eye:
+                continue
+            pitch, yaw, roll = eye
+            if self._plausible_eye_angles(pitch, yaw, roll):
+                return Vec3(pitch, yaw, roll)
+        scene = self.backend.read_u64(pawn + self.schema.m_p_game_scene_node)
+        if scene:
+            rot = self.backend.read_vec3(scene + self.schema.m_ang_abs_rotation)
+            if rot:
+                return Vec3(0.0, rot[1], 0.0)
+        return Vec3()
 
     def pawn_view_offset(self, pawn: int) -> Vec3:
         off = self.backend.read_vec3(pawn + self.schema.m_vec_view_offset)

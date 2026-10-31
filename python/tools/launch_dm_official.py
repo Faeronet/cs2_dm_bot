@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import time
@@ -80,11 +81,19 @@ def _signals(reader: Reader) -> dict:
     ctrl_team = _ri32(ctrl, s.m_i_team_num)
     life = reader.read_local_life()
     map_loaded = _valid_map(mp)
+    try:
+        pos = reader.local_position()
+        on_map = math.hypot(pos.x, pos.y) > 64.0
+    except Exception:  # noqa: BLE001
+        on_map = False
+    # Уже на сервере: живой pawn или точка на карте. Очередь и меню так не выглядят.
+    in_world = bool(pawn) and (on_map or (life.health > 0 and life.life_state == 0))
     # «быстрый» спавн — не ждём отстающий флаг контроллера, но страхуемся картой
     alive_fast = map_loaded and life.health > 0 and life.life_state == 0
     return {
         "map": mp,
         "map_loaded": map_loaded,
+        "in_world": in_world,
         "pawn": pawn,
         "ctrl": ctrl,
         "team": team,
@@ -151,22 +160,12 @@ def launch_until_spawn(
     Меню не закрывает: вызывающий владеет MenuController и вводом.
     """
     sig0 = _signals(reader)
-    if sig0["map_loaded"]:
-        log_fn(f"уже на карте {normalize_map(sig0['map'])!r} — меню и GO не трогаю")
-        return wait_spawn(reader, menu, shots=shots, log_fn=log_fn)
-    if sig0["pawn"] and sig0["health"] > 0 and sig0["life_state"] == 0:
-        log_fn(
-            "pawn уже в игре, но map_name пустой — не жму GO, жду имя карты из памяти "
-            "(если долго: scripts/update_offsets.py при запущенном CS2)"
-        )
-        wait_map = time.monotonic() + 90.0
-        while time.monotonic() < wait_map:
-            sig = _signals(reader)
-            if sig["map_loaded"]:
-                return wait_spawn(reader, menu, shots=shots, log_fn=log_fn)
-            time.sleep(1.0)
-        log_fn("map_name так и не появился — обнови offsets")
-        return 2
+    if sig0["map_loaded"] or sig0["in_world"]:
+        if sig0["map_loaded"]:
+            log_fn(f"уже на карте {normalize_map(sig0['map'])!r} — меню и GO не трогаю")
+        else:
+            log_fn("уже в матче (pawn на карте) — поиск не запускаю, читаю имя карты")
+        return _finish_loaded_match(reader, menu, shots=shots, log_fn=log_fn)
 
     driver = UIStateReader(reader)
     env = menu.executor._xdo_env()
@@ -197,18 +196,39 @@ def launch_until_spawn(
     map_deadline = map_start + 120
     while time.monotonic() < map_deadline:
         sig = _signals(reader)
-        if sig["map_loaded"]:
-            log_fn(f"карта загружена: {sig['map']!r}")
+        if sig["map_loaded"] or sig["in_world"]:
+            if sig["in_world"] and not sig["map_loaded"]:
+                log_fn("матч уже идёт — очередь больше не жду")
+            else:
+                log_fn(f"карта загружена: {sig['map']!r}")
             break
-        time.sleep(2.0)
+        time.sleep(1.0)
     else:
         root_shot(env, "/tmp/dmof_result.png")
         log_fn("карта не загрузилась за отведённое время — СТОП "
                "(ошибка матчмейкинга / нет сети / долгий поиск).")
         return 2
 
-    code = wait_spawn(reader, menu, shots=shots, log_fn=log_fn)
-    return code
+    return _finish_loaded_match(reader, menu, shots=shots, log_fn=log_fn)
+
+
+def _finish_loaded_match(reader: Reader, menu: MenuController, *, shots: bool, log_fn) -> int:
+    """Матч уже есть. Дочитать имя карты и дождаться спавна, не нажимая GO."""
+    deadline = time.monotonic() + 25.0
+    while time.monotonic() < deadline:
+        sig = _signals(reader)
+        if sig["map_loaded"]:
+            return wait_spawn(reader, menu, shots=shots, log_fn=log_fn)
+        if not sig["in_world"] and not sig["map_loaded"]:
+            log_fn("вышли с сервера, пока читал карту")
+            return 2
+        time.sleep(0.5)
+    sig = _signals(reader)
+    log_fn(
+        f"в матче, имя карты пустое (pawn={sig['pawn']} h={sig['health']} "
+        f"ls={sig['life_state']}) — поиск не жму"
+    )
+    return 2
 
 
 def wait_spawn(

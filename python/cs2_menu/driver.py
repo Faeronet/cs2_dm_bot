@@ -9,14 +9,15 @@ from pathlib import Path
 
 from cs2_menu.models import MenuPhase, UIState
 from cs2_reader.ladders import entity_designer_name
+from cs2_reader.offsets import load_module_offsets
 from cs2_reader.reader import MAX_ENTITIES, Reader
 
 ROOT = Path(__file__).resolve().parents[2]
 MAX_PTR = 0x00007FFFFFFFFFFF
 
-# offsets engine window (из data/offsets.json)
-_ENGINE_WIN_W = 10490208
-_ENGINE_WIN_H = 10490212
+_engine_off = load_module_offsets("libengine2.so")
+_ENGINE_WIN_W = _engine_off.get("dwWindowWidth", 0)
+_ENGINE_WIN_H = _engine_off.get("dwWindowHeight", 0)
 
 
 def _load_json_offsets(module: str) -> dict[str, int]:
