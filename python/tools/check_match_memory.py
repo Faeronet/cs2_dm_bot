@@ -29,10 +29,12 @@ def main() -> int:
     print(f"pos=({pos.x:.0f},{pos.y:.0f},{pos.z:.0f}) eye pitch={ang.x:.1f} yaw={ang.y:.1f}")
     if abs(ang.y) < 2.0 and abs(ang.x) < 2.0:
         print("WARN: eye angles подозрительно малы — обнови data/libclient.so.json (cs2-dumper)")
-    if sig["map_loaded"] and sig["alive_fast"]:
-        print("OK: бот должен стартовать без меню/GO")
-    elif sig["map_loaded"] or sig["in_world"]:
-        print("WARN: уже в матче, бот не должен жать GO")
+    print(f"on_server={sig.get('on_server')} alive_fast={sig.get('alive_fast')}")
+    print(f"resolved_map={r.resolved_map_name()!r}")
+    if sig["alive_fast"]:
+        print("OK: в бою — бот должен стартовать без меню/GO")
+    elif sig.get("on_server") or sig["map_loaded"] or sig["in_world"]:
+        print("WARN: уже на сервере, бот не должен жать GO")
     else:
         print("INFO: не в матче (меню/очередь)")
     return 0

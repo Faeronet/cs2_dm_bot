@@ -72,7 +72,7 @@ def _signals(reader: Reader) -> dict:
             return 0
 
     try:
-        mp = reader.map_name()
+        mp = reader.resolved_map_name() or reader.map_name()
     except Exception:  # noqa: BLE001
         mp = ""
     pawn = reader.local_pawn() or 0
@@ -88,11 +88,13 @@ def _signals(reader: Reader) -> dict:
         on_map = False
     # Уже на сервере: живой pawn или точка на карте. Очередь и меню так не выглядят.
     in_world = bool(pawn) and (on_map or (life.health > 0 and life.life_state == 0))
-    # «быстрый» спавн — не ждём отстающий флаг контроллера, но страхуемся картой
-    alive_fast = map_loaded and life.health > 0 and life.life_state == 0
+    # «быстрый» спавн — имя карты может отставать; достаточно pawn на карте
+    alive_fast = life.health > 0 and life.life_state == 0 and (map_loaded or in_world)
+    on_server = map_loaded or in_world
     return {
         "map": mp,
         "map_loaded": map_loaded,
+        "on_server": on_server,
         "in_world": in_world,
         "pawn": pawn,
         "ctrl": ctrl,
@@ -160,9 +162,11 @@ def launch_until_spawn(
     Меню не закрывает: вызывающий владеет MenuController и вводом.
     """
     sig0 = _signals(reader)
-    if sig0["map_loaded"] or sig0["in_world"]:
+    if sig0["on_server"] or sig0["alive_fast"]:
         if sig0["map_loaded"]:
             log_fn(f"уже на карте {normalize_map(sig0['map'])!r} — меню и GO не трогаю")
+        elif sig0["alive_fast"]:
+            log_fn("уже в бою — меню и GO не трогаю")
         else:
             log_fn("уже в матче (pawn на карте) — поиск не запускаю, читаю имя карты")
         return _finish_loaded_match(reader, menu, shots=shots, log_fn=log_fn)
@@ -196,8 +200,10 @@ def launch_until_spawn(
     map_deadline = map_start + 120
     while time.monotonic() < map_deadline:
         sig = _signals(reader)
-        if sig["map_loaded"] or sig["in_world"]:
-            if sig["in_world"] and not sig["map_loaded"]:
+        if sig["on_server"] or sig["alive_fast"]:
+            if sig["alive_fast"] and not sig["map_loaded"]:
+                log_fn("матч уже идёт (pawn жив) — очередь больше не жду")
+            elif sig["in_world"] and not sig["map_loaded"]:
                 log_fn("матч уже идёт — очередь больше не жду")
             else:
                 log_fn(f"карта загружена: {sig['map']!r}")
@@ -214,16 +220,18 @@ def launch_until_spawn(
 
 def _finish_loaded_match(reader: Reader, menu: MenuController, *, shots: bool, log_fn) -> int:
     """Матч уже есть. Дочитать имя карты и дождаться спавна, не нажимая GO."""
-    deadline = time.monotonic() + 25.0
+    deadline = time.monotonic() + 45.0
     while time.monotonic() < deadline:
         sig = _signals(reader)
-        if sig["map_loaded"]:
+        if sig["map_loaded"] or sig["alive_fast"] or sig["on_server"]:
             return wait_spawn(reader, menu, shots=shots, log_fn=log_fn)
-        if not sig["in_world"] and not sig["map_loaded"]:
+        if not sig["on_server"]:
             log_fn("вышли с сервера, пока читал карту")
             return 2
         time.sleep(0.5)
     sig = _signals(reader)
+    if sig["on_server"] or sig["alive_fast"]:
+        return wait_spawn(reader, menu, shots=shots, log_fn=log_fn)
     log_fn(
         f"в матче, имя карты пустое (pawn={sig['pawn']} h={sig['health']} "
         f"ls={sig['life_state']}) — поиск не жму"
@@ -249,12 +257,17 @@ def wait_spawn(
     prev_key = None
     shot_team = False
     strict_at = fast_at = 0.0
+    off_server_streak = 0
     while time.monotonic() < spawn_deadline:
         sig = _signals(reader)
         now = time.monotonic()
-        if not sig["map_loaded"]:
-            log_fn("карта пропала до спавна — вернулись в меню")
-            return 3
+        if not sig["on_server"]:
+            off_server_streak += 1
+            if off_server_streak >= 8:
+                log_fn("карта пропала до спавна — вернулись в меню")
+                return 3
+        else:
+            off_server_streak = 0
         if sig["alive_fast"] and not fast_at:
             fast_at = now
         if sig["alive"] and not strict_at:
@@ -269,7 +282,7 @@ def wait_spawn(
         if sig["alive_fast"]:
             break
         team_assigned = sig["team"] in (2, 3) or sig["ctrl_team"] in (2, 3)
-        need_team = sig["map_loaded"] and not team_assigned
+        need_team = sig["on_server"] and not team_assigned and not sig["alive_fast"]
         if need_team:
             if not shot_team and shots:
                 root_shot(env, "/tmp/dmof_teamselect.png")

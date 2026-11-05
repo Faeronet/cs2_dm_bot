@@ -269,33 +269,50 @@ def dismiss_errors(menu: MenuController, reader: Reader) -> None:
 def ensure_spawned(reader: Reader, menu: MenuController, *, shots: bool) -> str | None:
     """Вернуть имя карты, когда игрок заспавнился. None — не вышло."""
     sig = _signals(reader)
-    if sig["map_loaded"] and sig["alive_fast"]:
-        log(f"уже в бою: {normalize_map(sig['map'])}")
-        return normalize_map(sig["map"])
-    if sig["in_world"] or sig["map_loaded"]:
+    if sig["alive_fast"]:
+        name = normalize_map(sig["map"]) or normalize_map(reader.resolved_map_name())
+        if name:
+            log(f"уже в бою: {name}")
+            return name
+        if sig["on_server"]:
+            log("уже в бою, имя карты дочитываю — меню не трогаю")
+            code = wait_spawn(reader, menu, shots=shots, log_fn=log)
+            if code == 0:
+                return normalize_map(_signals(reader)["map"]) or normalize_map(reader.resolved_map_name())
+    if sig["on_server"] or sig["in_world"] or sig["map_loaded"]:
         if sig["in_world"] and not sig["map_loaded"]:
             log("уже в матче — поиск не запускаю, читаю карту")
         deadline = time.monotonic() + 25.0
         while time.monotonic() < deadline:
             sig = _signals(reader)
-            if sig["map_loaded"] and sig["alive_fast"]:
-                return normalize_map(sig["map"])
+            if sig["alive_fast"]:
+                name = normalize_map(sig["map"]) or normalize_map(reader.resolved_map_name())
+                if name:
+                    return name
             if sig["map_loaded"]:
                 break
-            if not sig["in_world"]:
+            if not sig["on_server"]:
                 break
             time.sleep(0.5)
         sig = _signals(reader)
-        if sig["map_loaded"]:
-            log(f"карта {normalize_map(sig['map'])} загружена — ждём команду/спавн")
+        if sig["on_server"] or sig["map_loaded"]:
+            m = normalize_map(sig["map"]) or normalize_map(reader.resolved_map_name())
+            if m:
+                log(f"карта {m} — ждём команду/спавн")
+            else:
+                log("на сервере — ждём имя карты/спавн")
             code = wait_spawn(reader, menu, shots=shots, log_fn=log)
             sig = _signals(reader)
-            if code == 0 and sig["map_loaded"]:
-                return normalize_map(sig["map"])
-            if sig["map_loaded"]:
-                log("на карте, но ещё не заспавнился — не трогаю меню, повтор ожидания")
+            if code == 0:
+                return (
+                    normalize_map(sig["map"])
+                    or normalize_map(reader.resolved_map_name())
+                    or m
+                )
+            if sig["on_server"]:
+                log("на сервере, но ещё не заспавнился — не трогаю меню, повтор ожидания")
                 return None
-        if sig["in_world"]:
+        if sig["on_server"] or sig["in_world"]:
             log("в матче, имя карты пустое — поиск не жму, повтор через паузу")
             return None
     if sig["map_loaded"]:
@@ -339,7 +356,8 @@ def load_coord_map(map_name: str, cache: dict[str, CoordinateMap]) -> Coordinate
 
 
 def _on_server(reader: Reader) -> bool:
-    return bool(_signals(reader)["map_loaded"])
+    sig = _signals(reader)
+    return bool(sig["on_server"] or sig["map_loaded"])
 
 
 def _pause_leave_point(clicker) -> tuple[float, float]:

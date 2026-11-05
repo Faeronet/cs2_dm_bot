@@ -60,6 +60,7 @@ from cs2_reader.profile_rank import ProfileRankInfo, ProfileRankReader
 from cs2_reader.schema import Schema
 from cs2_reader.visibility import read_radar_spotted, spotted_by_viewer
 from cs2_reader.enemy_calibration import calibrate_enemy_offsets
+from cs2_reader.match_calibration import calibrate_match_offsets
 from cs2_reader.vulnerability import read_pawn_vulnerability
 from cs2_reader.weapons import is_healthshot, weapon_name
 
@@ -124,6 +125,8 @@ class Reader:
         self._bone_array_in_model_state = BONE_ARRAY_IN_MODEL_STATE
         self._enemy_calibrate_at = 0.0
         self._enemy_calibrate_log: list[str] = []
+        self._match_calibrate_at = 0.0
+        self._last_map_name = ""
 
     @classmethod
     def from_pid(cls, pid: int) -> "Reader":
@@ -299,13 +302,29 @@ class Reader:
         if gv:
             name = self._map_name_from_global_base(gv)
             if name:
+                self._last_map_name = name
                 return name
         name = self._map_name_from_matchmaking()
         if name:
+            self._last_map_name = name
             return name
         # Широкий поиск только с pawn: в меню в объекте остаётся имя прошлой карты.
         if gv and self.local_pawn():
-            return self._scan_map_name(gv)
+            scanned = self._scan_map_name(gv)
+            if scanned:
+                self._last_map_name = scanned
+                return scanned
+        return ""
+
+    def resolved_map_name(self) -> str:
+        """Карта для матч-детекта: GlobalVars → matchmaking → последняя известная (если pawn на сервере)."""
+        name = _map_id(self.map_name())
+        if name:
+            return name
+        if self.local_pawn():
+            pos = self.local_position()
+            if abs(pos.x) + abs(pos.y) > 64.0 and self._last_map_name:
+                return self._last_map_name
         return ""
 
     def _scan_map_name(self, global_vars: int) -> str:
@@ -960,9 +979,16 @@ class Reader:
         snap.platform = self.offsets.platform
         snap.client_base = client
         snap.engine_base = engine
-        snap.map_name = self.map_name()
-        snap.in_game = bool(snap.map_name) and snap.map_name not in ("<empty>", "")
+        calibrate_match_offsets(self)
+        snap.map_name = self.resolved_map_name() or self.map_name()
         snap.in_match = bool(self.local_pawn())
+        snap.in_game = bool(snap.map_name) and snap.map_name not in ("<empty>", "")
+        if not snap.in_game and snap.in_match:
+            pos = self.local_position()
+            if abs(pos.x) + abs(pos.y) > 64.0:
+                snap.in_game = True
+                if not snap.map_name and self._last_map_name:
+                    snap.map_name = self._last_map_name
         if snap.in_match:
             fixes = calibrate_enemy_offsets(self)
             if fixes:

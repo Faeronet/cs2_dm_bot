@@ -105,23 +105,10 @@ class UIStateReader:
         return ctx, hashlib.md5(blob).hexdigest()[:16]
 
     def _matchmaking_map(self) -> str:
-        b = self.reader.backend
-        base = b.module_base("libmatchmaking.so")
-        off = self._mm_off.get("dwGameTypes_mapName", 0)
-        if not base or not off:
+        try:
+            return self.reader._map_name_from_matchmaking() or ""
+        except Exception:
             return ""
-        ptr = _usable_ptr(b.read_u64(base + off))
-        if not ptr:
-            return ""
-        raw = b.read_string(ptr, 64)
-        if not raw:
-            return ""
-        # иногда мусор + "<empty>"
-        if "<empty>" in raw:
-            return "<empty>"
-        if raw.isprintable() and raw.startswith("de_"):
-            return raw
-        return ""
 
     def _window_memory(self) -> tuple[int, int]:
         b = self.reader.backend
