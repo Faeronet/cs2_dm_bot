@@ -51,6 +51,26 @@ MOUSE_BUTTONS = {
 }
 
 
+def seg_pos(total: float, v0: float, dur: float, t: float) -> float:
+    """Путь внутри одного тика контроллера, px от начала тика.
+
+    Кубическая Эрмита: на входе скорость v0 (конец прошлого тика), на выходе — средняя скорость
+    этого тика total/dur, так что весь путь тика равен total. Скорость непрерывна на стыке тиков,
+    поэтому 40 Гц не дают ступенек скорости (раньше равномерный размаз давал рывок на каждом тике).
+    """
+    s = min(1.0, max(0.0, t / max(1e-6, dur)))
+    return dur * v0 * (s * s * s - 2.0 * s * s + s) + total * (2.0 * s * s - s * s * s)
+
+
+def _take_px(carry: list[float], dx: float, dy: float) -> tuple[int, int]:
+    """Целые пиксели из дробной дельты; остаток копится в carry, а не выбрасывается."""
+    want_x = carry[0] + dx
+    want_y = carry[1] + dy
+    px, py = int(round(want_x)), int(round(want_y))
+    carry[0], carry[1] = want_x - px, want_y - py
+    return px, py
+
+
 class GameInput:
     """WASD + мышь. Не запускать от root."""
 
@@ -142,6 +162,8 @@ class EvdevInput(GameInput):
         self._spread = 0.025                 # с: за сколько «доехать» дельту одного тика
         self._seg: list | None = None        # [dx, dy, t0, t1, emitted_x, emitted_y]
         self._seg_lock = threading.Lock()
+        self._carry = [0.0, 0.0]             # дробный остаток пикселей, пока сглаживание на паузе
+        self._closed = False
         self._running = smooth_hz > 0
         if self._running:
             self._thread = threading.Thread(target=self._mouse_loop, name="mouse-smooth", daemon=True)
@@ -165,20 +187,26 @@ class EvdevInput(GameInput):
 
     def _mouse_loop(self) -> None:
         period = 1.0 / self._smooth_hz
-        while self._running:
+        # поток живёт до close(): пауза (_running=False, клики меню) его не убивает,
+        # иначе после первого же меню камера до конца сессии шла рывками целыми тиками
+        while not self._closed:
             time.sleep(period)
             step_x = step_y = 0
             with self._seg_lock:
+                if not self._running:
+                    self._seg = None
+                    continue
                 seg = self._seg
                 if seg is None:
                     continue
-                dx, dy, t0, t1, ex, ey = seg
-                frac = min(1.0, (time.monotonic() - t0) / max(1e-6, t1 - t0))
-                want_x = int(round(dx * frac))
-                want_y = int(round(dy * frac))
+                dx, dy, t0, t1, ex, ey, v0x, v0y = seg
+                dur = t1 - t0
+                t = time.monotonic() - t0
+                want_x = int(round(seg_pos(dx, v0x, dur, t)))
+                want_y = int(round(seg_pos(dy, v0y, dur, t)))
                 step_x, step_y = want_x - ex, want_y - ey
                 seg[4], seg[5] = want_x, want_y
-                if frac >= 1.0:
+                if t >= dur and want_x == round(dx) and want_y == round(dy):
                     self._seg = None
             self._emit_rel(step_x, step_y)
 
@@ -226,18 +254,25 @@ class EvdevInput(GameInput):
         if not dx and not dy:
             return
         if not self._running:
-            self._emit_rel(int(dx), int(dy))
+            self._emit_rel(*_take_px(self._carry, dx, dy))
             return
         now = time.monotonic()
         with self._seg_lock:
-            rem_x = rem_y = 0
+            rem_x = rem_y = 0.0
+            v0x = v0y = 0.0
             if self._seg is not None:
-                # недоехавший остаток прошлого тика переносим в новый отрезок
-                rem_x = self._seg[0] - self._seg[4]
-                rem_y = self._seg[1] - self._seg[5]
-            self._seg = [int(dx) + rem_x, int(dy) + rem_y, now, now + self._spread, 0, 0]
+                # недоехавший остаток прошлого тика переносим в новый отрезок;
+                # скорость входа — конечная скорость прошлого тика (без ступеньки)
+                old = self._seg
+                rem_x = old[0] - old[4]
+                rem_y = old[1] - old[5]
+                old_dur = max(1e-6, old[3] - old[2])
+                v0x = old[0] / old_dur
+                v0y = old[1] / old_dur
+            self._seg = [float(dx) + rem_x, float(dy) + rem_y, now, now + self._spread, 0, 0, v0x, v0y]
 
     def close(self) -> None:
+        self._closed = True
         self._running = False
         seg = None
         with self._seg_lock:
@@ -245,7 +280,7 @@ class EvdevInput(GameInput):
                 seg = self._seg
                 self._seg = None
         if seg is not None:
-            self._emit_rel(seg[0] - seg[4], seg[1] - seg[5])
+            self._emit_rel(round(seg[0]) - seg[4], round(seg[1]) - seg[5])
         self.release_all()
         self._ui.close()
 
@@ -267,6 +302,7 @@ class XdotoolInput(GameInput):
         else:
             self._bin = XDOTOOL
         self._env = self._xdotool_env()
+        self._carry = [0.0, 0.0]
         print("Ввод: evdev (клавиши) + xdotool (мышь)")
 
     def _xdotool_env(self) -> dict[str, str]:
@@ -295,7 +331,7 @@ class XdotoolInput(GameInput):
     def mouse_move(self, dx: int, dy: int) -> None:
         if not dx and not dy:
             return
-        dx, dy = int(dx), int(dy)
+        dx, dy = _take_px(self._carry, dx, dy)
         chunk = self.MOUSE_CHUNK
         while dx or dy:
             step_x = max(-chunk, min(chunk, dx))

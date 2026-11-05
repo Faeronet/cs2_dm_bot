@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cs2_reader.life import LIFE_ALIVE
+from cs2_reader.runtime_tweaks import apply_tweaks, save_tweaks
 from cs2_reader.offsets import (
     ENTITY_LIST_CHUNK_OFFSET,
     ENTITY_LIST_CHUNK_OFFSET_WINDOWS,
@@ -154,6 +155,7 @@ def calibrate_match_offsets(
     force: bool = False,
 ) -> list[str]:
     """Fix entity-list chunk; scan pawn/globalvars; optional cs2-dumper."""
+    apply_tweaks(reader)
     pawn = reader.local_pawn()
     broken = not _usable_ptr(pawn) or not _sane_health(
         reader.backend.read_i32(pawn + reader.schema.m_i_health) if pawn else None
@@ -183,6 +185,7 @@ def calibrate_match_offsets(
         lp_off = scan_local_pawn_offset(reader)
         if lp_off is not None:
             reader._dw_local_player_pawn = lp_off
+            save_tweaks(dw_local_player_pawn=lp_off)
             pawn = reader.local_pawn()
             log.append(f"dwLocalPlayerPawn -> client+0x{lp_off:x}")
 
@@ -193,6 +196,7 @@ def calibrate_match_offsets(
             off, map_off = hit
             reader._dw_global_vars = off
             reader._map_name_off = map_off
+            save_tweaks(dw_global_vars=off, map_name_off=map_off)
             log.append(f"dwGlobalVars -> client+0x{off:x} (map field 0x{map_off:x})")
 
     pawn = reader.local_pawn()
@@ -201,6 +205,7 @@ def calibrate_match_offsets(
         co = scan_local_controller_offset(reader, pawn)
         if co is not None:
             reader._dw_local_player_controller = co
+            save_tweaks(dw_local_player_controller=co)
             log.append(f"dwLocalPlayerController -> client+0x{co:x}")
 
     pawn = reader.local_pawn()

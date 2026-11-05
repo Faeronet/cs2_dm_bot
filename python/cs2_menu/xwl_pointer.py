@@ -150,10 +150,21 @@ def _blank(im) -> bool:
 
 def move_abs(inp, sx: int, sy: int, *, step_delay: float = 0.0003) -> None:
     """Абсолютное позиционирование курсора композитора через относительные дельты."""
-    # остановить фоновое сглаживание мыши, если включено
-    if getattr(inp, "_running", False):
+    # сглаживание мыши — на паузу только на время позиционирования и обратно.
+    # Раньше оно выключалось навсегда: после первого клика в меню камера в бою
+    # шла рывками (каждый тик одним событием)
+    smooth = bool(getattr(inp, "_running", False))
+    if smooth:
         inp._running = False
         time.sleep(0.05)
+    try:
+        _move_abs(inp, sx, sy, step_delay)
+    finally:
+        if smooth:
+            inp._running = True
+
+
+def _move_abs(inp, sx: int, sy: int, step_delay: float) -> None:
     # Указатель libei живёт в окне gamescope, а sx/sy — пиксели всего экрана.
     origin = getattr(inp, "pointer_origin", (0, 0)) or (0, 0)
     sx = max(0, int(sx) - int(origin[0]))

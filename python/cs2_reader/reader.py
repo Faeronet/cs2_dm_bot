@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import re
+import struct
 import sys
+import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -60,6 +63,7 @@ from cs2_reader.profile_rank import ProfileRankInfo, ProfileRankReader
 from cs2_reader.schema import Schema
 from cs2_reader.visibility import read_radar_spotted, spotted_by_viewer
 from cs2_reader.enemy_calibration import calibrate_enemy_offsets
+from cs2_reader.runtime_tweaks import apply_tweaks
 from cs2_reader.match_calibration import calibrate_match_offsets
 from cs2_reader.vulnerability import read_pawn_vulnerability
 from cs2_reader.weapons import is_healthshot, weapon_name
@@ -85,6 +89,16 @@ BREAKABLE_CACHE_TTL = 1.0
 BREAKABLE_SCAN_MAX = 4096
 
 
+def _scan_yield(i: int) -> None:
+    """Полный перебор entity list (лестницы, двери, решётки) — сотни мс чистого Python.
+
+    В фоновом потоке он держал GIL, и тик бота с мышью ждал в очереди (тики по 100–400 мс).
+    Каждые 256 сущностей отдаём процессор; в главном потоке не спим.
+    """
+    if i & 0xFF == 0 and threading.current_thread() is not threading.main_thread():
+        time.sleep(0.0005)
+
+
 class Reader:
     def __init__(
         self,
@@ -96,6 +110,7 @@ class Reader:
         self.offsets = offsets or Offsets.load()
         self.schema = schema or Schema.load()
         self._cached_client_base: int | None = None
+        self._eye_hist: deque[tuple[float, float, float]] = deque(maxlen=8)  # последние свежие углы
         self._cached_engine_base: int | None = None
         self._client_mod = client_module_name()
         self._engine_mod = engine_module_name()
@@ -144,7 +159,13 @@ class Reader:
     @classmethod
     def from_live(cls) -> "Reader | None":
         backend = create_live_backend()
-        return cls(backend) if backend else None
+        if not backend:
+            return None
+        reader = cls(backend)
+        if reader.backend.is_valid():
+            apply_tweaks(reader)
+            calibrate_match_offsets(reader, force=True, min_interval_s=0, allow_dump=False)
+        return reader
 
     @classmethod
     def from_dump(cls, path: str) -> "Reader":
@@ -395,14 +416,59 @@ class Reader:
     def local_on_ladder(self) -> bool:
         return self.local_move_type() in (8, 9)
 
+    def _fresh_eye_angles(
+        self, addr: int, eye: tuple[float, float, float]
+    ) -> tuple[float, float, float]:
+        """m_angEyeAngles без повторов предсказания.
+
+        Каждый кадр предсказание CS2 заново проигрывает старые команды и на ~2 мс пишет в pawn
+        их углы — до 6–9° назад. Бот читал такой угол в ~10–30% тиков, видел ложную ошибку
+        и дёргал камеру обратно. Повтор — это угол, который камера уже имела: совпадает
+        с одним из прошлых чтений, но не с последним. Тогда перечитываем через 1.5 мс
+        (повтор длится ~2 мс); не помогло — отдаём последний свежий угол.
+        Матрицу вида как эталон не берём: в бою она обновляется ~10 раз в секунду и тянула угол назад.
+        """
+        hist = self._eye_hist
+        cur = eye
+        for _ in range(3):
+            if not hist or cur == hist[-1] or cur not in hist:
+                break
+            time.sleep(0.0015)
+            again = self.backend.read_vec3(addr)
+            if not again or not self._plausible_eye_angles(*again):
+                break
+            cur = again
+        if hist and cur != hist[-1] and cur in hist:
+            return hist[-1]
+        if not hist or cur != hist[-1]:
+            if cur in hist:
+                hist.remove(cur)
+            hist.append(cur)
+        return cur
+
     @staticmethod
     def _plausible_eye_angles(pitch: float, yaw: float, roll: float) -> bool:
         if not (-89.0 <= pitch <= 89.0 and -360.0 <= yaw <= 360.0 and abs(roll) <= 45.0):
             return False
-        # Сломанная схема часто даёт мусор около (0, 0, ±0.5).
-        if abs(pitch) < 1.5 and abs(yaw) < 1.5 and abs(roll) < 1.0:
+        # Сломанная схема часто даёт мусор (0, 0, ±0.5). Реальный взгляд вперёд — крен около нуля.
+        if abs(pitch) < 0.05 and abs(yaw) < 0.05 and 0.2 < abs(roll) < 1.0:
             return False
         return True
+
+    def mouse_sensitivity(self) -> float | None:
+        """sensitivity из настроек игры (dwSensitivity → поле sensitivity). None — не прочиталось."""
+        client = self._client_base()
+        off = self.offsets.client
+        if not client or not off.dw_sensitivity or not off.dw_sensitivity_sensitivity:
+            return None
+        obj = self._usable_ptr(self.backend.read_u64(client + off.dw_sensitivity))
+        if not obj:
+            return None
+        data = self.backend.read(obj + off.dw_sensitivity_sensitivity, 4)
+        if not data or len(data) < 4:
+            return None
+        sens = struct.unpack("<f", data)[0]
+        return sens if 0.01 <= sens <= 50.0 else None
 
     def local_eye_angles(self) -> Vec3:
         """pitch=X, yaw=Y, roll=Z (m_angEyeAngles)."""
@@ -410,7 +476,11 @@ class Reader:
         if not pawn:
             return Vec3()
         base = self.schema.m_ang_eye_angles
-        for delta in (0, -16, 16, -32, 32):
+        eye = self.backend.read_vec3(pawn + base)
+        if eye and self._plausible_eye_angles(*eye):
+            return Vec3(*self._fresh_eye_angles(pawn + base, eye))
+        # схема иногда лежит рядом: соседние поля смотрим только если штатное чтение — мусор
+        for delta in (-16, 16, -32, 32):
             off = base + delta
             if off < 0:
                 continue
@@ -747,8 +817,9 @@ class Reader:
         player.has_moved_since_spawn = vuln.has_moved_since_spawn
         return player
 
-    def players(self) -> list[PlayerInfo]:
-        if self.local_pawn():
+    def players(self, *, skip_calibrate: bool = False) -> list[PlayerInfo]:
+        if not skip_calibrate and self.local_pawn():
+            apply_tweaks(self)
             calibrate_enemy_offsets(self)
         local_idx = self.local_index()
         local_pawn = self.local_pawn()
@@ -834,7 +905,9 @@ class Reader:
         local = self.local_position()
         out: list[LadderInfo] = []
         seen: set[tuple[int, int, int]] = set()
-        for i in range(1, self.highest_entity_index() + 1):
+        scan_hi = max(self.highest_entity_index(), 4096)
+        for i in range(1, scan_hi + 1):
+            _scan_yield(i)
             ent = self.entity_by_index(i)
             if not ent or ent < 0x10000:
                 continue
@@ -876,6 +949,7 @@ class Reader:
         seen: set[tuple[int, int, int]] = set()
         scan_hi = max(self.highest_entity_index(), 512)
         for i in range(1, scan_hi + 1):
+            _scan_yield(i)
             ent = self.entity_by_index(i)
             if not ent or ent < 0x10000:
                 continue
@@ -920,6 +994,7 @@ class Reader:
         out: list[BreakableInfo] = []
         scan_hi = max(self.highest_entity_index(), BREAKABLE_SCAN_MAX)
         for i in range(1, scan_hi + 1):
+            _scan_yield(i)
             ent = self.entity_by_index(i)
             if not ent or ent < 0x10000:
                 continue

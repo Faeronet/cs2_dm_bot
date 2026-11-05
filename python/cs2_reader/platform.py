@@ -32,16 +32,32 @@ def engine_module_name(platform: Platform | None = None) -> str:
     return "engine2.dll"
 
 
+def _data_dir() -> Path:
+    """Каталог data/ с offsets.json (os.path — pathlib иногда падает на части FS)."""
+    import os
+
+    cur = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(10):
+        candidate = os.path.join(cur, "data", "offsets.json")
+        if os.path.isfile(candidate):
+            return Path(os.path.join(cur, "data"))
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return Path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data"))
+
+
 def schema_file(platform: Platform | None = None) -> Path:
     p = platform or detect_platform()
-    data = Path(__file__).resolve().parents[2] / "data"
+    data = _data_dir()
     if p == Platform.LINUX_NATIVE:
         return data / "libclient.so.json"
     return data / "client_dll.json"
 
 
 def offsets_file() -> Path:
-    return Path(__file__).resolve().parents[2] / "data" / "offsets.json"
+    return _data_dir() / "offsets.json"
 
 
 def find_cs2_pid() -> int | None:

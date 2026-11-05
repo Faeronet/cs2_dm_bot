@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,8 @@ XP_PER_RANK = 5000
 MAX_PROFILE_RANK = 40
 PERSONA_META = 3635
 SENTINEL_PTRS = frozenset({0x200000000, 0x400000000, 0x800000000})
+HEAP_SCAN_MIN_S = 2.0
+HEAP_SCAN_MAX_S = 120.0
 
 
 @dataclass
@@ -98,6 +101,8 @@ class ProfileRankReader:
         self._xp_candidates: list[int] = []
         self._xp_prev: dict[int, int] = {}
         self._last_heap_scan = 0.0
+        self._heap_backoff = HEAP_SCAN_MIN_S
+        self._heap_scanning = False
         self._last: ProfileRankInfo = ProfileRankInfo()
         self._last_at = 0.0
 
@@ -115,15 +120,18 @@ class ProfileRankReader:
             self._remember(live)
             return live
 
-        heap_due = now - self._last_heap_scan >= 2.0
-        cold_start = not self._sig_xp_addr and not self._xp_candidates
-        if (heap_due or cold_start) and rank_hint is not None:
+        # Скан кучи — до 64 МБ и миллионы совпадений 4 байт ранга: секунды процессора.
+        # Раньше он шёл прямо в вызове (а зовут нас из тика бота) и замораживал мышь на 1.5–4 с.
+        # Теперь — в своём потоке; результат подхватит следующий read(). Не нашёл XP —
+        # следующий скан позже (2 → 4 → … → 120 с)
+        heap_due = now - self._last_heap_scan >= self._heap_backoff
+        cold_start = not self._sig_xp_addr and not self._xp_candidates and self._last_heap_scan == 0.0
+        if (heap_due or cold_start) and rank_hint is not None and not self._heap_scanning:
             self._last_heap_scan = now
-            self._scan_heap_candidates(rank_hint)
-            live = self._pick_live_xp(rank_hint)
-            if live is not None:
-                self._remember(live)
-                return live
+            self._heap_scanning = True
+            threading.Thread(
+                target=self._heap_scan_job, args=(rank_hint,), name="profile-rank-scan", daemon=True
+            ).start()
 
         if rank_hint is not None:
             partial = ProfileRankInfo(rank=rank_hint, xp=0, valid=True, source="gc_rank_only")
@@ -132,6 +140,16 @@ class ProfileRankReader:
         if self._last.valid and now - self._last_at < 60.0:
             return self._last
         return ProfileRankInfo()
+
+    def _heap_scan_job(self, rank_hint: int) -> None:
+        try:
+            self._scan_heap_candidates(rank_hint)
+            found = self._pick_live_xp(rank_hint) is not None
+            self._heap_backoff = HEAP_SCAN_MIN_S if found else min(HEAP_SCAN_MAX_S, self._heap_backoff * 2.0)
+        except Exception:
+            self._heap_backoff = min(HEAP_SCAN_MAX_S, self._heap_backoff * 2.0)
+        finally:
+            self._heap_scanning = False
 
     def _remember(self, info: ProfileRankInfo) -> None:
         self._last = info
@@ -272,6 +290,7 @@ class ProfileRankReader:
             for base in range(start, end, step):
                 if scanned >= max_scan:
                     break
+                t_chunk = time.monotonic()
                 chunk = self.backend.read(base, min(step, end - base))
                 if not chunk:
                     continue
@@ -299,6 +318,9 @@ class ProfileRankReader:
                         continue
                     scored.append((score, base + hit - 16, xp))
                     idx = hit + 4
+                # поток фоновый, но GIL общий: каждый мегабайт — пауза не короче работы,
+                # чтобы тик бота с мышью не стоял в очереди
+                time.sleep(max(0.001, time.monotonic() - t_chunk))
 
         if not scored:
             self._xp_candidates.clear()

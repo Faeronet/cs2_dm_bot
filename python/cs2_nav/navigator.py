@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import random
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -62,10 +63,12 @@ from cs2_reader.weapons import (
     weapon_is_pistol,
     weapon_needs_scope,
 )
-from cs2_reader.recoil import recoil_offset, tap_gap_range
+from cs2_reader.recoil import recoil_offset, spray_recover_s, tap_gap_range
 from cs2_reader.vulnerability import read_pawn_vulnerability
 
 XYZ = tuple[float, float, float]
+STEADY_AIM_WORLD_U = 0.6   # u: дрожание кости меньше этого у мишени прицел не водит
+M_YAW_DEG_PER_COUNT = 0.022  # CS2 m_yaw/m_pitch по умолчанию: ° на отсчёт мыши при sensitivity 1
 
 # Относительный угол движения для комбинации клавиш (Source: +yaw = влево/против часовой)
 _KEY_DIRS: list[tuple[float, frozenset[str]]] = [
@@ -190,6 +193,9 @@ class NavConfig:
     # --- «рука»: плавность и кривизна (ветер как в WindMouse: инерционный случайный вектор скорости)
     hand_wind_sigma: float = 3.0             # °/с: σ ветра при панорамировании (стационарное)
     hand_wind_decay: float = 0.88            # за тик: инерция ветра (WindMouse: W/√3 за шаг)
+    arc_smooth_s: float = 0.12               # с: инерция угла изгиба дуги (НЧ-фильтр над ветром, без рывков направления)
+    arc_smooth_jitter: float = 0.20          # ± доля: τ дуги на каждом захвате (xxHash), одинаковых поворотов не бывает
+    out_smooth_s: float = 0.06               # с: инерция выхода камеры на маршруте — ступенька скорости сглажена
     tremor_sigma: float = 0.0                # °/тик: σ тремора при удержании (0 = прицел стоит; ≥0.01 — видно ±1 px)
     flick_curve_frac: float = 0.012          # слабее дуга — меньше увод с центра в конце маха
     flick_wind_frac: float = 0.006
@@ -273,6 +279,10 @@ class NavConfig:
     aim_close_boost: float = 5.68            # ÷1.5 к 8.52
     aim_far_boost: float = 4.32              # ÷1.5 к 6.48
     aim_speed_jitter: float = 0.12           # ± доля: плавание уже выбранной скорости (xxHash)
+    # ×: наводка на мишень быстрее во столько раз. Та же S-кривая, сжатая по времени:
+    # скорость ×k, разгон ×k², рывок ×k³ (только скорость ×k быстрее бы не стало — упрёмся в разгон)
+    aim_speed_scale: float = 3.0
+    aim_lead_s: float = 0.07                 # с: упреждение бегущей мишени на задержку ввода и кадра
     aim_accel_span: tuple[float, float] = (0.84, 1.18)  # запасной множитель, если фаза без своего диапазона
     # наведение: те же диапазон+погрешность xxHash, скорости ×1.4 (×2 давало перелёт на средней/дальней)
     aim_aim_rate: tuple[float, float] = (6498.0, 11567.0)
@@ -441,15 +451,22 @@ class Navigator:
         self._aim_xx_n = 0
         self._aim_speed_var = 0.0             # текущий сдвиг скорости наводки в ±aim_speed_jitter
         self._aim_speed_mul = 1.0
+        self._arc_frac = 0.12                 # доля шага, которую уводит дуга; на захват — xxHash
+        self._arc_tick = 0
+        self._arc_bend = 0.0                  # °: текущий угол изгиба дуги (сглажен инерцией)
+        self._arc_tau = self.cfg.arc_smooth_s  # с: инерция дуги этого захвата (xxHash, см. _xx_arc_tau)
+        self._out_d = [0.0, 0.0]              # °/тик: что реально ушло в мышь с камеры маршрута (для сглаживания)
         self._aim_accel_mul = 1.0             # xxHash на вход в фазу: насколько быстро добираем скорость
         self._chase_rise = 0.08
-        self._aim_rate = 6426.0
-        self._turn_rate = 7140.0
-        self._turn_acc = 5712.0
-        self._turn_jerk = 35700.0
-        self._chase_rate = 2856.0
-        self._chase_acc = 3927.0
-        self._chase_jerk = 28560.0
+        # до первой выборки на захвате — середина диапазонов, уже с темпом aim_speed_scale
+        k = self._aim_k()
+        self._aim_rate = 6426.0 * k
+        self._turn_rate = 7140.0 * k
+        self._turn_acc = 5712.0 * k * k
+        self._turn_jerk = 35700.0 * k * k * k
+        self._chase_rate = 2856.0 * k
+        self._chase_acc = 3927.0 * k * k
+        self._chase_jerk = 28560.0 * k * k * k
         self._chase_motion_ready = False
 
         self.route: Route | None = None
@@ -507,7 +524,10 @@ class Navigator:
         self._pend_yaw = _PendingAxis(expire_ticks=pend_ticks)
         self._pend_pitch = _PendingAxis(expire_ticks=pend_ticks)
         self._cal_win: list[tuple[int, int, float, float]] = []
+        self._yaw_px0 = self.cfg.yaw_per_px
+        self._pitch_px0 = self.cfg.pitch_per_px
         self._mouse_dead_ticks = 0
+        self._mouse_blind = False
         self._sign_flips_yaw = 0
         self._sign_flips_pitch = 0
         self.yaw_offset = 0.0
@@ -614,6 +634,8 @@ class Navigator:
         self.profile_rank = ProfileRankInfo()
         self._profile_rank_key: tuple[int, int] | None = None
         self._profile_rank_log_at = 0.0
+        self._profile_rank_next = 0.0
+        self._sens_next = 0.0
         self.local_account = LocalAccountInfo()
         self._local_account_id: int | None = None
         self._target_visible_now = False         # мишень в списке видимых на этом тике (стреляем только тогда)
@@ -2417,8 +2439,14 @@ class Navigator:
             return None
         return t
 
-    def _steady_aim(self, aim_yaw: float, aim_pitch: float, yaw: float, pitch: float) -> tuple[float, float]:
-        """Мелкое дрожание кости не водит прицел. Сдвиг в одну сторону проходит сразу."""
+    def _steady_aim(
+        self, aim_yaw: float, aim_pitch: float, yaw: float, pitch: float, dist: float = 0.0
+    ) -> tuple[float, float]:
+        """Мелкое дрожание кости не водит прицел. Сдвиг в одну сторону проходит сразу.
+
+        Порог — не больше ~0.6u у самой мишени: фиксированные 0.32° на 1000u уже больше
+        радиуса головы (≈0.26°), и прицел стоял мимо выбранной точки.
+        """
         err = math.hypot(shortest_yaw_err(aim_yaw, yaw), aim_pitch - pitch)
         if self._aim_steady is None or err > 5.0:
             self._aim_steady = (aim_yaw, aim_pitch)
@@ -2432,6 +2460,8 @@ class Navigator:
         def keep(delta: float, prev: float) -> float:
             # в скоупе тот же дрожащий градус выглядит как сильное вождение
             lim = 0.16 if self._scoped_now else 0.32
+            if dist > 1.0:
+                lim = min(lim, math.degrees(math.atan2(STEADY_AIM_WORLD_U, dist)))
             if abs(delta) < lim and prev * delta <= 0.0:
                 return 0.0
             if abs(delta) < lim * 0.55:
@@ -2521,6 +2551,13 @@ class Navigator:
             d = self._aim_bone_delta
             bone = (head[0] + d[0], head[1] + d[1], head[2] + d[2])
         ox, oy, oz = self._aim_world
+        # упреждение на задержку «чтение → мышь → кадр игры»: бегущая мишень за это время уходит
+        lead = self.cfg.aim_lead_s
+        vel = target.get("velocity") if lead > 0.0 else None
+        if isinstance(vel, (tuple, list)) and len(vel) >= 3:
+            ox += float(vel[0]) * lead
+            oy += float(vel[1]) * lead
+            oz += float(vel[2]) * lead
         pt = (bone[0] + ox, bone[1] + oy, bone[2] + oz)
         if (
             self._aim_part == "chest"
@@ -2590,7 +2627,7 @@ class Navigator:
         # как yaw_rate_max навигации, не 16°/тик (это 640°/с — рывок);
         # в прицеливании точка взгляда не должна отставать от руки — иначе прицел «догоняет»
         # уезжающую цель и ёрзает около мишени
-        cap = (cfg.aim_lock_rate if mode == "aim" else cfg.yaw_rate_max_moving) * dt
+        cap = (cfg.aim_lock_rate * self._aim_k() if mode == "aim" else cfg.yaw_rate_max_moving) * dt
         if self._cam_warm_t0 is not None:
             warm = (now - self._cam_warm_t0) / max(0.05, cfg.cam_warm_s)
             if warm < 1.0:
@@ -3064,6 +3101,11 @@ class Navigator:
         if self._workers_on or not self.cfg.background_workers:
             return
         self._workers_on = True
+        # тик — сотни мелких чтений памяти, каждое отпускает GIL. Пока фоновый поток считает
+        # (маршрут, скан мира), вернуть GIL можно лишь через switchinterval: при 5 мс
+        # 300 чтений шли 237 мс вместо 2 мс, тик растягивался до ~0.9 с и камера дёргалась
+        if sys.getswitchinterval() > 0.0005:
+            sys.setswitchinterval(0.0005)
         self._scan_stop.clear()
         threading.Thread(target=self._scan_loop, name="nav-scan", daemon=True).start()
         threading.Thread(target=self._world_loop, name="nav-world", daemon=True).start()
@@ -3078,8 +3120,11 @@ class Navigator:
             t0 = time.monotonic()
             self._scan_positions()
             self._scan_los_budget(0.004)
-            wait = interval - (time.monotonic() - t0)
-            if wait > 0 and self._scan_stop.wait(wait):
+            work = time.monotonic() - t0
+            # проход дольше интервала (600 Гц) — раньше поток не спал вовсе и держал GIL,
+            # тик навигатора ждал процессор и шёл раз в ~0.7 с. Отдаём не меньше половины работы
+            wait = max(interval - work, 0.5 * work, 0.001)
+            if self._scan_stop.wait(wait):
                 return
 
     def _read_enemy_snap(self) -> list[dict] | None:
@@ -4109,6 +4154,35 @@ class Navigator:
 
     # ------------------------------------------------------------ calibration
 
+    def _sync_mouse_sensitivity(self, now: float) -> None:
+        """°/px из настроек игры: sensitivity × 0.022. Онлайн-калибровка дальше правит вокруг этого.
+
+        Раньше °/px брался из конфига (0.0759 = sensitivity 3.45), а в игре стояло 1.25 (0.0275):
+        каждый поворот доходил на 36%, калибровка в коридоре ±20% этого не исправляла —
+        камера шла лестницей, наводка на мишень тянулась секундами.
+        """
+        fn = getattr(self.reader, "mouse_sensitivity", None)
+        if not callable(fn) or now < self._sens_next:
+            return
+        self._sens_next = now + 2.0
+        try:
+            sens = fn()
+        except Exception:
+            return
+        if not sens:
+            return
+        k = float(sens) * M_YAW_DEG_PER_COUNT
+        if abs(abs(self._yaw_px0) - k) <= 1e-6:
+            return
+        self.log(f"Мышь: sensitivity {sens:.3f} из игры → {k:.4f}°/px (было {abs(self._yaw_px0):.4f})")
+        self._yaw_px0 = math.copysign(k, self._yaw_px0 or self.cfg.yaw_per_px)
+        self._pitch_px0 = math.copysign(k, self._pitch_px0 or self.cfg.pitch_per_px)
+        self.cfg.yaw_per_px = math.copysign(k, self.cfg.yaw_per_px)
+        self.cfg.pitch_per_px = math.copysign(k, self.cfg.pitch_per_px)
+        self._cal_win.clear()
+        self._pend_yaw.clear()
+        self._pend_pitch.clear()
+
     def _calibrate_mouse(self, mem_yaw: float, mem_pitch: float) -> None:
         """
         Δугол из памяти vs отправленные пиксели за окно последних тиков.
@@ -4148,28 +4222,33 @@ class Navigator:
 
         if abs(sum_dx) >= need_px:
             est = sum_yaw / sum_dx
+            base = abs(self._yaw_px0) or abs(self.cfg.yaw_per_px)
             if abs(sum_yaw) < 0.3:
                 self._mouse_dead_ticks += 1
+                self._mouse_blind = self._mouse_dead_ticks >= 6
                 if self._mouse_dead_ticks == 12:
                     self.log("ВНИМАНИЕ: мышь не доходит до игры (yaw не меняется)")
             else:
                 self._mouse_dead_ticks = 0
-            if 0.004 <= abs(est) <= 0.6:
-                if est * self.cfg.yaw_per_px < 0:
-                    self._sign_flips_yaw += 1
-                    if self._sign_flips_yaw >= 4:
-                        # знак меняем, величину оставляем (оценка в момент смены знака шумная)
-                        self.cfg.yaw_per_px = -self.cfg.yaw_per_px
-                        self._sign_flips_yaw = 0
-                        self._cal_win.clear()
-                        self.log(f"Мышь: yaw инвертирован → {self.cfg.yaw_per_px:+.4f}°/px")
-                else:
+                self._mouse_blind = False
+            # оценка из скоупа и из задержки ввода утаскивает °/px к нулю,
+            # после чего каждый тик упирается в потолок пикселей и прицел дёргается
+            if self._scoped_now or not (base * 0.75 <= abs(est) <= base * 1.25):
+                est = 0.0
+            if est and est * self.cfg.yaw_per_px < 0:
+                self._sign_flips_yaw += 1
+                if self._sign_flips_yaw >= 4:
+                    self.cfg.yaw_per_px = -self.cfg.yaw_per_px
                     self._sign_flips_yaw = 0
-                    self.cfg.yaw_per_px = 0.8 * self.cfg.yaw_per_px + 0.2 * est
-                    if self.cfg.pitch_follows_yaw:
-                        # в игре одна чувствительность на обе оси; вертикальных ровных движений мало,
-                        # поэтому модуль pitch берём от yaw (знак — свой, см. ниже)
-                        self.cfg.pitch_per_px = math.copysign(abs(self.cfg.yaw_per_px), self.cfg.pitch_per_px)
+                    self._cal_win.clear()
+                    self.log(f"Мышь: yaw инвертирован → {self.cfg.yaw_per_px:+.4f}°/px")
+            elif est:
+                self._sign_flips_yaw = 0
+                learned = 0.9 * self.cfg.yaw_per_px + 0.1 * est
+                lim_lo, lim_hi = base * 0.8, base * 1.2
+                self.cfg.yaw_per_px = math.copysign(min(lim_hi, max(lim_lo, abs(learned))), learned)
+                if self.cfg.pitch_follows_yaw:
+                    self.cfg.pitch_per_px = math.copysign(abs(self.cfg.yaw_per_px), self.cfg.pitch_per_px)
 
         if abs(sum_dy) >= need_px:
             est = sum_pitch / sum_dy
@@ -4312,46 +4391,23 @@ class Navigator:
                 if abs(self._yaw_rate) > 220.0 and cur_err < 110.0:
                     return set(cur)
             return set(best_keys)
+        # сзади стоим и доворачиваем. Иначе идём вперёд: камера догоняет ход по дуге.
+        # узкий стоп на каждые 30° оставлял бота стоять и мотать прицел у стены.
         if arel > self.cfg.turn_in_place_deg:
-            # цель сзади: как человек — остановиться и развернуться
-            if speed > 120.0:
-                return {"s"} if arel > 157.5 else ({"s", "a"} if rel > 0 else {"s", "d"})
-            # на малой скорости сначала ждём, пока камера довернёт (yaw_err большой).
-            # если yaw_err мал > wait_turn — значит look_target впереди по маршруту (U-turn),
-            # идём назад по rel, иначе так и будем стоять.
-            if abs(yaw_err) > 10.0:
-                self._face_turn_since = None
-                return set()
-            if self._face_turn_since is None:
-                self._face_turn_since = self._now()
-            if self._now() - self._face_turn_since < 0.35:
-                return set()
-            _, back_keys = min(_KEY_DIRS, key=lambda kd: abs(shortest_yaw_err(kd[0], rel)))
-            return set(back_keys)
-        else:
             self._face_turn_since = None
-        if arel > self.cfg.strafe_only_deg:
-            return {"a"} if rel > 0 else {"d"}
-        # прямо по маршруту — только W, даже если морковка/damping чуть сбоку
-        if arel <= self.cfg.forward_only_deg:
-            return {"w"}
+            return set()
+        self._face_turn_since = None
+        return {"w"}
 
-        cur = frozenset(self._keys)
-        best_angle, best_keys = min(_KEY_DIRS, key=lambda kd: abs(shortest_yaw_err(kd[0], rel)))
-        if cur in _DIR_OF_KEYS and cur != best_keys:
-            cur_err = abs(shortest_yaw_err(_DIR_OF_KEYS[cur], rel))
-            # на прямой легко отпускаем A/D; на повороте держим комбинацию
-            hold_cone = 12.0 if ("a" in cur or "d" in cur) and "w" in cur else (22.5 + self.cfg.key_hysteresis_deg)
-            if cur_err <= hold_cone:
-                return set(cur)
-            # минимальное удержание: человек не перебирает клавиши каждые 25 мс
-            if self._now() - self._keys_since < self.cfg.key_min_hold and cur_err < 80.0:
-                return set(cur)
-        keys = set(best_keys)
-        # назад не ходим — только W-варианты и чистый страйф
-        if "s" in keys:
-            keys = {"a"} if rel > 0 else {"d"}
-        return keys
+    def _limit_step(self, d_yaw: float, d_pitch: float, dt: float, cap: float) -> tuple[float, float]:
+        """Один тик не уносит десятки градусов. Иначе дуги нет: кадр — это рывок, следующий кадр — обратно."""
+        mag = math.hypot(d_yaw, d_pitch)
+        if mag <= cap or mag < 1e-6 or dt <= 0.0:
+            return d_yaw, d_pitch
+        scale = cap / mag
+        self._yaw_rate *= scale
+        self._pitch_rate *= scale
+        return d_yaw * scale, d_pitch * scale
 
     def _camera_step(
         self,
@@ -4397,23 +4453,31 @@ class Navigator:
         )
         d_pitch = self._pitch_rate * dt
 
-        # ветер до ограничения по ошибке: у цели гасим, иначе камера уезжает и виляет
-        if wind:
-            activity = min(1.0, (abs(self._yaw_rate) + abs(self._pitch_rate)) / 60.0)
-            activity *= min(1.0, math.hypot(yaw_err, pitch_err) / 3.5)
-            wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay, dt)
-            d_yaw += wy * activity * dt
-            d_pitch += wp * activity * 0.5 * dt
-
         # не перелетать точку взгляда; скорость обнуляем (не err/dt — иначе bang-bang влево-вправо)
+        # не перелетать точку взгляда. Скорость в состоянии — та, что реально ушла в мышь:
+        # обнуление давало ступеньку скорости (камера стоп → разгон) на каждом подходе к цели
         if abs(d_yaw) > abs(yaw_err):
             d_yaw = yaw_err
-            self._yaw_rate = 0.0
+            self._yaw_rate = d_yaw / dt
             self._yaw_acc = 0.0
         if abs(d_pitch) > abs(pitch_err):
             d_pitch = pitch_err
-            self._pitch_rate = 0.0
+            self._pitch_rate = d_pitch / dt
             self._pitch_acc = 0.0
+        if wind:
+            d_yaw, d_pitch = self._curve_step(d_yaw, d_pitch, yaw_err, pitch_err, dt)
+        # выход камеры тоже с инерцией: шаг мыши на тик не прыгает вслед за скачком желаемой скорости.
+        # Состояние скорости выше остаётся прежним, поэтому разгон и торможение не меняются
+        k = 1.0 - math.exp(-dt / max(1e-3, cfg.out_smooth_s))
+        d_yaw = self._out_d[0] + (d_yaw - self._out_d[0]) * k
+        d_pitch = self._out_d[1] + (d_pitch - self._out_d[1]) * k
+        # сглаженный шаг всё равно не перелетает точку взгляда
+        if abs(d_yaw) > abs(yaw_err):
+            d_yaw = yaw_err
+        if abs(d_pitch) > abs(pitch_err):
+            d_pitch = pitch_err
+        d_yaw, d_pitch = self._limit_step(d_yaw, d_pitch, dt, 18.0)
+        self._out_d = [d_yaw, d_pitch]
         return d_yaw, d_pitch
 
     # ------------------------------------------------------------ aiming at a target
@@ -4468,26 +4532,42 @@ class Navigator:
         w[1] = w[1] * decay + self.rng.gauss(0.0, k)
         return w[0], w[1]
 
-    def _aim_wind(self, dt: float, yaw_err: float, pitch_err: float) -> tuple[float, float]:
-        """Дуга наведения: тот же WindMouse, что на маршруте (σ и decay).
+    def _curve_step(
+        self, d_yaw: float, d_pitch: float, yaw_err: float, pitch_err: float, dt: float
+    ) -> tuple[float, float]:
+        """Дуга WindMouse поперёк уже посчитанного шага.
 
-        На быстром флике ветер масштабируется скоростью, чтобы изгиб на градус пути
-        совпал с панорамой навигации, а не выродился в прямую.
+        Ветер (AR(1): затухание как в WindMouse + случайный толчок) задаёт сторону и силу изгиба.
+        Сам угол изгиба идёт через инерцию (НЧ-фильтр, arc_smooth_s): ветер за тик меняется почти
+        целиком, и без фильтра направление хода мотается на ±10–20° каждые 25 мс — это и был рывок.
+        Шаг по длине не меняется, у цели дуга гаснет, выстрел садится в точку.
         """
         cfg = self.cfg
         mag = math.hypot(yaw_err, pitch_err)
-        # у самой мишени дуга уже не нужна: ветер здесь раскачивает прицел
-        if mag < 5.0:
-            return 0.0, 0.0
-        fade = min(1.0, (mag - 5.0) / 8.0)
+        step = math.hypot(d_yaw, d_pitch)
+        if not self.engaged and self._tick_no - self._arc_tick > 50:
+            self._arc_tick = self._tick_no
+            # на маршруте доля дуги гуляет в полосе, а не держит одну константу
+            self._arc_frac = self._xx_range((0.08, 0.16)) + (self._xx_u01() * 2.0 - 1.0) * self._xx_range((0.01, 0.03))
+            self._arc_tau = self._xx_arc_tau()
         wy, wp = self._wind_step(cfg.hand_wind_sigma, cfg.hand_wind_decay, dt)
-        activity = min(1.0, (abs(self._yaw_rate) + abs(self._pitch_rate)) / 60.0)
-        activity *= min(1.0, mag / 3.5)
-        nav = max(80.0, cfg.yaw_rate_max)
-        rate = max(nav, math.hypot(self._yaw_rate, self._pitch_rate))
-        # потолок масштаба: на быстрой наводке ветер не должен раскачивать прицел из стороны в сторону
-        scale = min(1.6, rate / nav)
-        return wy * scale * activity * fade * dt, wp * scale * activity * fade * 0.5 * dt
+        target = 0.0
+        if mag >= 4.0 and step >= 0.05:
+            fade = min(1.0, (mag - 4.0) / 12.0)
+            ux, uy = d_yaw / step, d_pitch / step
+            px, py = -uy, ux
+            side = (wy * px + wp * py) / max(0.4, cfg.hand_wind_sigma)
+            side = max(-1.0, min(1.0, side))
+            frac = min(0.22, max(0.06, self._arc_frac))
+            target = side * (8.0 + frac * 70.0) * fade
+        # инерция изгиба: угол идёт к цели за arc_smooth_s, а не прыгает вместе с ветром
+        k = 1.0 - math.exp(-dt / max(1e-3, self._arc_tau))
+        self._arc_bend += (target - self._arc_bend) * k
+        # поворот самого шага, а не добавка градусов: длина хода та же, дуга есть,
+        # в потолок пикселей из-за дуги не упираемся
+        ang = math.radians(self._arc_bend)
+        ca, sa = math.cos(ang), math.sin(ang)
+        return d_yaw * ca - d_pitch * sa, d_yaw * sa + d_pitch * ca
 
     def _tremor_step(self) -> tuple[float, float]:
         """Тремор удержания (°/тик): медленно меняющийся, без «зернистости» тик-в-тик."""
@@ -4515,6 +4595,11 @@ class Navigator:
         lo, hi = span
         return lo + self._xx_u01() * (hi - lo)
 
+    def _xx_arc_tau(self) -> float:
+        """Инерция дуги на захват: arc_smooth_s ± arc_smooth_jitter, xxHash."""
+        j = max(0.0, self.cfg.arc_smooth_jitter)
+        return max(0.02, self.cfg.arc_smooth_s * (1.0 + (self._xx_u01() * 2.0 - 1.0) * j))
+
     def _xx_band(self, span: tuple[float, float], err_span: tuple[float, float]) -> float:
         """Точка из диапазона плюс погрешность из своего диапазона. Оба выбора — xxHash."""
         err = self._xx_range(err_span)
@@ -4537,19 +4622,29 @@ class Navigator:
         self._aim_speed_var = (self._xx_u01() * 2.0 - 1.0) * j
         self._aim_speed_mul = 1.0 + self._aim_speed_var
         self._sample_aim_accel()
-        self._aim_rate = max(220.0, self._xx_band(cfg.aim_aim_rate, cfg.aim_aim_rate_err))
-        self._turn_rate = max(220.0, self._xx_band(cfg.aim_turn_rate, cfg.aim_turn_rate_err))
-        self._turn_acc = max(280.0, self._xx_band(cfg.aim_turn_accel, cfg.aim_turn_accel_err))
-        self._turn_jerk = max(1200.0, self._xx_band(cfg.aim_turn_jerk, cfg.aim_turn_jerk_err))
+        # дуга этого захвата: доля шага и погрешность доли, обе из xxHash
+        self._arc_frac = self._xx_range((0.08, 0.16)) + (self._xx_u01() * 2.0 - 1.0) * self._xx_range((0.01, 0.03))
+        self._arc_tau = self._xx_arc_tau()
+        self._arc_tick = self._tick_no
+        k = self._aim_k()
+        self._aim_rate = max(220.0, self._xx_band(cfg.aim_aim_rate, cfg.aim_aim_rate_err)) * k
+        self._turn_rate = max(220.0, self._xx_band(cfg.aim_turn_rate, cfg.aim_turn_rate_err)) * k
+        self._turn_acc = max(280.0, self._xx_band(cfg.aim_turn_accel, cfg.aim_turn_accel_err)) * k * k
+        self._turn_jerk = max(1200.0, self._xx_band(cfg.aim_turn_jerk, cfg.aim_turn_jerk_err)) * k * k * k
+
+    def _aim_k(self) -> float:
+        """Множитель темпа наводки (aim_speed_scale): время сжато в k раз, форма движения та же."""
+        return max(0.1, float(self.cfg.aim_speed_scale))
 
     def _sample_chase_motion(self) -> None:
         """Конечная скорость и разгон преследования. Текущую скорость камеры не трогаем."""
         cfg = self.cfg
         if self._chase_motion_ready:
             return
-        self._chase_rate = max(160.0, self._xx_band(cfg.aim_chase_rate, cfg.aim_chase_rate_err))
-        self._chase_acc = max(180.0, self._xx_band(cfg.aim_chase_accel, cfg.aim_chase_accel_err))
-        self._chase_jerk = max(800.0, self._xx_band(cfg.aim_chase_jerk, cfg.aim_chase_jerk_err))
+        k = self._aim_k()
+        self._chase_rate = max(160.0, self._xx_band(cfg.aim_chase_rate, cfg.aim_chase_rate_err)) * k
+        self._chase_acc = max(180.0, self._xx_band(cfg.aim_chase_accel, cfg.aim_chase_accel_err)) * k * k
+        self._chase_jerk = max(800.0, self._xx_band(cfg.aim_chase_jerk, cfg.aim_chase_jerk_err)) * k * k * k
         self._chase_motion_ready = True
 
     def _aim_speed_step(self, dt: float) -> float:
@@ -4743,7 +4838,9 @@ class Navigator:
         """Скорость самой точки, не камеры. Скачок на новую мишень — не скорость."""
         prev = self._aim_omega_ang
         self._aim_omega_ang = (aim_yaw, aim_pitch)
-        if prev is None or dt < 1e-4 or dt > 0.08:
+        # длинный тик (до 0.3 с) — всё ещё скорость: раньше при dt > 0.08 она обнулялась,
+        # и упреждение пропадало именно в бою, где тики бывают по 100 мс
+        if prev is None or dt < 1e-4 or dt > 0.3:
             self._aim_omega = (0.0, 0.0)
             return
         dy = shortest_yaw_err(aim_yaw, prev[0])
@@ -4754,16 +4851,14 @@ class Navigator:
         self._aim_omega = (dy / dt, dp / dt)
 
     def _close_omega(self) -> tuple[float, float]:
-        """В упор точка уходит на сотни °/с. Дальше прежний тормоз, как будто она стоит."""
-        dist = self._tgt_aim_dist
-        near = self.cfg.aim_close_dist
-        far = near * 2.0
-        if dist >= far:
-            return 0.0, 0.0
-        t = 1.0 if dist <= near else (far - dist) / max(1.0, far - near)
+        """Угловая скорость точки прицела — подмешивается к скорости камеры на любой дистанции.
+
+        Раньше дальше 2×aim_close_dist она обнулялась («как будто мишень стоит»): бегущая на
+        500u мишень уходила на 2–3° от прицела и в овал выстрела прицел не попадал никогда.
+        """
         wy, wp = self._aim_omega
         cap = 3200.0
-        return max(-cap, min(cap, wy * t)), max(-cap, min(cap, wp * t))
+        return max(-cap, min(cap, wy)), max(-cap, min(cap, wp))
 
     def _aim_ramp(
         self,
@@ -4812,9 +4907,6 @@ class Navigator:
         )
         d_yaw = self._yaw_rate * dt
         d_pitch = self._pitch_rate * dt
-        wy, wp = self._aim_wind(dt, yaw_err, pitch_err)
-        d_yaw += wy
-        d_pitch += wp
         if abs(d_yaw) > abs(yaw_err):
             d_yaw = yaw_err
             self._yaw_rate = max(-final_rate, min(final_rate, oy))
@@ -4826,7 +4918,7 @@ class Navigator:
         if mag < 2.5:
             d_yaw = self._deg_not_past(d_yaw, yaw_err, self._axis_k(True), yaw=True)
             d_pitch = self._deg_not_past(d_pitch, pitch_err, self._axis_k(False), yaw=False)
-        return d_yaw, d_pitch
+        return self._limit_step(*self._curve_step(d_yaw, d_pitch, yaw_err, pitch_err, dt), dt, 26.0 * self._aim_k())
 
     def _axis_k(self, yaw: bool) -> float:
         """°/px с тем же множителем скоупа, что у отправки мыши."""
@@ -4869,24 +4961,26 @@ class Navigator:
             r = self._aim_rate
             acc = self._turn_acc
             jerk = self._turn_jerk
-        g = cfg.aim_lock_gain
+        k = self._aim_k()
+        g = cfg.aim_lock_gain * k
         close = math.hypot(yaw_err, pitch_err) < 1.5
         wy, wp = self._close_omega()
         scoped = self._scoped_now and not self._chase_on
         if close:
             # До точки быстро. Внутри полпикселя стоим: лишний пиксель перебрасывает прицел.
             # В скоупе дожим тише: тот же градус там выглядит как рывок.
+            # Потолки дожима — в том же темпе aim_speed_scale, что и сам захват
             if scoped:
-                g = 90.0
-                r = min(r, 70.0)
-                acc = min(acc, 700.0)
+                g = 90.0 * k
+                r = min(r, 70.0 * k)
+                acc = min(acc, 700.0 * k * k)
             else:
-                g = 672.0 if self._chase_on else 448.0
-                r = min(r, 1512.0 if self._chase_on else 882.0)
-                acc = min(acc, 5880.0)
+                g = (672.0 if self._chase_on else 448.0) * k
+                r = min(r, (1512.0 if self._chase_on else 882.0) * k)
+                acc = min(acc, 5880.0 * k * k)
                 phase = self._chase_rate if self._chase_on else self._aim_rate
                 r = min(phase, max(r, abs(wy), abs(wp)))
-            jerk = min(jerk, cfg.yaw_jerk_max)
+            jerk = min(jerk, cfg.yaw_jerk_max * k * k * k)
         lag = dt
         ey = yaw_err - (self._yaw_rate - wy) * lag
         ep = pitch_err - (self._pitch_rate - wp) * lag
@@ -4906,10 +5000,6 @@ class Navigator:
         self._pitch_rate, self._pitch_acc = self._track_rate(self._pitch_rate, self._pitch_acc, des_p, dt, acc, jerk)
         d_yaw = self._yaw_rate * dt
         d_pitch = self._pitch_rate * dt
-        if not close:
-            wy, wp = self._aim_wind(dt, yaw_err, pitch_err)
-            d_yaw += wy
-            d_pitch += wp
         # лишний шаг за точку забираем. Скорость после посадки — угловая скорость мишени:
         # 0, если она стоит, иначе прицел не отстаёт от овала и выстрел не пропадает.
         carry = wy
@@ -5063,23 +5153,22 @@ class Navigator:
         d_yaw, d_pitch = self._aim_lock(ay, ap, dt)
         return d_yaw, d_pitch, "lock"
 
-    def _send_mouse(self, d_yaw: float, d_pitch: float, max_px: int | None = None) -> tuple[int, int]:
-        """Градусы → пиксели с переносом дробного остатка: мелкие плавные повороты не дребезжат."""
+    def _send_mouse(self, d_yaw: float, d_pitch: float, max_px: int | None = None) -> tuple[float, float]:
+        """Градусы → пиксели. Дробная часть уходит в ввод как есть: округление до целого пикселя
+        делает бэкенд ввода на 500 Гц. Округление на каждом тике 40 Гц давало ±1 px рывок камеры."""
         cfg = self.cfg
         m = cfg.max_px_per_tick if max_px is None else max_px
-        out = [0, 0]
+        if self._mouse_blind:
+            m = min(m, 24)
+        out = [0.0, 0.0]
         for i, (d, k) in enumerate(((d_yaw, cfg.yaw_per_px), (d_pitch, cfg.pitch_per_px))):
             if not k:
                 continue
             if self._scoped_now:
                 k = k * (40.0 / 90.0)
-            want = d / k + self._px_carry[i]
-            px = int(round(want))
+            px = d / k
             if abs(px) > m:
                 px = m if px > 0 else -m
-                self._px_carry[i] = 0.0          # обрезали — остаток не копим (иначе «догонит» рывком)
-            else:
-                self._px_carry[i] = want - px
             out[i] = px
             (self._pend_yaw if i == 0 else self._pend_pitch).sent(self._tick_no, px * k)
         dx, dy = out
@@ -5434,14 +5523,11 @@ class Navigator:
         auto = bool(self.weapon.get("auto"))
         tx, ty, tz = self._target_aim_xyz(target, x, y)
         dist = math.hypot(tx - x, ty - y, tz - (z + self._eye_z))
-        # ошибка до точки, куда реально ведём (кость + небольшое отклонение), не до идеального центра
+        # ошибка до точки, куда реально ведём (кость + небольшое отклонение), не до идеального центра.
+        # стреляем по углу из памяти, а не по «мыши в полёте»: иначе клик уходит, пока прицел ещё в стороне
         aim_yaw_err = yaw_err - self._track_aim[0]
         aim_pitch_err = pitch_err - self._track_aim[1]
-        on_oval = self._fire_on_oval(
-            aim_yaw_err - self._pend_yaw.value(),
-            aim_pitch_err - self._pend_pitch.value(),
-            dist,
-        )
+        on_oval = self._fire_on_oval(aim_yaw_err, aim_pitch_err, dist)
         spray = self._should_spray(dist)
         holding_spray = (
             spray
@@ -5497,17 +5583,31 @@ class Navigator:
         self._shots_on_target += 1
         self.shots_fired += 1
         if auto:
-            cycle = weapon_cycle_s(int(self.weapon.get("id") or 0), str(self.weapon.get("name") or ""))
+            wid = int(self.weapon.get("id") or 0)
+            wname = str(self.weapon.get("name") or "")
+            cycle = weapon_cycle_s(wid, wname)
             self._far_burst_n += 1
-            if self._far_burst_n < max(1, cfg.long_tap_burst):
+            if self._far_burst_n < self._long_burst_len(wid, wname, dist):
                 self._next_fire_at = now + cycle
             else:
                 self._far_burst_n = 0
-                self._next_fire_at = now + cycle + 0.16 + self._xx_u01() * 0.14
+                # пауза не короче сброса отдачи: при 0.16…0.30 с индекс отдачи копился от пары
+                # к паре (антиотдачи в дальнем тапе нет), и к 30-й пуле ствол уходил на ~11° вверх
+                settle = spray_recover_s(wid, wname) + cfg.fire_hold_ticks / max(1.0, cfg.tick_hz) + 0.02
+                self._next_fire_at = now + cycle + max(0.16, settle) + self._xx_u01() * 0.14
         else:
             self._next_fire_at = now + self._tap_wait()
         self._on_combat_strafe_shot()
         return True
+
+    def _long_burst_len(self, wid: int, wname: str, dist: float) -> int:
+        """Пуль в дальней очереди. Если вторая уже по отдаче вылетает из овала стрельбы — одиночный."""
+        burst = max(1, self.cfg.long_tap_burst)
+        if burst > 1:
+            ky, kp = recoil_offset(wid, wname, 1)
+            if not self._fire_on_oval(ky, kp, dist):
+                return 1
+        return burst
 
     def _release_fire(self) -> None:
         if self._injecting():
@@ -5803,8 +5903,11 @@ class Navigator:
         mem_yaw, mem_pitch = ang.y, ang.x
         self.weapon = self._read_weapon()
         self.life = self._read_life()
+        self._sync_mouse_sensitivity(now)
         pr_fn = getattr(self.reader, "profile_rank", None)
-        if callable(pr_fn):
+        # ранг меняется раз в матч; читать его каждый тик — лишняя работа в цикле мыши
+        if callable(pr_fn) and now >= self._profile_rank_next:
+            self._profile_rank_next = now + 2.0
             try:
                 self.profile_rank = pr_fn()
             except Exception:
@@ -6251,7 +6354,9 @@ class Navigator:
         if target is not None:
             self.engaged_ticks += 1
             aim_yaw, aim_pitch = self._aim_angles(x, y, z, target)
-            aim_yaw, aim_pitch = self._steady_aim(aim_yaw, aim_pitch, yaw, mem_pitch)
+            ax, ay_, az = self._target_aim_xyz(target, x, y)
+            aim_range = math.hypot(ax - x, ay_ - y, az - (z + self._eye_z))
+            aim_yaw, aim_pitch = self._steady_aim(aim_yaw, aim_pitch, yaw, mem_pitch, aim_range)
             if self._rcs_active():
                 rcs_y, rcs_p = self._rcs_offset(now)
             look_yaw = aim_yaw + rcs_y
@@ -6418,7 +6523,9 @@ class Navigator:
                 ):
                     pitch_rate = 360.0
                 d_yaw, d_pitch = self._camera_step(
-                    yaw_err, pitch_err, dt, speed, rate_cap, gain, pitch_rate_max=pitch_rate
+                    yaw_err - self._pend_yaw.value(),
+                    pitch_err - self._pend_pitch.value(),
+                    dt, speed, rate_cap, gain, pitch_rate_max=pitch_rate,
                 )
             # только маршрут: иначе потолок 160 px режет новый yaw_rate_max
             nav_px = None if rcs_back else int(cfg.max_px_per_tick * 1.75)
@@ -6560,6 +6667,7 @@ class Navigator:
         duration = duration if duration is not None else self.cfg.duration
         interval = 1.0 / self.cfg.tick_hz
         t0 = time.monotonic()
+        t_start = t0
         n = 0
         reason = "done"
         try:
@@ -6567,7 +6675,7 @@ class Navigator:
                 if should_stop is not None and should_stop():
                     reason = "stop"
                     break
-                if duration and time.monotonic() - t0 > duration:
+                if duration and time.monotonic() - t_start > duration:
                     print(f"Лимит {duration:.0f}s")
                     reason = "limit"
                     break
@@ -6602,6 +6710,10 @@ class Navigator:
                 sleep = next_t - time.monotonic()
                 if sleep > 0:
                     time.sleep(sleep)
+                elif sleep < -interval:
+                    # отстали больше чем на тик: сдвигаем такт, а не догоняем пачкой тиков без паузы —
+                    # пачка давала свой рывок мыши сразу после любого залипания
+                    t0 += -sleep
         finally:
             self._stop_workers()
             self.release()

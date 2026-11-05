@@ -13,7 +13,7 @@ import os
 import threading
 import time
 
-from cs2_control.input import KEY_MAP, MOUSE_BUTTONS, GameInput
+from cs2_control.input import KEY_MAP, MOUSE_BUTTONS, GameInput, _take_px, seg_pos
 
 # libei 1.2: биты возможностей устройства.
 _CAP_POINTER = 1
@@ -137,6 +137,7 @@ class EiInput(GameInput):
         self._seg_lock = threading.Lock()
         self._running = False
         self._mouse_started = False
+        self._carry = [0.0, 0.0]             # дробный остаток пикселей, пока сглаживание на паузе
         self._pump = threading.Thread(target=self._pump_loop, name="gamescope-ei", daemon=True)
         self._pump.start()
 
@@ -273,8 +274,15 @@ class EiInput(GameInput):
 
     def _mouse_loop(self) -> None:
         period = 1.0 / self._smooth_hz
-        while self._running:
+        # поток живёт до close(): пауза (_running=False на время клика в меню) его не убивает.
+        # Раньше цикл выходил, prepare() второй раз не запускал, и после первого же меню
+        # каждый тик уходил одним событием — камера прыгала на несколько градусов разом
+        while self._alive:
             time.sleep(period)
+            if not self._running:
+                with self._seg_lock:
+                    self._seg = None
+                continue
             self._emit_rel(*self._pop_mouse_step(period))
 
     def _pop_mouse_step(self, period: float) -> tuple[int, int]:
@@ -287,11 +295,11 @@ class EiInput(GameInput):
             seg = self._seg
             if seg is None:
                 return 0, 0
-            dx, dy, t0, t1, ex, ey = seg
+            dx, dy, t0, t1, ex, ey, v0x, v0y = seg
             dur = max(1e-6, t1 - t0)
-            frac = min(1.0, (time.monotonic() - t0) / dur)
-            step_x = int(round(dx * frac)) - ex
-            step_y = int(round(dy * frac)) - ey
+            t = time.monotonic() - t0
+            step_x = int(round(seg_pos(dx, v0x, dur, t))) - ex
+            step_y = int(round(seg_pos(dy, v0y, dur, t))) - ey
             span = math.hypot(dx, dy)
             cap = max(1.0, span * period / dur * 3.0)
             mag = math.hypot(step_x, step_y)
@@ -307,7 +315,7 @@ class EiInput(GameInput):
             ex += step_x
             ey += step_y
             seg[4], seg[5] = ex, ey
-            if ex == dx and ey == dy:
+            if t >= dur and ex == round(dx) and ey == round(dy):
                 self._seg = None
             return step_x, step_y
 
@@ -338,15 +346,20 @@ class EiInput(GameInput):
         if not dx and not dy:
             return
         if not self._running:
-            self._emit_rel(int(dx), int(dy))
+            self._emit_rel(*_take_px(self._carry, dx, dy))
             return
         now = time.monotonic()
         with self._seg_lock:
-            rem_x = rem_y = 0
+            rem_x = rem_y = 0.0
+            v0x = v0y = 0.0
             if self._seg is not None:
-                rem_x = self._seg[0] - self._seg[4]
-                rem_y = self._seg[1] - self._seg[5]
-            self._seg = [int(dx) + rem_x, int(dy) + rem_y, now, now + self._spread, 0, 0]
+                old = self._seg
+                rem_x = old[0] - old[4]
+                rem_y = old[1] - old[5]
+                old_dur = max(1e-6, old[3] - old[2])
+                v0x = old[0] / old_dur
+                v0y = old[1] / old_dur
+            self._seg = [float(dx) + rem_x, float(dy) + rem_y, now, now + self._spread, 0, 0, v0x, v0y]
 
     def mouse_down(self, button: str = "left") -> None:
         if button not in _BTN or button in self._btn_down or not self._ready(self._buttons or self._pointer):
@@ -668,7 +681,7 @@ class HybridInput(GameInput):
 
     def _emit_rel(self, dx: int, dy: int) -> None:
         """Шаг относительной мыши gamescope. Сглаживание к этому моменту уже выключено."""
-        self._ei._emit_rel(int(dx), int(dy))
+        self._ei._emit_rel(round(dx), round(dy))
 
     def _xdo(self, *args: str) -> bool:
         import subprocess

@@ -23,6 +23,8 @@ class ClientOffsets:
     dw_prediction: int = 0
     dw_game_entity_system: int = 0
     dw_game_entity_system_highest_entity_index: int = 0
+    dw_sensitivity: int = 0
+    dw_sensitivity_sensitivity: int = 0
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,8 @@ class Offsets:
                 dw_game_entity_system_highest_entity_index=client.get(
                     "dwGameEntitySystem_highestEntityIndex", 0
                 ),
+                dw_sensitivity=client.get("dwSensitivity", 0),
+                dw_sensitivity_sensitivity=client.get("dwSensitivity_sensitivity", 0),
             ),
             engine=EngineOffsets(
                 dw_build_number=engine["dwBuildNumber"],

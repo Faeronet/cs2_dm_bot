@@ -115,7 +115,8 @@ class SimTarget:
 
     @property
     def position(self) -> Vec3:
-        return Vec3(self.x, self.y, self.z)
+        # контракт Reader: position — ноги (m_vOldOrigin), голова — отдельно; центр овала на 64 выше
+        return Vec3(self.x, self.y, self.z - 64.0)
 
     @property
     def head_position(self) -> Vec3:

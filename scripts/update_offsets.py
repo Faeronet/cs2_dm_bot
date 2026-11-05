@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 
@@ -53,6 +54,10 @@ def main() -> int:
     DATA.mkdir(parents=True, exist_ok=True)
     if cs2_running():
         dump_live()
+        patch = ROOT / "scripts" / "patch_offsets_live.py"
+        if patch.is_file():
+            print("Patching client pointers from live memory...")
+            subprocess.run([sys.executable, str(patch)], cwd=str(ROOT), check=False)
     else:
         download_fallback()
     print(f"Done. Kept: {', '.join(sorted(KEEP & {p.name for p in DATA.iterdir() if p.is_file()}))}")
