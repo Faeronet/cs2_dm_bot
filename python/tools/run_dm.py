@@ -36,6 +36,7 @@ from cs2_menu.window_signatures import close_window
 from cs2_menu.xwl_pointer import ScreenClicker, ensure_flat_accel
 from cs2_nav.coord_map import CoordinateMap
 from cs2_nav.navigator import NavConfig, Navigator
+from cs2_reader.match_calibration import calibrate_match_offsets
 from cs2_reader.reader import Reader
 from tools.launch_dm_official import (
     _signals,
@@ -268,6 +269,7 @@ def dismiss_errors(menu: MenuController, reader: Reader) -> None:
 
 def ensure_spawned(reader: Reader, menu: MenuController, *, shots: bool) -> str | None:
     """Вернуть имя карты, когда игрок заспавнился. None — не вышло."""
+    calibrate_match_offsets(reader, min_interval_s=0.0, allow_dump=False)
     sig = _signals(reader)
     if sig["alive_fast"]:
         name = normalize_map(sig["map"]) or normalize_map(reader.resolved_map_name())
@@ -278,7 +280,7 @@ def ensure_spawned(reader: Reader, menu: MenuController, *, shots: bool) -> str 
             log("уже в бою, имя карты дочитываю — меню не трогаю")
             code = wait_spawn(reader, menu, shots=shots, log_fn=log)
             if code == 0:
-                return normalize_map(_signals(reader)["map"]) or normalize_map(reader.resolved_map_name())
+                return _map_after_spawn(reader)
     if sig["on_server"] or sig["in_world"] or sig["map_loaded"]:
         if sig["in_world"] and not sig["map_loaded"]:
             log("уже в матче — поиск не запускаю, читаю карту")
@@ -304,11 +306,7 @@ def ensure_spawned(reader: Reader, menu: MenuController, *, shots: bool) -> str 
             code = wait_spawn(reader, menu, shots=shots, log_fn=log)
             sig = _signals(reader)
             if code == 0:
-                return (
-                    normalize_map(sig["map"])
-                    or normalize_map(reader.resolved_map_name())
-                    or m
-                )
+                return _map_after_spawn(reader) or m
             if sig["on_server"]:
                 log("на сервере, но ещё не заспавнился — не трогаю меню, повтор ожидания")
                 return None
@@ -329,8 +327,15 @@ def ensure_spawned(reader: Reader, menu: MenuController, *, shots: bool) -> str 
     code = launch_until_spawn(reader, menu, shots=shots, log_fn=log)
     if code != 0:
         return None
-    name = normalize_map(_signals(reader)["map"])
+    calibrate_match_offsets(reader, min_interval_s=0.0, allow_dump=False)
+    name = normalize_map(_signals(reader)["map"]) or normalize_map(reader.resolved_map_name())
     return name or None
+
+
+def _map_after_spawn(reader: Reader) -> str:
+    calibrate_match_offsets(reader, min_interval_s=0.0, allow_dump=False)
+    sig = _signals(reader)
+    return normalize_map(sig["map"]) or normalize_map(reader.resolved_map_name())
 
 
 def load_coord_map(map_name: str, cache: dict[str, CoordinateMap]) -> CoordinateMap | None:

@@ -32,6 +32,7 @@ from cs2_menu.driver import UIStateReader
 from cs2_menu.live_ui import menu_fully_visible
 from cs2_menu.window_signatures import close_window
 from cs2_menu.xwl_pointer import ScreenClicker, ensure_flat_accel, root_shot
+from cs2_reader.match_calibration import calibrate_match_offsets
 from cs2_reader.reader import Reader
 
 # Доли КОНТЕНТА окна CS2 (fx, fy) — отсчёт от игрового контента (без титульной полосы),
@@ -72,6 +73,8 @@ def _signals(reader: Reader) -> dict:
             return 0
 
     try:
+        if not reader.resolved_map_name() and (reader.local_pawn() or reader.local_controller()):
+            calibrate_match_offsets(reader, min_interval_s=0.0, allow_dump=False)
         mp = reader.resolved_map_name() or reader.map_name()
     except Exception:  # noqa: BLE001
         mp = ""

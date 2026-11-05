@@ -127,6 +127,9 @@ class Reader:
         self._enemy_calibrate_log: list[str] = []
         self._match_calibrate_at = 0.0
         self._last_map_name = ""
+        self._dw_local_player_pawn = self.offsets.client.dw_local_player_pawn
+        self._dw_local_player_controller = self.offsets.client.dw_local_player_controller
+        self._dw_global_vars = self.offsets.client.dw_global_vars
 
     @classmethod
     def from_pid(cls, pid: int) -> "Reader":
@@ -169,13 +172,13 @@ class Reader:
         client = self._client_base()
         if not client:
             return None
-        return self.backend.read_u64(client + self.offsets.client.dw_local_player_controller)
+        return self.backend.read_u64(client + self._dw_local_player_controller)
 
     def local_pawn(self) -> int | None:
         client = self._client_base()
         if not client:
             return None
-        pawn = self._usable_ptr(self.backend.read_u64(client + self.offsets.client.dw_local_player_pawn))
+        pawn = self._usable_ptr(self.backend.read_u64(client + self._dw_local_player_pawn))
         if pawn:
             return pawn
         controller = self.local_controller()
@@ -238,7 +241,7 @@ class Reader:
         client = self._client_base()
         if not client:
             return 0
-        slot = client + self.offsets.client.dw_global_vars
+        slot = client + self._dw_global_vars
         gv = self.backend.read_u64(slot) or 0
         if not gv:
             return 0

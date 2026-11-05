@@ -2,11 +2,11 @@
   "libclient.so": [
     {
       "name": "dwEntityList",
-      "value": 74216832
+      "value": 74219520
     },
     {
       "name": "dwGameEntitySystem",
-      "value": 79273104
+      "value": 79275856
     },
     {
       "name": "dwGameEntitySystem_highestEntityIndex",
@@ -14,31 +14,31 @@
     },
     {
       "name": "dwGlobalVars",
-      "value": 73974520
+      "value": 73977208
     },
     {
       "name": "dwGlowManager",
-      "value": 76799288
+      "value": 76801976
     },
     {
       "name": "dwLocalPlayerController",
-      "value": 76597656
+      "value": 76600344
     },
     {
       "name": "dwLocalPlayerPawn",
-      "value": 76827224
+      "value": 76830968
     },
     {
       "name": "dwPlantedC4",
-      "value": 74303143
+      "value": 74305831
     },
     {
       "name": "dwPrediction",
-      "value": 76826896
+      "value": 76829584
     },
     {
       "name": "dwSensitivity",
-      "value": 76819320
+      "value": 76822008
     },
     {
       "name": "dwSensitivity_sensitivity",
@@ -46,11 +46,11 @@
     },
     {
       "name": "dwViewMatrix",
-      "value": 76857472
+      "value": 76860160
     },
     {
       "name": "dwViewRender",
-      "value": 76857744
+      "value": 76860432
     }
   ],
   "libengine2.so": [
@@ -114,11 +114,11 @@
   "libpanorama.so": [
     {
       "name": "HUD_CONTEXT",
-      "value": 7115008
+      "value": 7115264
     },
     {
       "name": "MENU_CONTEXT",
-      "value": 7114976
+      "value": 7115232
     }
   ]
 }
